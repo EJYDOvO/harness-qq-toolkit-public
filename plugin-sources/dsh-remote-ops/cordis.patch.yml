@@ -1,0 +1,5 @@
+- insert:
+    - id: qq-remote-ops
+      name: dsh-remote-ops-local
+      config:
+        root: D:/DeepSeek-Harness

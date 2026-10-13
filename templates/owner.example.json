@@ -1,0 +1,4 @@
+{
+  "openid": "<LOCAL_OWNER_OPENID>",
+  "sessionKey": "qqbot:<LOCAL_QQ_APP_ID>:c2c:<LOCAL_OWNER_OPENID>"
+}

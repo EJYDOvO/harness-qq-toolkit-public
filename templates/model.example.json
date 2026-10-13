@@ -1,0 +1,5 @@
+{
+  "provider": "navigator",
+  "model": "gemma-4-31b-it",
+  "note": "Configure provider URL and credentials locally using the official application UI. They are intentionally absent from this repository."
+}

@@ -1,0 +1,28 @@
+{
+  "name": "dsh-profile-desktop",
+  "private": true,
+  "dependencies": {
+    "@tencent-connect/dsh-qqbot": "0.5.2",
+    "dsh-free-search": "0.8.9",
+    "dsh-plugin-bilibili": "file:D:/DeepSeek-Harness/plugin-packages/dsh-plugin-bilibili-0.2.4.tgz",
+    "dshmarket": "1.66.18",
+    "dsh-remote-ops-local": "file:D:/DeepSeek-Harness/plugin-packages/dsh-remote-ops-local-1.0.0.tgz",
+    "dsh-task-memory-local": "file:D:/DeepSeek-Harness/plugin-packages/dsh-task-memory-local-0.1.0-local.2.tgz"
+  },
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-web-app",
+        "@deepseek-ai/dsh-experimental-auto-review",
+        "@deepseek-ai/dsh-experimental-schedule-bundle",
+        "@tencent-connect/dsh-qqbot",
+        "dshmarket",
+        "dsh-plugin-bilibili",
+        "dsh-free-search",
+        "dsh-remote-ops-local",
+        "dsh-task-memory-local"
+      ]
+    }
+  }
+}

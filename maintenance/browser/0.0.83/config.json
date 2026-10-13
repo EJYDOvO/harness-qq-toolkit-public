@@ -1,0 +1,9 @@
+{
+  "browser": {
+    "browserName": "chromium",
+    "userDataDir": "D:/DeepSeek-Harness/data/browser-profile",
+    "launchOptions": { "channel": "msedge", "headless": true }
+  },
+  "outputDir": "D:/DeepSeek-Harness/default-workspace/browser-output",
+  "imageResponses": "omit"
+}

@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "profile": "desktop",
+  "testedRuntime": "0.2.0-rc.2",
+  "targets": {
+    "@tencent-connect/dsh-qqbot": "0.5.2",
+    "dsh-free-search": "0.8.9",
+    "dshmarket": "1.66.18"
+  },
+  "qqPatch": "patches/dsh-qqbot@0.5.2.patch",
+  "notes": "QQ approval compatibility patch must be reviewed before changing the QQ version. Core is updated only through the official desktop updater.",
+  "localPackages": {
+    "dsh-remote-ops-local": {
+      "version": "1.0.0",
+      "source": "file:D:/DeepSeek-Harness/plugin-packages/dsh-remote-ops-local-1.0.0.tgz",
+      "sha256": "e5383c14bb36cb750b9ef47559c36792c0f96730f6f99bf911aea6fa7ceeca2e"
+    },
+    "dsh-task-memory-local": {
+      "version": "0.1.0-local.2",
+      "source": "file:D:/DeepSeek-Harness/plugin-packages/dsh-task-memory-local-0.1.0-local.2.tgz",
+      "sha256": "531f79053ddf66299dc8399f7b686254a08bce7bbc99cb5c8e203b6c3f9dd6e4"
+    }
+  }
+}

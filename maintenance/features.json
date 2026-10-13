@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "remoteOps": {
+    "enabled": true,
+    "notifyAfterSeconds": 120,
+    "staleAfterSeconds": 300,
+    "maxTurnSeconds": 1800
+  },
+  "notifications": {
+    "enabled": true
+  },
+  "watchdog": {
+    "enabled": true,
+    "intervalSeconds": 30,
+    "maxStartsPerHour": 3
+  },
+  "memory": {
+    "enabled": true
+  },
+  "browser": {
+    "enabled": true
+  },
+  "retention": {
+    "keepNewest": 5,
+    "minAgeDays": 14,
+    "automaticDelete": false
+  }
+}

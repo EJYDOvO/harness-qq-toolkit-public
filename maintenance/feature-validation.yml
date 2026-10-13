@@ -1,0 +1,4 @@
+- id: im-qqbot
+  disabled: true
+- id: schedule
+  disabled: true

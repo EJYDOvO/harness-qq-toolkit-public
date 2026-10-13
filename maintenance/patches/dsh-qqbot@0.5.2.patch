@@ -1,0 +1,484 @@
+diff --git a/dist/features/approval-channel.js b/dist/features/approval-channel.js
+index 15182b6..8802825 100644
+--- a/dist/features/approval-channel.js
++++ b/dist/features/approval-channel.js
+@@ -1,142 +1,121 @@
+-import { decodeButtonData } from "./button-utils.js";
+-import { buildApprovalKeyboard, buildApprovalText } from "./approval-renderer.js";
+-const COMMAND_CLIP = 500;
+-/**
+- * 从 session log 按 callId 找回被 gate 的命令（审批请求本身不重复携带 arguments）。
+- * 对齐 TUI/web 的 `commandOf` 语义。
+- */
++import { randomUUID } from 'node:crypto';
++import { decodeButtonData } from './button-utils.js';
++import { buildApprovalKeyboard, buildApprovalText } from './approval-renderer.js';
+ function commandOf(req) {
+-    if (req.callId === undefined)
+-        return undefined;
+-    const events = req.agent.session.events;
+-    for (let i = events.length - 1; i >= 0; i -= 1) {
+-        const event = events[i];
+-        if (!event || event.type !== 'tool/call')
+-            continue;
+-        const data = event.data;
+-        if (String(data?.callId) !== String(req.callId))
+-            continue;
+-        const raw = data?.arguments;
+-        if (typeof raw !== 'string')
+-            return undefined;
++    if (req.callId === undefined) return undefined;
++    const session = req.agent.session;
++    for(let seq = session.seq - 1; seq >= 0; seq--){
++        const event = session.eventAt(seq);
++        if (event?.type !== 'tool/call' || String(event.data?.callId) !== String(req.callId)) continue;
++        const raw = event.data?.arguments;
++        if (typeof raw !== 'string') return undefined;
+         try {
+             const parsed = JSON.parse(raw);
+-            if (parsed !== null && typeof parsed === 'object' && 'command' in parsed) {
+-                const command = parsed.command;
+-                if (typeof command === 'string')
+-                    return command;
+-            }
+-        }
+-        catch {
+-            // 非 JSON，回退到原始字符串
+-        }
+-        return raw.length <= COMMAND_CLIP ? raw : `${raw.slice(0, COMMAND_CLIP)}…`;
++            if (parsed && typeof parsed.command === 'string') return parsed.command;
++        } catch  {}
++        return raw.length <= 500 ? raw : `${raw.slice(0, 500)}…`;
+     }
+     return undefined;
+ }
+ export class ApprovalChannel {
+-    pending = new Map();
+     manager;
+     sender;
+     logger;
+-    constructor(manager, sender, logger) {
++    pending = new Map();
++    installed = false;
++    constructor(manager, sender, logger){
+         this.manager = manager;
+         this.sender = sender;
+         this.logger = logger;
+     }
+-    /**
+-     * 注册 approval/request waterfall answerer。approval 服务未挂载时优雅禁用。
+-     */
+     install(ctx) {
+-        let hasApproval = false;
+-        try {
+-            hasApproval = ctx.get('approval') !== undefined;
+-        }
+-        catch {
+-            hasApproval = false;
+-        }
+-        if (!hasApproval) {
+-            this.logger.debug('im-qqbot: approval service unavailable — approval channel disabled');
+-            return;
+-        }
+-        const self = this;
+-        ctx.on('approval/request', (req, next) => {
++        if (this.installed) return;
++        this.installed = true;
++        ctx.on('approval/request', (req, next)=>{
+             const request = req;
+-            const nextFn = next;
+-            const record = self.manager.findBySessionId(request.agent.id);
+-            if (record)
+-                return self.park(record, request);
+-            return nextFn();
+-        }, { prepend: true });
++            const record = this.manager.findBySessionId(request.agent.id);
++            return record ? this.park(record, request) : next();
++        }, {
++            prepend: true
++        });
++        ctx.effect?.(()=>()=>{
++                for (const key of [
++                    ...this.pending.keys()
++                ])this.cancelPending(key);
++            });
+         this.logger.info('im-qqbot: QQ approval channel installed');
+     }
+-    /** 会话回收时清理其 pending 审批，避免 Promise 悬挂 */
+-    cancelPending(sessionKey) {
+-        const entry = this.pending.get(sessionKey);
+-        if (!entry)
+-            return;
+-        this.pending.delete(sessionKey);
+-        this.removeAbort(entry);
+-        entry.resolve('cancelled');
++    settle(key, entry, outcome) {
++        if (this.pending.get(key) !== entry) return;
++        this.pending.delete(key);
++        if (entry.timer) clearTimeout(entry.timer);
++        if (entry.onAbort) entry.request.signal?.removeEventListener('abort', entry.onAbort);
++        entry.resolve(outcome);
++    }
++    cancelPending(key) {
++        const entry = this.pending.get(key);
++        if (entry) this.settle(key, entry, 'cancelled');
+     }
+-    /** 按钮点击决策：解码 button_data，settle pending 审批 */
+     handleInteraction(event) {
+         const peerId = event.group_openid ?? event.user_openid;
+-        if (!peerId)
+-            return false;
++        if (!peerId) return false;
+         const scope = event.group_openid ? 'group' : 'c2c';
+         const record = this.manager.getSessionRecord(scope, peerId);
+-        if (!record)
+-            return false;
++        if (!record) return false;
+         const entry = this.pending.get(record.sessionKey);
+-        if (!entry)
+-            return false;
+-        const data = event.data?.resolved?.button_data;
+-        if (!data)
++        const raw = event.data?.resolved?.button_data;
++        const button = raw ? decodeButtonData(raw) : undefined;
++        if (!entry || !button || button.t !== 'approval' || button.n !== entry.nonce) return false;
++        if (button.d !== 'allow' && button.d !== 'deny') return false;
++        if (!event.user_openid || event.user_openid !== entry.approverId) return false;
++        if (entry.request.signal?.aborted) {
++            this.settle(record.sessionKey, entry, 'cancelled');
+             return false;
+-        const button = decodeButtonData(data);
+-        if (!button || button.t !== 'approval')
+-            return false;
+-        this.pending.delete(record.sessionKey);
+-        this.removeAbort(entry);
+-        entry.resolve(button.d === 'allow' ? 'allowed-once' : 'rejected');
++        }
++        this.settle(record.sessionKey, entry, button.d === 'allow' ? 'allowed-once' : 'rejected');
+         return true;
+     }
+-    /** 走 QQ 通道：发审批消息 + 挂起 Promise，等待用户决策 */
+-    async park(record, request) {
++    park(record, request) {
+         const key = record.sessionKey;
+-        // 会话回收/取消可能在发送前发生：signal 已 abort 则直接失败
+-        if (request.signal?.aborted)
+-            return 'cancelled';
+-        const command = commandOf(request);
++        if (request.signal?.aborted) return Promise.resolve('cancelled');
++        if (this.pending.has(key)) return Promise.resolve('unavailable');
++        const approverId = record.senderId || (record.scope === 'c2c' ? record.replyTarget.targetId : undefined);
++        if (!approverId) return Promise.resolve('unavailable');
++        let command;
+         try {
+-            await this.sender.sendMarkdown(record.replyTarget, buildApprovalText(request, command), { keyboard: buildApprovalKeyboard() });
++            command = commandOf(request);
++        } catch (error) {
++            this.logger.error(`im-qqbot: approval command lookup failed: ${String(error)}`);
++            return Promise.resolve('unavailable');
+         }
+-        catch (err) {
+-            const msg = err instanceof Error ? err.message : String(err);
+-            this.logger.error(`im-qqbot: approval send failed key=${key}: ${msg}`);
+-            return 'unavailable'; // 无法呈现审批，fail-closed
+-        }
+-        return new Promise((resolve) => {
+-            const entry = { record, request, resolve };
+-            if (request.signal) {
+-                const onAbort = () => {
+-                    if (this.pending.get(key) !== entry)
+-                        return;
+-                    this.pending.delete(key);
+-                    resolve('cancelled');
+-                };
+-                entry.onAbort = onAbort;
+-                request.signal.addEventListener('abort', onAbort, { once: true });
+-            }
++        return new Promise((resolve)=>{
++            const entry = {
++                request,
++                nonce: randomUUID(),
++                approverId,
++                resolve
++            };
+             this.pending.set(key, entry);
+-            this.logger.info(`im-qqbot: approval sent to QQ, waiting for decision key=${key}`);
++            entry.onAbort = ()=>this.settle(key, entry, 'cancelled');
++            request.signal?.addEventListener('abort', entry.onAbort, {
++                once: true
++            });
++            entry.timer = setTimeout(()=>this.settle(key, entry, 'cancelled'), 300_000);
++            if (request.signal?.aborted) {
++                this.settle(key, entry, 'cancelled');
++                return;
++            }
++            Promise.resolve().then(()=>{
++                if (this.pending.get(key) !== entry) return;
++                return this.sender.sendMarkdown(record.replyTarget, buildApprovalText(request, command), {
++                    keyboard: buildApprovalKeyboard(entry.nonce)
++                });
++            }).then(()=>{
++                if (this.pending.get(key) === entry) this.logger.info(`im-qqbot: approval sent to QQ, waiting for decision key=${key}`);
++            }, (error)=>{
++                this.logger.error(`im-qqbot: approval send failed key=${key}: ${String(error)}`);
++                this.settle(key, entry, 'unavailable');
++            });
+         });
+     }
+-    removeAbort(entry) {
+-        if (entry.onAbort && entry.request.signal) {
+-            entry.request.signal.removeEventListener('abort', entry.onAbort);
+-        }
+-    }
+ }
+-//# sourceMappingURL=approval-channel.js.map
+\ No newline at end of file
+diff --git a/dist/features/approval-renderer.js b/dist/features/approval-renderer.js
+index ad00ad3..77bf8ad 100644
+--- a/dist/features/approval-renderer.js
++++ b/dist/features/approval-renderer.js
+@@ -24,7 +24,7 @@ export function buildApprovalText(request, command) {
+  * 无 allow-always，因此只提供两个按钮；`group_id` 相同实现单选互斥变灰。
+  * button_data 编码 `{"t":"approval","d":"allow"|"deny"}`，由分发器解码。
+  */
+-export function buildApprovalKeyboard() {
++export function buildApprovalKeyboard(nonce) {
+     const allow = {
+         id: 'approval-allow',
+         render_data: { label: '✅ 允许一次', visited_label: '✓ 已允许', style: 1 },
+@@ -32,7 +32,7 @@ export function buildApprovalKeyboard() {
+             type: 1,
+             permission: { type: 2 },
+             click_limit: 1,
+-            data: encodeButtonData({ t: 'approval', d: 'allow' }),
++            data: encodeButtonData({ t: 'approval', d: 'allow', n: nonce }),
+         },
+         group_id: 'approval',
+     };
+@@ -43,10 +43,9 @@ export function buildApprovalKeyboard() {
+             type: 1,
+             permission: { type: 2 },
+             click_limit: 1,
+-            data: encodeButtonData({ t: 'approval', d: 'deny' }),
++            data: encodeButtonData({ t: 'approval', d: 'deny', n: nonce }),
+         },
+         group_id: 'approval',
+     };
+     return { content: { rows: [{ buttons: [allow, deny] }] } };
+ }
+-//# sourceMappingURL=approval-renderer.js.map
+\ No newline at end of file
+diff --git a/dist/features/question-channel.js b/dist/features/question-channel.js
+index 3d2811c..21f91e1 100644
+--- a/dist/features/question-channel.js
++++ b/dist/features/question-channel.js
+@@ -1,3 +1,4 @@
++import { randomUUID } from 'node:crypto';
+ import { parseAnswer } from "./answer-parser.js";
+ import { buildKeyboard, formatQuestion } from "./question-renderer.js";
+ import { decodeButtonData } from "./button-utils.js";
+@@ -109,7 +110,7 @@ export class QuestionChannel {
+         if (!data)
+             return false;
+         const button = decodeButtonData(data);
+-        if (!button || button.t !== 'question')
++        if (!button || button.t !== 'question' || button.n !== entry.nonce || event.user_openid !== entry.record.senderId)
+             return false;
+         const current = entry.request.questions[entry.index];
+         if (!current)
+@@ -120,7 +121,7 @@ export class QuestionChannel {
+             return false;
+         const idx = button.i;
+         const opts = current.options ?? [];
+-        if (idx < 0 || idx >= opts.length)
++        if (!Number.isInteger(idx) || idx < 0 || idx >= opts.length)
+             return false;
+         this.advance(entry, record.sessionKey, { id: current.id, selected: [opts[idx].label] });
+         return true;
+@@ -143,9 +144,9 @@ export class QuestionChannel {
+         const first = request.questions[0];
+         if (!first)
+             throw new Error('ask_user_question with empty questions');
+-        await this.sendQuestion(record, first);
+         return new Promise((resolve, reject) => {
+-            const entry = { record, request, resolve, reject, index: 0, collected: [] };
++            const entry = { record, request, resolve, reject, index: 0, collected: [], nonce: randomUUID() };
++            this.pending.set(key, entry);
+             if (request.signal) {
+                 const onAbort = () => {
+                     if (this.pending.get(key) !== entry)
+@@ -158,7 +159,8 @@ export class QuestionChannel {
+                 request.signal.addEventListener('abort', onAbort, { once: true });
+             }
+             entry.timer = setTimeout(() => this.onTimeout(key), this.config.askTimeoutMs);
+-            this.pending.set(key, entry);
++            if (request.signal?.aborted) { this.cancelPending(key); return; }
++            void this.sendQuestion(record, first, entry.nonce).catch(error => this.fail(entry, key, error));
+             this.logger.info(`im-qqbot: question sent to QQ, waiting for answer key=${key}`);
+         });
+     }
+@@ -169,12 +171,8 @@ export class QuestionChannel {
+         if (entry.index < entry.request.questions.length) {
+             const next = entry.request.questions[entry.index];
+             this.resetTimer(entry, key);
+-            void this.sendQuestion(entry.record, next).catch((err) => {
+-                this.pending.delete(key);
+-                this.clearTimer(entry);
+-                this.removeAbort(entry);
+-                entry.reject(err instanceof Error ? err : new Error(String(err)));
+-            });
++            entry.nonce = randomUUID();
++            void this.sendQuestion(entry.record, next, entry.nonce).catch(err => this.fail(entry, key, err));
+             return;
+         }
+         this.pending.delete(key);
+@@ -184,9 +182,16 @@ export class QuestionChannel {
+         entry.resolve({ answers: entry.collected });
+     }
+     /** 发送单个问题：优先带按钮，按钮发送失败降级纯文本 */
+-    async sendQuestion(record, question) {
++    fail(entry, key, error) {
++        if (this.pending.get(key) !== entry) return;
++        this.pending.delete(key);
++        this.clearTimer(entry);
++        this.removeAbort(entry);
++        entry.reject(error instanceof Error ? error : new Error(String(error)));
++    }
++    async sendQuestion(record, question, nonce) {
+         const hint = record.scope === 'group' && this.config.requireMention === true;
+-        const keyboard = buildKeyboard(question);
++        const keyboard = buildKeyboard(question, nonce);
+         try {
+             if (keyboard) {
+                 try {
+diff --git a/dist/features/question-renderer.js b/dist/features/question-renderer.js
+index dc2e41f..0757387 100644
+--- a/dist/features/question-renderer.js
++++ b/dist/features/question-renderer.js
+@@ -8,7 +8,7 @@ import { BUTTONS_PER_ROW, buttonLabel, encodeButtonData } from "./button-utils.j
+  * `t` 顶层判别字段供 interaction 统一路由；`q` 关联「当前正在问的题」：逐题
+  * 推进时旧题按钮在新题发出后被点击，其 q 不等于当前题 id，可被识别并忽略。
+  */
+-export function buildKeyboard(question) {
++export function buildKeyboard(question, nonce) {
+     const opts = question.options ?? [];
+     if (opts.length === 0 || question.multiSelect)
+         return undefined;
+@@ -28,7 +28,7 @@ export function buildKeyboard(question) {
+                         type: 1,
+                         permission: { type: 2 },
+                         click_limit: 1,
+-                        data: encodeButtonData({ t: 'question', q: question.id, i: idx }),
++                        data: encodeButtonData({ t: 'question', q: question.id, i: idx, n: nonce }),
+                     },
+                     // 同一题的选项共享分组：点一个后其余变灰（单选互斥）
+                     group_id: `q-${question.id}`,
+diff --git a/dist/gateway/middleware-setup.js b/dist/gateway/middleware-setup.js
+index ca4b002..0abed48 100644
+--- a/dist/gateway/middleware-setup.js
++++ b/dist/gateway/middleware-setup.js
+@@ -12,11 +12,11 @@ export function setupMiddlewares(bot, config, manager, logger) {
+     bot.use(accessPolicy({
+         c2c: {
+             mode: config.access.c2cMode,
+-            allow: config.access.c2cAllow.length > 0 ? config.access.c2cAllow : ['*'],
++            allow: config.access.c2cAllow,
+         },
+         group: {
+             mode: config.access.groupMode,
+-            allow: config.access.groupAllow.length > 0 ? config.access.groupAllow : ['*'],
++            allow: config.access.groupAllow,
+         },
+         onBlock: (_mCtx, reason) => {
+             if (config.debug) {
+@@ -52,7 +52,7 @@ export function setupMiddlewares(bot, config, manager, logger) {
+         // 关闭 autoHelp：help 命令由 qqbot 注册为 /bot-help，
+         // 避免 SDK 再自动注册一个无前缀的 /help 造成重复
+         autoHelp: false,
+-        commands: buildCommandList({ manager, config }),
++        commands: [...buildCommandList({ manager, config }), ...(manager.ctx?.get('qqRemoteOps')?.commands(manager) ?? [])],
+     });
+     bot.use(slash.middleware);
+     // 8.5. 待答问题截获（在 concurrencyGuard 之前，答案消息不排队直接作答）
+diff --git a/dist/media/send-file-tool.js b/dist/media/send-file-tool.js
+index 553fd46..785c954 100644
+--- a/dist/media/send-file-tool.js
++++ b/dist/media/send-file-tool.js
+@@ -7,7 +7,7 @@
+  *   - 路径白名单：默认只允许访问 media 目录 + agent cwd，可开关 + 扩展白名单。
+  */
+ import { existsSync } from 'node:fs';
+-import { stat } from 'node:fs/promises';
++import { stat, realpath } from 'node:fs/promises';
+ import { basename, isAbsolute, relative, resolve } from 'node:path';
+ import { MEDIA_ROOT } from "./media-cleaner.js";
+ /** 工具名（qqbot 前缀避免与其他通道的同名工具冲突） */
+@@ -36,11 +36,15 @@ function isWithinRoot(filePath, root) {
+     return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+ }
+ /** 路径白名单校验：restrictPaths 关闭时放行任意路径，否则限定 media + cwd + extraRoots */
+-function isPathAllowed(filePath, config, cwd) {
++async function isPathAllowed(filePath, config, cwd) {
+     if (!config.restrictPaths)
+         return true;
+     const roots = [MEDIA_ROOT, cwd, ...config.extraRoots];
+-    return roots.some((root) => isWithinRoot(filePath, root));
++    for (const root of roots) {
++        try { if (isWithinRoot(filePath, await realpath(root))) return true; }
++        catch (error) { if (error.code !== 'ENOENT') throw error; }
++    }
++    return false;
+ }
+ /** 注册 qqbot_send_file 工具（tools 服务缺失时优雅降级，不阻断插件启动） */
+ export function registerSendFileTool(ctx, bot, manager, config, logger) {
+@@ -105,9 +109,15 @@ export function registerSendFileTool(ctx, bot, manager, config, logger) {
+             if (replyTarget === undefined) {
+                 throw new Error('qqbot_send_file: 无法确定发送目标，请显式传 target 参数');
+             }
++            const access = config.access;
++            const mode = replyTarget.scope === 'c2c' ? access.c2cMode : access.groupMode;
++            const allow = replyTarget.scope === 'c2c' ? access.c2cAllow : access.groupAllow;
++            if (mode !== 'open' && !(mode === 'allowlist' && allow.includes(replyTarget.targetId))) {
++                throw new Error('qqbot_send_file: recipient is not allowed by the access policy');
++            }
+             // 2. 校验文件 + 路径白名单
+-            const absPath = resolve(file_path);
+-            if (!isPathAllowed(absPath, config.sendFile, cwd)) {
++            const absPath = await realpath(resolve(file_path));
++            if (!await isPathAllowed(absPath, config.sendFile, cwd)) {
+                 throw new Error(`qqbot_send_file: file_path 不在允许的目录内: ${absPath}`);
+             }
+             if (!existsSync(absPath)) {
+diff --git a/dist/index.js b/dist/index.js
+index c4998d0..166c01c 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -4,7 +4,8 @@ import { getProfileDir, resolveEnv } from "./shared/index.js";
+ import { ensureCredentials, persistCredentialsToProfile, registerBoundCredentialRoutes } from "./setup/index.js";
+ // ── Cordis 插件元数据 ──
+ export const name = 'im-qqbot';
+-export const inject = ['agents'];
++// Harness 0.2 uses a service-name map/array, not upstream Cordis required/optional metadata.
++export const inject = ['agents', 'qqRemoteOps'];
+ export const Config = ConfigSchema;
+ // ── 插件主体 ──
+ export async function apply(ctx, config) {
+@@ -58,4 +59,4 @@ export async function apply(ctx, config) {
+     const resolvedConfig = { ...config, appId, appSecret };
+     await bootstrapGateway(ctx, agents, resolvedConfig, logger);
+ }
+-//# sourceMappingURL=index.js.map
+\ No newline at end of file
++//# sourceMappingURL=index.js.map
+diff --git a/dist/gateway/bootstrap.js b/dist/gateway/bootstrap.js
+index 070f21e..9bc8106 100644
+--- a/dist/gateway/bootstrap.js
++++ b/dist/gateway/bootstrap.js
+@@ -89,6 +89,7 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+     const approvalChannel = new ApprovalChannel(manager, sender, logger);
+     manager.approvalChannel = approvalChannel;
+     approvalChannel.install(ctx);
++    ctx.get('qqRemoteOps')?.attach({ bot, manager, sender, config });
+     // ── 按钮点击回调（interaction）：统一分发到问答/审批通道 ──
+     bot.on('interaction', async (_iCtx, event) => {
+         // scope/targetId 推导对齐消息事件（inbound.ts）：按 scene 判定类型，群用 group_openid，私聊用 user_openid

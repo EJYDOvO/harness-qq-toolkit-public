@@ -1,0 +1,78 @@
+{
+  "name": "dsh-task-memory-local",
+  "version": "0.1.0-local.2",
+  "description": "Task-isolated long-term memory for DeepSeek Harness: remember / recall / search stay inside one task boundary, with optional prompt injection. Locally reviewed adapter for Harness 0.2.0-rc.2.",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh.md",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "homepage": "https://dsh.pub/en/plugins/dsh-task-memory/",
+  "bugs": {
+    "url": "https://github.com/wangyihao0001-oss/dsh-task-memory/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wangyihao0001-oss/dsh-task-memory.git"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis",
+    "memory",
+    "task-memory",
+    "long-term-memory",
+    "isolation"
+  ],
+  "dsh": {
+    "displayName": "Task Memory",
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test",
+    "smoke": "npm run build && node scripts/smoke.mjs"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-agent": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-home-paths": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-system-prompt": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-tools": "0.2.0-rc.2",
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-agent": "^0.1.0-rc.8",
+    "@deepseek-ai/dsh-home-paths": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-system-prompt": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-tools": "^0.1.0-rc.6",
+    "@deepseek-ai/schemastery": "^3.18.1",
+    "@types/node": "^22.15.0",
+    "typescript": "^5.8.3"
+  },
+  "private": true
+}

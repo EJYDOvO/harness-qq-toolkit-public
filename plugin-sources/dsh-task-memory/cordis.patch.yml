@@ -1,0 +1,15 @@
+- insert:
+    - id: task-memory
+      name: dsh-task-memory-local
+      config:
+        # Max memories injected into the system prompt for the active task.
+        injectLimit: 8
+        # Soft character budget for the injected memory block.
+        injectMaxChars: 2400
+        # Per-entry character cap inside the injected block (content is truncated).
+        injectMaxEntryChars: 400
+        # When true, inject pinned + recent memories for the active task (per agent).
+        injectPrompt: true
+        # Max entries per vault (>= 1); oldest non-pinned entries are evicted
+        # first (pinned entries are never evicted).
+        maxEntries: 500

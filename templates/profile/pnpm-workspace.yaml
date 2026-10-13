@@ -1,0 +1,14 @@
+packages:
+  - .
+nodeLinker: hoisted
+autoInstallPeers: false
+minimumReleaseAgeExclude:
+  - dshmarket@1.66.15 || 1.66.17
+  - dsh-free-search@0.8.5
+  - dsh-free-search@0.8.8
+  - '@tencent-connect/dsh-qqbot@0.5.2'
+  - dsh-free-search@0.8.9
+  - dshmarket@1.66.18
+  - '@tencent-connect/qqbot-nodejs@1.0.5'
+patchedDependencies:
+  '@tencent-connect/dsh-qqbot@0.5.2': patches/dsh-qqbot@0.5.2.patch

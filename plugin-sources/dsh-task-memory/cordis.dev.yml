@@ -1,0 +1,11 @@
+# Dev overlay: load the local build without `dsh plugin add`.
+# Set `name` to the absolute path of this repo's lib/index.js.
+- insert:
+    - id: task-memory
+      name: '/absolute/path/to/dsh-task-memory/lib/index.js'
+      config:
+        injectLimit: 8
+        injectMaxChars: 2400
+        injectMaxEntryChars: 400
+        injectPrompt: true
+        maxEntries: 500

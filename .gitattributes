@@ -1,0 +1,5 @@
+* -text
+*.tgz -text
+maintenance/qqbot-upstream-0.5.2/** -text
+maintenance/qqbot-src/** -text
+maintenance/patches/** -text

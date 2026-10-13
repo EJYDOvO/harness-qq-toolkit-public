@@ -1,0 +1,10 @@
+{
+  "name": "harness-qq-toolkit",
+  "version": "1.0.0",
+  "private": true,
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "pretest": "node -e \"require('node:fs').mkdirSync('tmp',{recursive:true})\"",
+    "test": "node --test maintenance/remote-ops.test.mjs plugin-sources/dsh-task-memory/tests/render.test.mjs"
+  }
+}

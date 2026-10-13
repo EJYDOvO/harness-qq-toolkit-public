@@ -1,0 +1,38 @@
+# Reference only. QQ is disabled until local credentials and owner are supplied.
+- id: im-qqbot
+  disabled: true
+  config:
+    preset: cordis
+    cwd: D:/DeepSeek-Harness/default-workspace
+    requireMention: true
+    streaming: true
+    showToolResults: false
+    debug: false
+    sessionIdleTimeout: 7200000
+    processingTimeoutMs: 1800000
+    askTimeoutMs: 600000
+    maxQueue: 8
+    textChunkLimit: 3500
+    appId: <LOCAL_QQ_APP_ID>
+    appSecret: <LOCAL_QQ_APP_SECRET>
+    access:
+      c2cMode: allowlist
+      c2cAllow:
+        - <LOCAL_OWNER_OPENID>
+      groupMode: disabled
+      groupAllow: []
+    sendFile:
+      restrictPaths: true
+- id: subagent
+  config:
+    maxDepth: 1
+    maxActiveSubagents: 3
+- id: task-memory
+  disabled: false
+  config:
+    storageRoot: D:/DeepSeek-Harness/data/storages/task-memory
+    injectPrompt: false
+    injectLimit: 5
+    injectMaxChars: 1200
+    injectMaxEntryChars: 300
+    maxEntries: 500

@@ -1,0 +1,15 @@
+{
+  "package": "@tencent-connect/dsh-qqbot",
+  "version": "0.5.2",
+  "source": "https://registry.npmjs.org/@tencent-connect/dsh-qqbot/-/dsh-qqbot-0.5.2.tgz",
+  "files": {
+    "dist/features/approval-channel.js": "c7ff9430a3d6d81b359ce020fee7414757fb7c9142337fcd6a8c79280927f035",
+    "dist/features/approval-renderer.js": "80936460b92c58a1261b4109287a6b9801dcecfab72292127a73612085c16513",
+    "dist/features/question-channel.js": "8f15e35561028cd7c72659abf3914f625a6c2200e11ef8bab7d8814c3670f8f4",
+    "dist/features/question-renderer.js": "d976493c515debc8d5c42e2bc8b85774d6b4d933072bc0e68247972ec8a2a77b",
+    "dist/gateway/middleware-setup.js": "0a6603cb3e84ad9a56aecbaa38149b8653eaf08c6107d292c6d594651a4f9658",
+    "dist/media/send-file-tool.js": "8dd8ecf0ab0d14bf68a1191efebe90c3ec89110465a2938e1fe92261123eb45e",
+    "dist/index.js": "dc03a2712e87b10d7a83662b26284652fd59d7784ca2a10a21eb680d61aafa13",
+    "dist/gateway/bootstrap.js": "0874656c4f2a2111e578316720c7a96a6ccfa6e7b75b99c178fc6378d9c4a7f3"
+  }
+}

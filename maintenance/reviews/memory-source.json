@@ -1,0 +1,14 @@
+{
+  "repository": "https://github.com/wangyihao0001-oss/dsh-task-memory",
+  "commit": "96e6552a26b11b6430e48cbd37755bb40f1a13dc",
+  "originalVersion": "0.1.0",
+  "adaptedPackage": "dsh-task-memory-local",
+  "adaptedVersion": "0.1.0-local.2",
+  "reason": "Upstream peer contract only covers 0.1.x; local adapter is limited to 0.2.0-rc.2, requires real host tool validation before deployment.",
+  "modifications": [
+    "package identity and exact core peer contract",
+    "bundle module name",
+    "Recall and search render stored content into model-visible tool messages"
+  ],
+  "license": "MIT"
+}
