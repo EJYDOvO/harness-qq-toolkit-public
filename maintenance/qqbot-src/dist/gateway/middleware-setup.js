@@ -57,8 +57,10 @@ export function setupMiddlewares(bot, config, manager, logger) {
             const msg = cmdCtx.message;
             const scope = msg.kind === 'group' ? 'group' : 'c2c';
             const record = manager.getSessionRecord(scope, scope === 'group' ? (msg.groupOpenid ?? msg.senderId) : msg.senderId);
-            const service = record && manager.ctx.get('agentPresets')?.serviceFor?.(record.agent, 'interactionPolicy');
-            service?.get(record.agent).stopOutput();
+            try {
+                const service = record && manager.ctx.get('agentPresets')?.serviceFor?.(record.agent, 'interactionPolicy');
+                service?.get(record.agent).stopOutput();
+            } catch { logger.warn?.('Interaction unavailable during stop; continuing native cancellation'); }
             return nativeStop(cmdCtx);
         };
     }
@@ -84,7 +86,10 @@ export function setupMiddlewares(bot, config, manager, logger) {
             const admitted = await manager.admitInteractionInput(mCtx);
             if (admitted !== record) throw new Error('Interaction Session changed during admission');
         }
-        policy.revise(createUserMessage({ content: [{ type: 'text', text: msg.content }], source: { kind: 'user' } }));
+        record.replyTarget = { scope: 'c2c', targetId: msg.senderId, msgId: msg.messageId };
+        const message=createUserMessage({ content: [{ type: 'text', text: msg.content }], source: { kind: 'user' } });
+        manager.registerInteractionInput?.(record,message);
+        policy.revise(message);
     });
     // 9. 并发串行 + 消息合并（同 peer 排队，避免 session 冲突）
     bot.use(concurrencyGuard({

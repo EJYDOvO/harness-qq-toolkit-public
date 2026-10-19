@@ -21,3 +21,6 @@ Character 的原生隔离探针使用真实 DSH Loop、实际 QQ 出站/中间�
 兼容补丁仍从原始 0.5.2 快照生成，不能手改安装目录。部署前必须重建/检查补丁、生成新的锁文件与候选包并执行完整回归。旧 `plugin-packages` 的恢复包不包含候选改动；不可用旧包版本号覆盖打包，或只修改源码就声称已启用。
 
 配套实例的最终真实 QQ 入站测试已正常完成，用户确认手机气泡正常、没有重复消息；真实逐帧时序、异常网络与频控仍未专项验收。完整部署与回退记录见 [Character test.10](https://github.com/EJYDOvO/character-agent-v1/blob/main/docs/RELEASE-test10.md)。
+# 未发布修复说明
+
+2026-10-20：新增可信 native input 登记、协议长度分片、额度共享、可取消 SDK 重试与响应正文 deadline。需要配套 QQ Bot 0.5.2 和 SDK 1.0.5 两份补丁，完整接口、操作及验证边界见 [审计修复说明](INTERACTION-AUDIT-FIXES.md)。以下原设计/部署记录不代表修复候选已经部署。

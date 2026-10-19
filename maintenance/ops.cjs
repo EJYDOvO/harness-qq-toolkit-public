@@ -117,7 +117,19 @@ function verify(dir = profile) {
   assert.equal(settings.autoInstallPeers, false, 'Profile must use the bundled core runtime');
   const a = require('./read-asar.cjs').openArchive();
   let runtime; try { runtime = JSON.parse(a.read('dsh/package.json')).version; } finally { a.close(); }
-  assert.equal(qq.preset, 'cordis');
+  const characterEnabled=manifest.dsh?.profile?.bundles?.includes('dsh-character-core');
+  assert.equal(qq.preset, characterEnabled ? 'qq-character' : 'cordis');
+  if(characterEnabled){
+    assert.equal(qq.access.c2cAllow.length,1,'Character V1 requires exactly one Owner');
+    assert.equal(qq.access.groupMode,'disabled');
+    assert(!manifest.dsh.profile.bundles.includes('@tencent-connect/dsh-qqbot'),'Core owns the only QQ gateway');
+    assert(!manifest.dsh.profile.bundles.includes('dsh-remote-ops-local'),'Core owns Remote Ops');
+    const pins=JSON.parse(fs.readFileSync(path.join(dir,'character-artifacts.json'),'utf8'));
+    for(const [name,pin]of Object.entries(pins)){
+      assert.equal(manifest.dependencies[name],pin.source,'Character artifact source changed');
+      assert.equal(require('node:crypto').createHash('sha256').update(fs.readFileSync(pin.source.slice(5))).digest('hex'),pin.sha256,'Character artifact integrity failed');
+    }
+  }
   assert.equal(qq.access.c2cMode, 'allowlist');
   assert(qq.access.c2cAllow.length > 0);
   assert(qq.access.c2cAllow.every(id=>typeof id==='string' && id.length>0 && id!=='*'), 'Private whitelist must name individual users');
@@ -133,6 +145,9 @@ function verify(dir = profile) {
     assert.equal(require('node:crypto').createHash('sha256').update(fs.readFileSync(entry.source.slice(5))).digest('hex'),entry.sha256,`Local artifact changed: ${name}`);
   }
   assert.equal(settings.patchedDependencies?.[`@tencent-connect/dsh-qqbot@${policy.targets['@tencent-connect/dsh-qqbot']}`], policy.qqPatch);
+  assert.equal(settings.patchedDependencies?.['@tencent-connect/qqbot-nodejs@1.0.5'],'patches/qqbot-nodejs@1.0.5.patch');
+  const sdkManifest=JSON.parse(fs.readFileSync(path.join(__dirname,'sdk-upstream-1.0.5/manifest.json'),'utf8'));
+  for(const file of Object.keys(sdkManifest.files))assert.equal(fs.readFileSync(path.join(dir,'node_modules/@tencent-connect/qqbot-nodejs',file),'utf8').replaceAll('\r\n','\n'),fs.readFileSync(path.join(__dirname,'sdk-src',file),'utf8').replaceAll('\r\n','\n'),`Installed SDK differs: ${file}`);
   const channel = fs.readFileSync(path.join(dir,'node_modules/@tencent-connect/dsh-qqbot/dist/features/approval-channel.js'),'utf8');
   assert(channel.includes('session.eventAt(seq)'), 'QQ approval patch is missing');
   assert(channel.includes('button.n !== entry.nonce'), 'QQ approval replay protection is missing');

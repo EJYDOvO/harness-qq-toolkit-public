@@ -374,7 +374,7 @@ index dc2e41f..0757387 100644
                      // 同一题的选项共享分组：点一个后其余变灰（单选互斥）
                      group_id: `q-${question.id}`,
 diff --git a/dist/gateway/middleware-setup.js b/dist/gateway/middleware-setup.js
-index ca4b002..71a6630 100644
+index ca4b002..25a5e7f 100644
 --- a/dist/gateway/middleware-setup.js
 +++ b/dist/gateway/middleware-setup.js
 @@ -3,6 +3,7 @@ import { buildCommandList } from "../commands/index.js";
@@ -399,7 +399,7 @@ index ca4b002..71a6630 100644
          },
          onBlock: (_mCtx, reason) => {
              if (config.debug) {
-@@ -48,15 +49,43 @@ export function setupMiddlewares(bot, config, manager, logger) {
+@@ -48,15 +49,48 @@ export function setupMiddlewares(bot, config, manager, logger) {
      // 7. 三层限流（sender / group / global）
      bot.use(rateLimiter());
      // 8. 斜杠命令（在 concurrencyGuard 之前，命令匹配后不排队直接响应）
@@ -411,8 +411,10 @@ index ca4b002..71a6630 100644
 +            const msg = cmdCtx.message;
 +            const scope = msg.kind === 'group' ? 'group' : 'c2c';
 +            const record = manager.getSessionRecord(scope, scope === 'group' ? (msg.groupOpenid ?? msg.senderId) : msg.senderId);
-+            const service = record && manager.ctx.get('agentPresets')?.serviceFor?.(record.agent, 'interactionPolicy');
-+            service?.get(record.agent).stopOutput();
++            try {
++                const service = record && manager.ctx.get('agentPresets')?.serviceFor?.(record.agent, 'interactionPolicy');
++                service?.get(record.agent).stopOutput();
++            } catch { logger.warn?.('Interaction unavailable during stop; continuing native cancellation'); }
 +            return nativeStop(cmdCtx);
 +        };
 +    }
@@ -439,12 +441,15 @@ index ca4b002..71a6630 100644
 +            const admitted = await manager.admitInteractionInput(mCtx);
 +            if (admitted !== record) throw new Error('Interaction Session changed during admission');
 +        }
-+        policy.revise(createUserMessage({ content: [{ type: 'text', text: msg.content }], source: { kind: 'user' } }));
++        record.replyTarget = { scope: 'c2c', targetId: msg.senderId, msgId: msg.messageId };
++        const message=createUserMessage({ content: [{ type: 'text', text: msg.content }], source: { kind: 'user' } });
++        manager.registerInteractionInput?.(record,message);
++        policy.revise(message);
 +    });
      // 9. 并发串行 + 消息合并（同 peer 排队，避免 session 冲突）
      bot.use(concurrencyGuard({
          strategy: 'merge',
-@@ -79,4 +108,4 @@ export function setupMiddlewares(bot, config, manager, logger) {
+@@ -79,4 +113,4 @@ export function setupMiddlewares(bot, config, manager, logger) {
          includeSender: true,
      }));
  }
@@ -520,7 +525,7 @@ index c4998d0..33b0125 100644
 \ No newline at end of file
 +//# sourceMappingURL=index.js.map
 diff --git a/dist/gateway/bootstrap.js b/dist/gateway/bootstrap.js
-index 070f21e..002570e 100644
+index 070f21e..d50afc8 100644
 --- a/dist/gateway/bootstrap.js
 +++ b/dist/gateway/bootstrap.js
 @@ -12,6 +12,8 @@ import { setupMiddlewares } from "./middleware-setup.js";
@@ -532,27 +537,67 @@ index 070f21e..002570e 100644
  /**
   * interaction 统一分发器：按 button_data 的顶层 `t` 判别字段，路由到对应
   * channel（question / approval）。QQ 只有一个 interaction 入口，集中路由
-@@ -30,7 +32,36 @@ function dispatchInteraction(event, manager) {
+@@ -30,7 +32,76 @@ function dispatchInteraction(event, manager) {
          return manager.approvalChannel?.handleInteraction(event) ?? false;
      return false;
  }
 +// Reusable transport wiring, separately testable without creating a QQ gateway.
 +export function createInteractionOutbound(ctx, manager, sender, config, logger, toolsRegistry) {
-+    const policyFor = record => record && ctx.get('agentPresets')?.serviceFor?.(record.agent, 'interactionPolicy')?.get(record.agent);
++    const policyFor = record => { try { return record && ctx.get('agentPresets')?.serviceFor?.(record.agent, 'interactionPolicy')?.get(record.agent); } catch { logger.warn?.('Interaction scope temporarily unavailable; withholding output');return null; } };
++    manager.registerInteractionInput=(record,message)=>{
++        const policy=policyFor(record);
++        if(policy){record.interactionSuppressed=false;policy.admitInput?.(message);}
++    };
++    const limit = Math.max(100, Math.min(4500, config.textChunkLimit ?? 4500));
++    function pieces(text) {
++        const parts=[];
++        while(text.length){let end=Math.min(limit,text.length);if(end<text.length&&/[\uD800-\uDBFF]/u.test(text[end-1]))end--;parts.push(text.slice(0,end));text=text.slice(end);}
++        return parts;
++    }
++    function boundedStream(target) {
++        let stream, latest='', cancelled=false;
++        return {
++            async update(text) {
++                if(cancelled)return;
++                latest=text;
++                const first=pieces(text)[0];if(first===undefined)return;
++                stream??=sender.openStream(target);
++                await stream.update(first);
++            },
++            async complete(){
++                // Overflow remains buffered until durable assistant settlement.
++                const parts=pieces(latest);
++                for(let i=0;i<parts.length;i++){
++                    if(cancelled)return;
++                    if(i>0){stream=sender.openStream(target);await stream.update(parts[i]);}
++                    if(cancelled)return;
++                    await stream?.complete();
++                }
++            },
++            cancel(){cancelled=true;stream?.cancel?.();}
++        };
++    }
 +    const presentationSender = { ...sender, sendMarkdown(target, text, opts) {
 +        const record = manager.getSessionRecord(target.scope, target.targetId);
 +        const policy = policyFor(record);
++        if(policy===null)return Promise.resolve();
 +        return policy?.transport ? policy.external(text, { kind: 'tool-or-error' }) : sender.sendMarkdown(target, text, opts);
 +    } };
 +    const legacyOutbound = createOutboundHandler(manager, presentationSender, config, logger, toolsRegistry);
 +    const outboundHandler = (session, event) => {
 +        const record = manager.findBySessionId(session.header.id);
 +        const policy = policyFor(record);
++        if(policy===null)return;
 +        if (policy) {
++            if(event.type==='user/message'){
++                const source=event.data?.message?.source??event.data?.source;
++                if(source?.kind&&!['user','runtime-context','skill-catalog'].includes(source.kind)){record.interactionSuppressed=true;policy.stopOutput();}
++            }
++            if(record.interactionSuppressed)return;
 +            const target = { ...record.replyTarget };
-+            policy.bind({ key: manager, sendText: (text) => sender.sendMarkdown(target, text),
++            policy.bind({ key: manager, requireIngress: true, sendText: async (text,meta) => {for(const part of pieces(text)){if(meta?.cancelled?.())return;await sender.sendMarkdown(target, part);}},
 +                waitingForUser: () => manager.approvalChannel?.pending.has(record.sessionKey) || manager.questionChannel?.pending.has(record.sessionKey),
-+                ...(config.streaming && target.scope === 'c2c' && target.msgId ? { openStream: () => sender.openStream(target) } : {}) });
++                ...(config.streaming && target.scope === 'c2c' && target.msgId ? { openStream: () => boundedStream(target) } : {}) });
 +            policy.event(event);
 +            if (['assistant/chunk', 'assistant/message'].includes(event.type)) return;
 +        }
@@ -569,9 +614,26 @@ index 070f21e..002570e 100644
      const manager = new SessionManager(ctx, agents, config, logger);
      // ── 初始化 QQ Bot SDK ──
      const userAgent = buildUserAgent();
-@@ -78,7 +109,8 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+@@ -70,15 +141,22 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+     const replyLimiter = new ReplyLimiter({ limit: 4 });
+     const sender = {
+         sendMarkdown: (target, content, opts) => sendResolvedMarkdown(bot, resolveReplyTarget(target, replyLimiter, true), content, opts),
+-        openStream: (target) => bot.openStream({
++        openStream: (target) => {
++            const resolved=resolveReplyTarget(target, replyLimiter, false);
++            if(!resolved.msgId){
++                let text='',cancelled=false;
++                return {async update(value){text=value;},async complete(){if(!cancelled)await sendResolvedMarkdown(bot,resolved,text);},cancel(){cancelled=true;}};
++            }
++            return bot.openStream({
+             target: {
+                 scope: target.scope,
+                 targetId: target.targetId,
+-                msgId: target.msgId,
++                msgId: resolved.msgId,
              },
-         }),
+-        }),
++        });},
      };
 -    const outboundHandler = createOutboundHandler(manager, sender, config, logger, toolsRegistry);
 +    // Optional Agent policy. No Character, Remote Ops or policy package dependency.
@@ -579,7 +641,7 @@ index 070f21e..002570e 100644
      ctx
          .on('session/event', outboundHandler);
      // ── 问答通道（ask_user_question → QQ 文本 + 按钮） ──
-@@ -89,6 +121,10 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+@@ -89,6 +167,10 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
      const approvalChannel = new ApprovalChannel(manager, sender, logger);
      manager.approvalChannel = approvalChannel;
      approvalChannel.install(ctx);
@@ -590,7 +652,7 @@ index 070f21e..002570e 100644
      // ── 按钮点击回调（interaction）：统一分发到问答/审批通道 ──
      bot.on('interaction', async (_iCtx, event) => {
          // scope/targetId 推导对齐消息事件（inbound.ts）：按 scene 判定类型，群用 group_openid，私聊用 user_openid
-@@ -146,11 +182,12 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+@@ -146,11 +228,12 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
          bot.start().catch((err) => {
              logger.error(`Bot start failed: ${err instanceof Error ? err.message : String(err)}`);
          });
@@ -657,3 +719,65 @@ index a470376..ccdcf39 100644
          this.debugLog = debugLog;
          this.load();
      }
+diff --git a/dist/transport/reply-limiter.js b/dist/transport/reply-limiter.js
+index bf09220..45e8ed1 100644
+--- a/dist/transport/reply-limiter.js
++++ b/dist/transport/reply-limiter.js
+@@ -19,10 +19,10 @@ export class ReplyLimiter {
+         const now = Date.now();
+         const tracked = this.messages.get(messageId);
+         if (!tracked) {
+-            return { allowed: true, remaining: this.limit };
++            return this.messages.size >= this.maxTracked ? { allowed: false, remaining: 0, fallbackReason: 'capacity' } : { allowed: true, remaining: this.limit };
+         }
+         if (now - tracked.firstSeenAt > this.ttlMs) {
+-            this.messages.delete(messageId);
++            // Keep the expired tombstone; a later lookup must not resurrect it.
+             return { allowed: false, remaining: 0, fallbackReason: 'expired' };
+         }
+         const remaining = Math.max(0, this.limit - tracked.count);
+@@ -40,9 +40,7 @@ export class ReplyLimiter {
+             return;
+         }
+         if (this.messages.size >= this.maxTracked) {
+-            const firstKey = this.messages.keys().next().value;
+-            if (firstKey !== undefined)
+-                this.messages.delete(firstKey);
++            return; // Fail closed at capacity instead of evicting spent leases.
+         }
+         this.messages.set(messageId, { count: 1, firstSeenAt: now });
+     }
+diff --git a/dist/transport/reply-target.js b/dist/transport/reply-target.js
+index 36a81a2..4970410 100644
+--- a/dist/transport/reply-target.js
++++ b/dist/transport/reply-target.js
+@@ -22,7 +22,10 @@ export function resolveReplyTarget(target, limiter, allowEvent) {
+     for (const c of getCachedReplyIds(target.scope, target.targetId)) {
+         candidates.push(c);
+     }
++    const seen = new Set();
+     for (const c of candidates) {
++        if (seen.has(c.id)) continue;
++        seen.add(c.id);
+         if (c.kind === 'event' && !allowEvent)
+             continue;
+         if (limiter.checkLimit(c.id).allowed) {
+diff --git a/dist/transport/inbound.js b/dist/transport/inbound.js
+index 1006265..ded9c4b 100644
+--- a/dist/transport/inbound.js
++++ b/dist/transport/inbound.js
+@@ -43,6 +43,7 @@ export async function handleInbound(ctx, manager, config, logger) {
+         content,
+         source: { kind: 'user' },
+     });
++    manager.registerInteractionInput?.(record,message);
+     record.agent.followup(message);
+     logger.info(`→ followup sent: key=${scope}:${peerId}`);
+     // 群消息回复后清空历史缓存（避免下次 @ 时重复组包）
+@@ -285,4 +286,4 @@ const SENDER_SHORT_ID_LEN = 8;
+ function shortSenderId(senderId) {
+     return senderId.slice(0, SENDER_SHORT_ID_LEN);
+ }
+-//# sourceMappingURL=inbound.js.map
+\ No newline at end of file
++//# sourceMappingURL=inbound.js.map

@@ -5,6 +5,7 @@
   "engines": { "node": ">=22" },
   "scripts": {
     "pretest": "node -e \"require('node:fs').mkdirSync('tmp',{recursive:true})\"",
-    "test": "node --test maintenance/remote-ops.test.mjs maintenance/interaction.test.mjs plugin-sources/dsh-task-memory/tests/render.test.mjs"
+    "test": "node --test maintenance/remote-ops.test.mjs maintenance/interaction.test.mjs plugin-sources/dsh-task-memory/tests/render.test.mjs",
+    "test:audit": "node --test maintenance/audit/*.test.mjs"
   }
 }

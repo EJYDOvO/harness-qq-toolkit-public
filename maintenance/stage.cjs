@@ -16,6 +16,7 @@ if (cmd === 'seal') {
   assert.deepEqual(record.baseline,hashes(profile),'Live profile changed while staging');
   record.candidate=hashes(stage);
   record.patch=hash(path.join(stage,policy.qqPatch));
+  record.sdkPatch=hash(path.join(stage,'patches/qqbot-nodejs@1.0.5.patch'));
   record.runtime=hash(path.join(root,'resources/app.asar'));
   record.features=hash(path.join(__dirname,'features.json'));
   record.policy=hash(path.join(__dirname,'plugin-policy.json'));
@@ -30,6 +31,7 @@ if (cmd === 'seal') {
   assert.deepEqual(record.baseline,hashes(profile),'Live profile changed: stage again');
   assert.deepEqual(record.candidate,hashes(stage),'Candidate changed: stage again');
   assert.equal(record.patch,hash(path.join(stage,policy.qqPatch)));
+  assert.equal(record.sdkPatch,hash(path.join(stage,'patches/qqbot-nodejs@1.0.5.patch')));
   assert.equal(record.runtime,hash(path.join(root,'resources/app.asar')),'Core changed: stage again');
   assert.equal(record.features,hash(path.join(__dirname,'features.json')),'Features changed: stage again');
   assert.equal(record.policy,hash(path.join(__dirname,'plugin-policy.json')),'Policy changed: stage again');
@@ -54,6 +56,7 @@ if (cmd === 'seal') {
   if(fs.existsSync(path.join(profile,'patches'))) fs.cpSync(path.join(profile,'patches'),path.join(stage,'patches'),{recursive:true});
   fs.mkdirSync(path.dirname(path.join(stage,policy.qqPatch)),{recursive:true});
   fs.copyFileSync(patch,path.join(stage,policy.qqPatch));
+  fs.copyFileSync(path.join(__dirname,'patches/qqbot-nodejs@1.0.5.patch'),path.join(stage,'patches/qqbot-nodejs@1.0.5.patch'));
   const manifest=JSON.parse(fs.readFileSync(path.join(stage,'package.json'),'utf8'));
   manifest.dependencies={...manifest.dependencies,...policy.targets,...Object.fromEntries(Object.entries(policy.localPackages||{}).map(([n,e])=>[n,e.source]))};
   manifest.dsh.profile.bundles=[...new Set([...manifest.dsh.profile.bundles,...Object.keys(policy.localPackages||{})])];
@@ -61,6 +64,8 @@ if (cmd === 'seal') {
   const settings=yaml.load(fs.readFileSync(path.join(stage,'pnpm-workspace.yaml'),'utf8'));
   settings.autoInstallPeers=false;
   settings.patchedDependencies={...settings.patchedDependencies, '@tencent-connect/dsh-qqbot@0.5.2':policy.qqPatch};
+  settings.patchedDependencies['@tencent-connect/qqbot-nodejs@1.0.5']='patches/qqbot-nodejs@1.0.5.patch';
+  settings.overrides={...settings.overrides,'@tencent-connect/qqbot-nodejs':'1.0.5'};
   settings.minimumReleaseAgeExclude=[...new Set([...(settings.minimumReleaseAgeExclude||[]),...Object.entries(policy.targets).map(([n,v])=>n+'@'+v),'@tencent-connect/qqbot-nodejs@1.0.5'])];
   atomic(path.join(stage,'pnpm-workspace.yaml'),yaml.dump(settings));
   configure(stage);

@@ -127,6 +127,7 @@ try {
         $taskResult.backup = Backup-TaskProfile
     } elseif ($Action -eq 'Stage') {
         Invoke-TaskNode @((Join-Path $PSScriptRoot 'build-qqbot-patch.cjs'),'--check')
+        Invoke-TaskNode @((Join-Path $PSScriptRoot 'build-qqbot-patch.cjs'),'--sdk','--check')
         Invoke-TaskNode @((Join-Path $PSScriptRoot 'stage.cjs'))
         & $taskNode $taskPnpm --dir $taskStage --store-dir $taskStore install --ignore-scripts
         if ($LASTEXITCODE -ne 0) { throw 'Candidate dependency installation failed.' }

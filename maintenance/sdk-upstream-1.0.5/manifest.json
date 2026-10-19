@@ -1,0 +1,10 @@
+{
+  "package": "@tencent-connect/qqbot-nodejs",
+  "version": "1.0.5",
+  "source": "https://registry.npmjs.org/@tencent-connect/qqbot-nodejs/-/qqbot-nodejs-1.0.5.tgz",
+  "files": {
+    "dist/streaming.js": "2fc2e34b7c0e24f1e612cb47527b2cdc8cc4c8b2ecd2bf201411e9e3b81a6906",
+    "dist/protocol/api/api-client.js": "6022507de2382e5d186b0f9da89be3abdc6d8c56fae2573b1a0574f8eed02195",
+    "dist/middleware/concurrency-guard.js": "1be72b841bacaf8e751b3aa8bd7b648729c72c83bdcf3b06aab516ad5fb8e3ed"
+  }
+}

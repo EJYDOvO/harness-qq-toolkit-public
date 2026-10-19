@@ -1,0 +1,146 @@
+diff --git a/dist/streaming.js b/dist/streaming.js
+index 7986cdd..c5c5765 100644
+--- a/dist/streaming.js
++++ b/dist/streaming.js
+@@ -50,6 +50,8 @@ export class StreamSession {
+     flushInProgress = false;
+     flushPromise = null;
+     isCompleted = false;
++    cancelled = false;
++    retryWake = null;
+     constructor(api, opts) {
+         this.api = api;
+         this.opts = opts;
+@@ -101,10 +103,13 @@ export class StreamSession {
+         if (this.flushPromise) {
+             await this.flushPromise.catch(() => { });
+         }
++        if (this.cancelled) return;
+         return this.flush(StreamInputState.DONE);
+     }
+     /** Force-cancel without sending a DONE frame (caller must clean up). */
+     cancel() {
++        this.cancelled = true;
++        this.retryWake?.();
+         this.isCompleted = true;
+         if (this.pendingTimer) {
+             clearTimeout(this.pendingTimer);
+@@ -177,6 +182,7 @@ export class StreamSession {
+      */
+     async sendWithRetry(req) {
+         for (let attempt = 0; attempt <= MAX_FLUSH_RETRIES; attempt++) {
++            if (this.cancelled) return;
+             try {
+                 return await this.api.sendC2CStreamMessage(this.opts.creds, this.opts.openid, req);
+             }
+@@ -186,7 +192,13 @@ export class StreamSession {
+                 }
+                 const delay = RATE_LIMIT_BASE_DELAY_MS * Math.pow(2, attempt);
+                 this.opts.logger?.debug?.(`[qqbot:stream] rate limited, retry ${attempt + 1}/${MAX_FLUSH_RETRIES} after ${delay}ms`);
+-                await new Promise((r) => setTimeout(r, delay));
++                await new Promise((resolve) => {
++                    const timer = setTimeout(done, delay);
++                    const self = this;
++                    function done() { clearTimeout(timer); self.retryWake = null; resolve(); }
++                    this.retryWake = done;
++                    if (this.cancelled) done();
++                });
+                 // Advance index for the retry to avoid stale index conflict
+                 req.index = this.index++;
+             }
+@@ -198,6 +210,7 @@ export class StreamSession {
+         const msg = err instanceof Error ? err.message : String(err);
+         if (msg.includes("rate limit"))
+             return true;
++        if (err?.httpStatus === 429 || err?.bizCode === 50002) return true;
+         const code = err?.code ?? err?.err_code;
+         if (code === 50002 || code === 429)
+             return true;
+diff --git a/dist/protocol/api/api-client.js b/dist/protocol/api/api-client.js
+index 69336fd..b05d322 100644
+--- a/dist/protocol/api/api-client.js
++++ b/dist/protocol/api/api-client.js
+@@ -69,9 +69,6 @@ export class ApiClient {
+             this.logger?.error?.(`[qqbot:api] <<< Network error: ${formatErrorMessage(err)}`);
+             throw new ApiError(`Network error [${path}]: ${formatErrorMessage(err)}`, 0, path);
+         }
+-        finally {
+-            clearTimeout(timeoutId);
+-        }
+         const traceId = res.headers.get("x-tps-trace-id") ?? "";
+         this.logger?.info?.(`[qqbot:api] <<< Status: ${res.status} ${res.statusText}${traceId ? ` | TraceId: ${traceId}` : ""}`);
+         let rawBody;
+@@ -81,6 +78,7 @@ export class ApiClient {
+         catch (err) {
+             throw new ApiError(`Failed to read response [${path}]: ${formatErrorMessage(err)}`, res.status, path);
+         }
++        finally { clearTimeout(timeoutId); }
+         this.logger?.debug?.(`[qqbot:api] <<< Body: ${rawBody}`);
+         const contentType = res.headers.get("content-type") ?? "";
+         const isHtmlResponse = contentType.includes("text/html") || rawBody.trimStart().startsWith("<");
+diff --git a/dist/middleware/concurrency-guard.js b/dist/middleware/concurrency-guard.js
+index 989daa4..5551eb3 100644
+--- a/dist/middleware/concurrency-guard.js
++++ b/dist/middleware/concurrency-guard.js
+@@ -96,17 +96,7 @@ export function concurrencyGuard(options = {}) {
+                     timedOut = true;
+                     ctx.log.warn?.(`[concurrency] aborting active chain ${key} after ${maxProcessingMs}ms`);
+                     ctx.abort('concurrency:processing-timeout');
+-                    // Release lock BEFORE draining — the next message in queue will
+-                    // set busy=true, which would be overwritten if we did it after.
+-                    state.busy = false;
+-                    state.activeCtx = undefined;
+-                    if (strategy === 'merge') {
+-                        drainMergeBuffer(key, state, ctx).catch(() => { });
+-                    }
+-                    else {
+-                        drainQueue(key);
+-                    }
+-                    cleanupState(key);
++                    // Abort requests cancellation; retain exclusion until next() settles.
+                 }, maxProcessingMs);
+             }
+             try {
+@@ -115,12 +105,11 @@ export function concurrencyGuard(options = {}) {
+             finally {
+                 if (timeoutId)
+                     clearTimeout(timeoutId);
+-                if (!timedOut) {
++                {
+                     // timeout not triggered, release lock normally
+                     state.activeCtx = undefined;
+                     if (strategy === "merge") {
+                         await drainMergeBuffer(key, state, ctx);
+-                        state.busy = false;
+                     }
+                     else {
+                         state.busy = false;
+@@ -174,7 +163,8 @@ export function concurrencyGuard(options = {}) {
+                     });
+                 });
+                 if (isSurvivor) {
+-                    await next();
++                    state.activeCtx = ctx;
++                    try { await next(); } finally { await drainMergeBuffer(key, state, ctx); cleanupState(key); }
+                 }
+                 return;
+             }
+@@ -272,8 +262,11 @@ export function concurrencyGuard(options = {}) {
+                         w.markSurvivor();
+                     w.resolve();
+                 }
++                return; // The survivor now owns and eventually releases this lock.
+             }
+         }
++        state.busy = false;
++        state.activeCtx = undefined;
+         state.mergeBuffer = undefined;
+         state.mergeWaiters = undefined;
+     }
+@@ -322,4 +315,4 @@ export function concurrencyGuard(options = {}) {
+     }
+     return guard;
+ }
+-//# sourceMappingURL=concurrency-guard.js.map
+\ No newline at end of file
++//# sourceMappingURL=concurrency-guard.js.map

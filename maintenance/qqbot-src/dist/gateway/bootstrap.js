@@ -34,21 +34,61 @@ function dispatchInteraction(event, manager) {
 }
 // Reusable transport wiring, separately testable without creating a QQ gateway.
 export function createInteractionOutbound(ctx, manager, sender, config, logger, toolsRegistry) {
-    const policyFor = record => record && ctx.get('agentPresets')?.serviceFor?.(record.agent, 'interactionPolicy')?.get(record.agent);
+    const policyFor = record => { try { return record && ctx.get('agentPresets')?.serviceFor?.(record.agent, 'interactionPolicy')?.get(record.agent); } catch { logger.warn?.('Interaction scope temporarily unavailable; withholding output');return null; } };
+    manager.registerInteractionInput=(record,message)=>{
+        const policy=policyFor(record);
+        if(policy){record.interactionSuppressed=false;policy.admitInput?.(message);}
+    };
+    const limit = Math.max(100, Math.min(4500, config.textChunkLimit ?? 4500));
+    function pieces(text) {
+        const parts=[];
+        while(text.length){let end=Math.min(limit,text.length);if(end<text.length&&/[\uD800-\uDBFF]/u.test(text[end-1]))end--;parts.push(text.slice(0,end));text=text.slice(end);}
+        return parts;
+    }
+    function boundedStream(target) {
+        let stream, latest='', cancelled=false;
+        return {
+            async update(text) {
+                if(cancelled)return;
+                latest=text;
+                const first=pieces(text)[0];if(first===undefined)return;
+                stream??=sender.openStream(target);
+                await stream.update(first);
+            },
+            async complete(){
+                // Overflow remains buffered until durable assistant settlement.
+                const parts=pieces(latest);
+                for(let i=0;i<parts.length;i++){
+                    if(cancelled)return;
+                    if(i>0){stream=sender.openStream(target);await stream.update(parts[i]);}
+                    if(cancelled)return;
+                    await stream?.complete();
+                }
+            },
+            cancel(){cancelled=true;stream?.cancel?.();}
+        };
+    }
     const presentationSender = { ...sender, sendMarkdown(target, text, opts) {
         const record = manager.getSessionRecord(target.scope, target.targetId);
         const policy = policyFor(record);
+        if(policy===null)return Promise.resolve();
         return policy?.transport ? policy.external(text, { kind: 'tool-or-error' }) : sender.sendMarkdown(target, text, opts);
     } };
     const legacyOutbound = createOutboundHandler(manager, presentationSender, config, logger, toolsRegistry);
     const outboundHandler = (session, event) => {
         const record = manager.findBySessionId(session.header.id);
         const policy = policyFor(record);
+        if(policy===null)return;
         if (policy) {
+            if(event.type==='user/message'){
+                const source=event.data?.message?.source??event.data?.source;
+                if(source?.kind&&!['user','runtime-context','skill-catalog'].includes(source.kind)){record.interactionSuppressed=true;policy.stopOutput();}
+            }
+            if(record.interactionSuppressed)return;
             const target = { ...record.replyTarget };
-            policy.bind({ key: manager, sendText: (text) => sender.sendMarkdown(target, text),
+            policy.bind({ key: manager, requireIngress: true, sendText: async (text,meta) => {for(const part of pieces(text)){if(meta?.cancelled?.())return;await sender.sendMarkdown(target, part);}},
                 waitingForUser: () => manager.approvalChannel?.pending.has(record.sessionKey) || manager.questionChannel?.pending.has(record.sessionKey),
-                ...(config.streaming && target.scope === 'c2c' && target.msgId ? { openStream: () => sender.openStream(target) } : {}) });
+                ...(config.streaming && target.scope === 'c2c' && target.msgId ? { openStream: () => boundedStream(target) } : {}) });
             policy.event(event);
             if (['assistant/chunk', 'assistant/message'].includes(event.type)) return;
         }
@@ -101,13 +141,19 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
     const replyLimiter = new ReplyLimiter({ limit: 4 });
     const sender = {
         sendMarkdown: (target, content, opts) => sendResolvedMarkdown(bot, resolveReplyTarget(target, replyLimiter, true), content, opts),
-        openStream: (target) => bot.openStream({
+        openStream: (target) => {
+            const resolved=resolveReplyTarget(target, replyLimiter, false);
+            if(!resolved.msgId){
+                let text='',cancelled=false;
+                return {async update(value){text=value;},async complete(){if(!cancelled)await sendResolvedMarkdown(bot,resolved,text);},cancel(){cancelled=true;}};
+            }
+            return bot.openStream({
             target: {
                 scope: target.scope,
                 targetId: target.targetId,
-                msgId: target.msgId,
+                msgId: resolved.msgId,
             },
-        }),
+        });},
     };
     // Optional Agent policy. No Character, Remote Ops or policy package dependency.
     const outboundHandler = createInteractionOutbound(ctx, manager, sender, config, logger, toolsRegistry);
