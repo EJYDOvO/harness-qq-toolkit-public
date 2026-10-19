@@ -3,6 +3,7 @@ import { buildCommandList } from "../commands/index.js";
 import { attachmentProcessor } from "../middleware/attachment.js";
 import { questionAnswer } from "../middleware/question-answer.js";
 import { getHistoryStore, historyGroupKey } from "../features/history-store.js";
+import { createUserMessage } from '@deepseek-ai/dsh-llm';
 export function setupMiddlewares(bot, config, manager, logger) {
     // 1. 错误兜底（最外层洋葱皮）
     bot.use(errorHandler());
@@ -48,15 +49,43 @@ export function setupMiddlewares(bot, config, manager, logger) {
     // 7. 三层限流（sender / group / global）
     bot.use(rateLimiter());
     // 8. 斜杠命令（在 concurrencyGuard 之前，命令匹配后不排队直接响应）
+    const commands = [...buildCommandList({ manager, config }), ...(manager.ctx?.get('qqRemoteOps')?.commands(manager) ?? [])];
+    const stop = commands.find(c => c.name === 'stop');
+    if (stop) {
+        const nativeStop = stop.handler;
+        stop.handler = cmdCtx => {
+            const msg = cmdCtx.message;
+            const scope = msg.kind === 'group' ? 'group' : 'c2c';
+            const record = manager.getSessionRecord(scope, scope === 'group' ? (msg.groupOpenid ?? msg.senderId) : msg.senderId);
+            const service = record && manager.ctx.get('agentPresets')?.serviceFor?.(record.agent, 'interactionPolicy');
+            service?.get(record.agent).stopOutput();
+            return nativeStop(cmdCtx);
+        };
+    }
     const slash = slashCommand({
         // 关闭 autoHelp：help 命令由 qqbot 注册为 /bot-help，
         // 避免 SDK 再自动注册一个无前缀的 /help 造成重复
         autoHelp: false,
-        commands: [...buildCommandList({ manager, config }), ...(manager.ctx?.get('qqRemoteOps')?.commands(manager) ?? [])],
+        commands,
     });
     bot.use(slash.middleware);
     // 8.5. 待答问题截获（在 concurrencyGuard 之前，答案消息不排队直接作答）
     bot.use(questionAnswer(manager));
+    // Explicit correction only, after access/question admission but before merge.
+    // Ordinary messages and /stop retain their existing native paths.
+    bot.use(async (mCtx, next) => {
+        const msg = mCtx.message;
+        const correction = /^更正[：:]\s*(\S[\s\S]*)$/u.exec(msg.content ?? '');
+        if (msg.kind !== 'c2c' || !correction || msg.attachments?.length) return next();
+        const record = manager.getSessionRecord('c2c', msg.senderId);
+        const policy = record && manager.ctx.get('agentPresets')?.serviceFor?.(record.agent, 'interactionPolicy')?.get(record.agent);
+        if (!policy || record.agent.status !== 'running') return next();
+        if (manager.admitInteractionInput) {
+            const admitted = await manager.admitInteractionInput(mCtx);
+            if (admitted !== record) throw new Error('Interaction Session changed during admission');
+        }
+        policy.revise(createUserMessage({ content: [{ type: 'text', text: msg.content }], source: { kind: 'user' } }));
+    });
     // 9. 并发串行 + 消息合并（同 peer 排队，避免 session 冲突）
     bot.use(concurrencyGuard({
         strategy: 'merge',

@@ -32,10 +32,12 @@ export function apply(ctx,config){
       const agent=ctx.agents.get(id);if(!agent||agent.status!=='running'){active.delete(id);continue;}
       const elapsed=Date.now()-v.startedAt,quiet=Date.now()-v.lastAt;
       if(quiet>f.remoteOps.staleAfterSeconds*1000)await notify(`stale:${id}:${v.turn}`,`任务已有 ${Math.floor(quiet/60000)} 分钟没有新进展。可用 /ops tasks 查看，/ops stop 停止当前 QQ 任务及子 Agent。`);
-      else if(elapsed>f.remoteOps.notifyAfterSeconds*1000)await notify(`progress:${id}:${v.turn}`,'任务仍在执行。/ops tasks 可查看主 Agent 和子 Agent 状态。');
+      else if(elapsed>f.remoteOps.notifyAfterSeconds*1000&&!ctx.get?.('agentPresets')?.serviceFor?.(agent,'interactionPolicy'))await notify(`progress:${id}:${v.turn}`,'任务仍在执行。/ops tasks 可查看主 Agent 和子 Agent 状态。');
       if(elapsed>f.remoteOps.maxTurnSeconds*1000){await remote.stop();await notify(`timeout:${id}:${v.turn}`,'QQ 任务达到运行时限，已停止当前任务；请缩小任务后继续。');active.delete(id);}
     }
   }catch(error){ctx.logger?.warn('Remote operations tick failed: '+error.message);}finally{busy=false;}}
+  // Native 0.2.1 frames are transient rather than session assistant/chunk events.
+  ctx.on('agent/assistant-stream',({agent})=>{if(active.has(agent.id))active.get(agent.id).lastAt=Date.now();});
   ctx.on('session/event',(session,event)=>{
     if(!runtime||!runtime.manager.findBySessionId(session.header.id))return;
     const id=session.header.id;

@@ -68,3 +68,6 @@ patchedDependencies:
 补丁包含10个文件的审查快照；原文件哈希在 qqbot-upstream-0.5.2/manifest.json。修改 qqbot-src 后重建补丁并运行 `node maintenance/build-qqbot-patch.cjs --check`。升级上游版本时重新比对，不能将0.5.2补丁盲目应用到其他版本。
 
 原 templates/profile 是旧安装快照；新项目优先使用本文件的最小装配，不直接复制旧绝对路径/可选插件清单。更新配置与状态目录时先备份；不要删除通知账本来“重试”不确定投递。
+# Interaction 可选接入
+
+开发候选可对接 Agent 层 Interaction 服务，详见 [接口与验证边界](INTERACTION.md)。QQ 基础接入仍不依赖它，不增加 Gateway、数据库或额外模型。安装包、在 Preset 中声明并隔离服务、应用 QQ 补丁和部署是不同步骤；本轮没有部署。

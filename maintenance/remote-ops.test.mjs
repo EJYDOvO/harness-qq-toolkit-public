@@ -58,3 +58,17 @@ test('standalone Remote Ops needs no installation root, Character or maintenance
  const rt={config:{access:{c2cMode:'allowlist',c2cAllow:['standalone-owner']}},manager:{sessions:new Map(),getOrCreate:async()=>{}},bot:{on(){},off(){}},sender:{sendMarkdown:async()=>{}}};
  const detach=service.attach(rt);assert.throws(()=>service.attach(rt),/already attached/);detach();service.attach(rt)();
 });
+
+test('Interaction owns generic hang-on while native frames keep Remote Ops activity current',async(t)=>{
+ const state=fs.mkdtempSync(path.resolve('tmp/interaction-ops-')),events=new Map(),clean=[],sent=[];let service,tick,now=100000;
+ const agent={id:'fixture-agent',status:'running'};
+ t.mock.method(Date,'now',()=>now);t.mock.method(globalThis,'setInterval',f=>{tick=f;return 1;});t.mock.method(globalThis,'clearInterval',()=>{});
+ apply({agents:{get:()=>agent},get:n=>n==='agentPresets'?{serviceFor:()=>({contractVersion:1})}:undefined,on:(n,f)=>events.set(n,f),provide:(_n,v)=>service=v,effect:f=>clean.push(f())},{ownerId:'owner',stateDirectory:state});
+ t.after(()=>clean.forEach(f=>f()));
+ service.attach({config:{access:{c2cMode:'allowlist',c2cAllow:['owner']}},manager:{sessions:new Map(),getOrCreate:async()=>{},findBySessionId:()=>true},bot:{on(){},off(){}},sender:{sendMarkdown:async(_t,text)=>sent.push(text)}});
+ events.get('session/event')({header:{id:agent.id}},{type:'turn/start',data:{turn:1}});
+ now+=400000;events.get('agent/assistant-stream')({agent,frame:{type:'chunk'}});tick();for(let i=0;i<4;i++)await new Promise(r=>setImmediate(r));
+ assert.equal(sent.length,0,'No duplicate progress and no false stale alert while streaming');
+ events.get('session/event')({header:{id:agent.id}},{type:'turn/end',data:{reason:{kind:'completed'}}});for(let i=0;i<4;i++)await new Promise(r=>setImmediate(r));
+ assert.equal(sent.length,1);assert.match(sent[0],/长任务已结束/);
+});

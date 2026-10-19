@@ -32,6 +32,30 @@ function dispatchInteraction(event, manager) {
         return manager.approvalChannel?.handleInteraction(event) ?? false;
     return false;
 }
+// Reusable transport wiring, separately testable without creating a QQ gateway.
+export function createInteractionOutbound(ctx, manager, sender, config, logger, toolsRegistry) {
+    const policyFor = record => record && ctx.get('agentPresets')?.serviceFor?.(record.agent, 'interactionPolicy')?.get(record.agent);
+    const presentationSender = { ...sender, sendMarkdown(target, text, opts) {
+        const record = manager.getSessionRecord(target.scope, target.targetId);
+        const policy = policyFor(record);
+        return policy?.transport ? policy.external(text, { kind: 'tool-or-error' }) : sender.sendMarkdown(target, text, opts);
+    } };
+    const legacyOutbound = createOutboundHandler(manager, presentationSender, config, logger, toolsRegistry);
+    const outboundHandler = (session, event) => {
+        const record = manager.findBySessionId(session.header.id);
+        const policy = policyFor(record);
+        if (policy) {
+            const target = { ...record.replyTarget };
+            policy.bind({ key: manager, sendText: (text) => sender.sendMarkdown(target, text),
+                waitingForUser: () => manager.approvalChannel?.pending.has(record.sessionKey) || manager.questionChannel?.pending.has(record.sessionKey),
+                ...(config.streaming && target.scope === 'c2c' && target.msgId ? { openStream: () => sender.openStream(target) } : {}) });
+            policy.event(event);
+            if (['assistant/chunk', 'assistant/message'].includes(event.type)) return;
+        }
+        return legacyOutbound(session, event);
+    };
+    return outboundHandler;
+}
 export async function bootstrapGateway(ctx, agents, config, logger) {
     if (gatewayLeases.has(config.appId)) throw new Error('Duplicate QQ Gateway for this application');
     const lease = {};
@@ -85,7 +109,8 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
             },
         }),
     };
-    const outboundHandler = createOutboundHandler(manager, sender, config, logger, toolsRegistry);
+    // Optional Agent policy. No Character, Remote Ops or policy package dependency.
+    const outboundHandler = createInteractionOutbound(ctx, manager, sender, config, logger, toolsRegistry);
     ctx
         .on('session/event', outboundHandler);
     // ── 问答通道（ask_user_question → QQ 文本 + 按钮） ──
