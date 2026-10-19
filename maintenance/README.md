@@ -1,6 +1,8 @@
 # QQ 端维护手册
 
-当前部署：官方桌面本体 0.2.0-rc.2，profile `desktop`，QQ 默认 Creator（`cordis`）预设，继续使用 Navigator / gemma-4-31b-it。内置子 Agent 限制为 3 个存活实例、1 层委派。群聊关闭，私人白名单由当前唯一已使用的 QQ 私聊 openid 初始化。
+本文适用于原 Windows 维护后端，包含旧实例的目录、Preset 和功能约定；不表示所有 QQTK 项目或当前生产都采用相同配置。普通 Agent 的最小 QQ 接入见 [通用集成](../docs/GENERIC-INTEGRATION.md)，Remote Ops 1.1 的独立模式和服务后端见 [插件说明](../plugin-sources/dsh-remote-ops/README.md)。
+
+原验收基线为 DSH 0.2.0-rc.2、desktop Profile、Creator（cordis）及单 Owner 私聊。模型、子 Agent 限制、Preset 和自启动状态均应以目标实例实际配置为准。Character 项目有自己的 Preset 和部署流程，不要为了套用本文而把它改回 cordis。
 
 ## 在 QQ 使用
 
@@ -54,7 +56,7 @@ DeployValidated 校验候选文件、当前 profile 和本体哈希；若准备�
 | 免费搜索 | 0.8.9 | npm 固定版本 |
 | 插件市场 | 1.66.18 | npm 固定版本；保留本机应急 UI |
 | Bilibili | 0.2.4 | 保留现有本地 tgz 来源，不自动换成同名远程包 |
-| 私人运维 | dsh-remote-ops-local 1.0.0 | 独立源码、本地 tgz、哈希固定；与 QQ 桥接补丁一起验证 |
+| 私人运维 | dsh-remote-ops-local 1.1.0；保留 1.0.0 恢复包 | 独立源码、本地 tgz、哈希固定；与 QQ 桥接补丁一起验证 |
 | 项目记忆 | dsh-task-memory-local 0.1.0-local.2 | 固定上游提交的本地适配包，仅当前核心版本通过验收 |
 | 浏览器 | @playwright/mcp 0.0.83 | 版本独立目录、锁文件、通过核心 MCP 桥接 |
 | 本体 | 0.2.0-rc.2 | 官方桌面更新器，更新前备份、更新后复验 |

@@ -1,6 +1,8 @@
 # 功能管理手册
 
-这些功能运行在现有 QQ 私人部署上，本体发行文件未修改。入口权限名单与运维所有者分别保存；只有 `data/maintenance/owner.json` 指定的私人 QQ 可用 `/ops`，群聊不能运维。这只限制快捷入口，不是多个用户之间完整的文件/模型权限隔离。
+本文描述原 Windows 维护后端的功能、路径与开关，不是所有 QQTK 项目的默认配置。Remote Ops 1.1 独立模式使用显式 ownerId/stateDirectory，服务后端的能力由 qqMaintenance 实现，见 [插件说明](../plugin-sources/dsh-remote-ops/README.md)。下文 memory 指旧项目记忆，不是 Character 的分层 Memory Core。
+
+原后端中入口权限名单与运维所有者分别保存；只有 `data/maintenance/owner.json` 指定的私人 QQ 可用 `/ops`，群聊不能运维。这只限制快捷入口，不是多个用户之间完整的文件/模型权限隔离。
 
 ## 日常操作
 

@@ -1,6 +1,8 @@
 # 恢复部署
 
-仓库只保存扩展，无法独立启动 Harness。当前路径模板为 `D:/DeepSeek-Harness`，当前验收核心为 `0.2.0-rc.2`。其他版本或路径须修改配置并重新验收；不能直接覆盖正在运行的安装目录。
+本文用于恢复原 Windows 部署的扩展，不是新项目的最小安装指南。新项目先阅读 [通用集成](GENERIC-INTEGRATION.md)，仅选择需要的组件；Character 项目应使用其自身部署/数据库恢复流程。
+
+仓库只保存扩展，无法独立启动 Harness。旧路径模板为 `D:/DeepSeek-Harness`，验收基线为 `0.2.0-rc.2`。其他版本或路径须修改配置并重新验收；不能直接覆盖正在运行的安装目录。
 
 1. 从官方渠道安装相应 Harness 桌面版本，先通过官方 UI 配置模型并完成 QQ 绑定，确保基本对话正常。QQ openid 不等于 QQ 号码；先取得实际私聊 openid。
 2. 退出宿主并暂停既有 watchdog，备份原 profile。复制仓库的 `maintenance`、`plugin-sources` 和 `plugin-packages` 到安装根目录；合并 `default-workspace/AGENTS.md`，保留自己的项目约定。
