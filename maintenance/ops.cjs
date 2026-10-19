@@ -54,7 +54,8 @@ function coreVersion() {
 }
 function configureFeatures(dir=profile) {
   const rows=patchRows(dir),features=JSON.parse(fs.readFileSync(path.join(__dirname,'features.json'),'utf8'));
-  Object.assign(row(rows,'task-memory'),{disabled:!features.memory.enabled,config:{storageRoot:path.join(root,'data/storages/task-memory').replaceAll('\\','/'),injectPrompt:false,injectLimit:5,injectMaxChars:1200,injectMaxEntryChars:300,maxEntries:500}});
+  const bundles=fs.existsSync(path.join(dir,'package.json'))?JSON.parse(fs.readFileSync(path.join(dir,'package.json'),'utf8')).dsh?.profile?.bundles??[]:[];
+  if(bundles.includes('dsh-task-memory-local')) Object.assign(row(rows,'task-memory'),{disabled:bundles.includes('dsh-character-core')||!features.memory.enabled,config:{storageRoot:path.join(root,'data/storages/task-memory').replaceAll('\\','/'),injectPrompt:false,injectLimit:5,injectMaxChars:1200,injectMaxEntryChars:300,maxEntries:500}});
   Object.assign(row(rows,'mcp-browser'),{name:'@deepseek-ai/dsh-mcp-client',disabled:!features.browser.enabled,config:{serverName:'browser',transport:'stdio',command:path.join(root,'resources/runtime/primary-runtime/dependencies/node/bin/node.exe'),args:[path.join(__dirname,'browser/0.0.83/node_modules/@playwright/mcp/cli.js'),'--config',path.join(__dirname,'browser/0.0.83/config.json')],cwd:path.join(root,'default-workspace'),toolCallTimeoutMs:60000,failOnStartupError:false}});
   // A new row must use insert; overrides reference rows provided by installed bundles.
   const browser=rows.find(x=>x.id==='mcp-browser');rows.splice(rows.indexOf(browser),1);
@@ -96,7 +97,8 @@ async function liveStatus(withPresets = false) {
             const pluginsEnvelope=await pluginResponse.json();assert(pluginsEnvelope.result?.ok,'Plugin inspection failed');
             const plugins=pluginsEnvelope.result.value,manifest=JSON.parse(fs.readFileSync(path.join(profile,'package.json'),'utf8'));
             const checks=['im-qqbot'];
-            if(manifest.dependencies['dsh-remote-ops-local'])checks.push('qq-remote-ops','task-memory','mcp-browser');
+            if(manifest.dependencies['dsh-remote-ops-local'])checks.push('qq-remote-ops','mcp-browser');
+            if(manifest.dsh?.profile?.bundles?.includes('dsh-task-memory-local'))checks.push('task-memory');
             value.featurePlugins=plugins.filter(p=>checks.includes(p.patchId)).map(p=>({id:p.patchId,enabled:p.enabled,phase:p.fiberPhase}));
             for(const id of checks){const p=value.featurePlugins.find(p=>p.id===id);assert(p,`Missing plugin: ${id}`);assert(!p.enabled||p.phase==='active',`Plugin failed to activate: ${id}`);}
             assert(value.featurePlugins.find(p=>p.id==='im-qqbot')?.enabled,'QQ is disabled');

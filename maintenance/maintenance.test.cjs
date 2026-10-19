@@ -25,4 +25,5 @@ test('re-applying feature configuration is idempotent and keeps one browser entr
  fs.writeFileSync(file,yaml.dump([{id:'custom',config:{keep:'unchanged'}}]));
  configureFeatures(dir);const first=fs.readFileSync(file,'utf8');configureFeatures(dir);assert.equal(fs.readFileSync(file,'utf8'),first);
  const rows=yaml.load(first);assert.equal(rows[0].config.keep,'unchanged');assert.equal(rows.flatMap(r=>r.insert||[]).filter(r=>r.id==='mcp-browser').length,1);
+ assert.equal(rows.find(r=>r.id==='task-memory'),undefined,'Absent legacy bundle must not gain a dangling override');
 });
