@@ -1,6 +1,8 @@
 # Harness QQ Toolkit
 
-私人 QQ 助手的插件、兼容补丁和维护工具源码仓库。**本体使用官方安装器单独安装**；这里保存可审查、可重建的扩展，以及恢复需要的小型固定版本包。
+DSH QQ 接入的兼容补丁、独立 Remote Ops 和维护工具源码仓库。**本体使用官方安装器单独安装**；这里保存可审查、可重建的扩展，以及恢复需要的小型固定版本包。
+
+2026-10-19 更新：基础 QQ 不再依赖 Remote Ops 或 Character，Remote Ops 1.1.0 支持独立状态目录及可选 Host 维护后端。参见 [通用安装与依赖](docs/GENERIC-INTEGRATION.md) 和 [Remote Ops 接口](plugin-sources/dsh-remote-ops/README.md)。原 Windows 维护目录保留为兼容后端，不等同于跨平台通用安装器。
 
 已验证环境：Windows、Harness `0.2.0-rc.2`、QQ 插件 `0.5.2`、Navigator / `gemma-4-31b-it`。这是现有部署的维护快照，不是跨版本通用的一键安装器。
 

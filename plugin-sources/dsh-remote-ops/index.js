@@ -1,18 +1,15 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import {createRequire} from 'node:module';
+import {resolveBackend} from './backend.js';
 export const name='qq-remote-ops';
 export const inject=['agents'];
 const read=file=>JSON.parse(fs.readFileSync(file,'utf8').replace(/^\uFEFF/,''));
 export function apply(ctx,config){
-  const root=path.resolve(config.root),state=path.join(root,'data/maintenance');
-  const req=createRequire(path.join(root,'maintenance/remote.cjs'));
-  const remote=req(path.join(root,'maintenance/remote.cjs'));
-  const {atomic}=req(path.join(root,'maintenance/ops.cjs'));
-  const owner=read(path.join(state,'owner.json'));
+  let runtime;
+  const {state,owner,remote,atomic}=resolveBackend(ctx,config,()=>runtime);
   const outFile=path.join(state,'qq-notifications.json');
   const ledger=fs.existsSync(outFile)?read(outFile):{enabledAt:Date.now(),deliveries:{}};
-  const active=new Map();let runtime,busy=false;
+  const active=new Map();let busy=false;
   const persist=()=>atomic(outFile,JSON.stringify(ledger,null,2));
   const allowed=c=>c.message.kind==='c2c'&&c.message.senderId===owner.openid;
   const saveHealth=(connected,detail)=>atomic(path.join(state,'qq-health.json'),JSON.stringify({connected,detail,at:Date.now(),pid:process.pid}));
@@ -21,7 +18,7 @@ export function apply(ctx,config){
     if(!remote.features().notifications.enabled){ledger.deliveries[key]={status:'suppressed',at:Date.now()};persist();return;}
     // Persist before sending. A crash with status=sending is ambiguous and never auto-replayed.
     ledger.deliveries[key]={status:'sending',at:Date.now()};persist();
-    try{await runtime.sender.sendMarkdown({scope:'c2c',targetId:owner.openid},text);ledger.deliveries[key].status='sent';}
+    try{if(runtime.notifyEvent){await runtime.notifyEvent({eventId:'qqtk:'+key,kind:key.startsWith('job:')?'maintenance_result':key.startsWith('timeout:')?'task_timeout':key.startsWith('complete:')?'task_completed':key.startsWith('failed:')?'task_failed':'configured_alert',text});}else{await runtime.sender.sendMarkdown({scope:'c2c',targetId:owner.openid},text);}ledger.deliveries[key].status='sent';}
     catch{ledger.deliveries[key].status='failed';}
     persist();
   }
@@ -44,7 +41,12 @@ export function apply(ctx,config){
     const id=session.header.id;
     if(event.type==='turn/start')active.set(id,{startedAt:Date.now(),lastAt:Date.now(),turn:event.data.turn});
     if(active.has(id))active.get(id).lastAt=Date.now();
-    if(event.type==='turn/end')active.delete(id);
+    if(event.type==='turn/end'){
+      const tracked=active.get(id);
+      // Only long-running tracked tasks have a separate completion notification.
+      if(tracked&&Date.now()-tracked.startedAt>remote.features().remoteOps.notifyAfterSeconds*1000){const failed=!!event.data?.error||event.data?.reason?.kind!=='completed';void notify(`${failed?'failed':'complete'}:${id}:${tracked.turn}`,failed?'QQ 长任务执行失败；请查看当前会话结果。':'QQ 长任务已结束；请查看当前会话结果。');}
+      active.delete(id);
+    }
   });
   const service={
     commands(manager){return [{name:'ops',scope:'c2c',description:'私人运维：help/status/tasks/stop/result/backup/stage/deploy/restart/features',authorized:c=>allowed(c)||'仅部署所有者可执行运维命令。',handler:async c=>{
@@ -63,9 +65,16 @@ export function apply(ctx,config){
       if(actions[action])return await remote.queue(actions[action]);
       return '未知指令；/ops help 查看支持项。';
     }}];},
-    attach(value){runtime=value;persist();value.bot.on('ready',()=>saveHealth(true,'ready'));value.bot.on('disconnected',e=>saveHealth(false,e.willReconnect?'reconnecting':'permanent'));
+    attach(value){
+      if(runtime)throw Error('Remote Ops already attached to a QQ gateway');
+      if(value.config.access?.c2cMode!=='allowlist'||!value.config.access.c2cAllow?.includes(owner.openid))throw Error('Remote Ops owner is not admitted by QQ policy');
+      runtime=value;persist();
+      const ready=()=>{if(runtime===value)saveHealth(true,'ready');};
+      const disconnected=e=>{if(runtime===value)saveHealth(false,e.willReconnect?'reconnecting':'permanent');};
+      value.bot.on('ready',ready);value.bot.on('disconnected',disconnected);
       // Reconnect the persisted owner session so native scheduled follow-ups can reach QQ after restart.
       void value.manager.getOrCreate('c2c',owner.openid,owner.openid,{scope:'c2c',targetId:owner.openid}).catch(e=>ctx.logger?.warn('QQ owner session restore failed: '+e.message));
+      return ()=>{if(runtime===value){runtime=undefined;active.clear();}value.bot.off?.('ready',ready);value.bot.off?.('disconnected',disconnected);};
     }
   };
   ctx.provide('qqRemoteOps',service);

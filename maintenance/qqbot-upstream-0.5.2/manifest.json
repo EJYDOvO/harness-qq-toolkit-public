@@ -10,6 +10,8 @@
     "dist/gateway/middleware-setup.js": "0a6603cb3e84ad9a56aecbaa38149b8653eaf08c6107d292c6d594651a4f9658",
     "dist/media/send-file-tool.js": "8dd8ecf0ab0d14bf68a1191efebe90c3ec89110465a2938e1fe92261123eb45e",
     "dist/index.js": "dc03a2712e87b10d7a83662b26284652fd59d7784ca2a10a21eb680d61aafa13",
-    "dist/gateway/bootstrap.js": "0874656c4f2a2111e578316720c7a96a6ccfa6e7b75b99c178fc6378d9c4a7f3"
+    "dist/gateway/bootstrap.js": "0874656c4f2a2111e578316720c7a96a6ccfa6e7b75b99c178fc6378d9c4a7f3",
+    "dist/session/session-manager.js": "592415a3417ce9b2654953b35f3bc47add4fceb9ee375dd92768e5a25427222c",
+    "dist/model/prefs-store.js": "47787266032527ba228947f01f894f8916bf5f0272c33fba5eae2cdc84518b8e"
   }
 }

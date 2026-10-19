@@ -20,6 +20,7 @@
 *.asar
 *.tgz
 !/plugin-packages/dsh-remote-ops-local-1.0.0.tgz
+!/plugin-packages/dsh-remote-ops-local-1.1.0.tgz
 !/plugin-packages/dsh-task-memory-local-0.1.0-local.2.tgz
 !/plugin-packages/dsh-plugin-bilibili-0.2.4.tgz
 **/browser-profile/

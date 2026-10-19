@@ -1,5 +1,6 @@
+# Configure ownerId + stateDirectory (or explicit legacy root) in the consuming Profile.
 - insert:
     - id: qq-remote-ops
       name: dsh-remote-ops-local
-      config:
-        root: D:/DeepSeek-Harness
+      disabled: true
+      config: {}

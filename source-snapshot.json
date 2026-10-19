@@ -103,7 +103,7 @@
     },
     {
       "path": "maintenance/patches/dsh-qqbot@0.5.2.patch",
-      "sha256": "2ea25b3c2a2c121b612c2ff8019f34ee29e9efd13c5c73823435802bb937f7eb"
+      "sha256": "1727861df592fa351e580684ec0d9b4b6d7457a88a3bc2d871fa6fc9b50ef2f8"
     },
     {
       "path": "maintenance/plugin-policy.json",
@@ -151,7 +151,7 @@
     },
     {
       "path": "maintenance/qqbot-src/dist/gateway/bootstrap.js",
-      "sha256": "f79264a9546d35bf374c037d22061e25a9ac2fe215435927a906ec57a3b5d6bf"
+      "sha256": "7b37916d5e52e9d16d1a4b125fa21047ee097154a6670d7974fbb5f141f53ce3"
     },
     {
       "path": "maintenance/qqbot-src/dist/gateway/middleware-setup.js",
@@ -159,7 +159,7 @@
     },
     {
       "path": "maintenance/qqbot-src/dist/index.js",
-      "sha256": "e9347f7f51f488b2df70c52ac3a5c5bc103aec4b222270603206d18ea1a30f31"
+      "sha256": "cd3f2ead9c6509157779e48683e053ff66338517482363c493e96ba235d3bb82"
     },
     {
       "path": "maintenance/qqbot-src/dist/media/send-file-tool.js",
@@ -199,7 +199,7 @@
     },
     {
       "path": "maintenance/qqbot-upstream-0.5.2/manifest.json",
-      "sha256": "620839ca8a181adbe2d0be747844a2d7cd79cc4347e5276d552eae7799f6e07c"
+      "sha256": "58c8174ed132d6d40cff0992cdf9589bc8c3dd7b9ddd535ca3815d430d372f59"
     },
     {
       "path": "maintenance/read-asar.cjs",
@@ -207,7 +207,7 @@
     },
     {
       "path": "maintenance/remote-ops.test.mjs",
-      "sha256": "1204218da1f97a7d0518fb52511f149198ae2cebad05e90adffc28fad90c2c6c"
+      "sha256": "20fdd08e31d62c2f4776fdc56b058bbece7cbed3d1adc2325a966673952ffcb3"
     },
     {
       "path": "maintenance/remote.cjs",
@@ -247,19 +247,19 @@
     },
     {
       "path": "plugin-sources/dsh-remote-ops/README.md",
-      "sha256": "9030aa8b644a56230080e850d529d9993f8161f2f91dc2462034e1bf6e8d15c5"
+      "sha256": "f3ecc308ec93d7bf06bcf4e4e8ca9f0bef9f7681fbc50a074c406f85740d4cd1"
     },
     {
       "path": "plugin-sources/dsh-remote-ops/cordis.patch.yml",
-      "sha256": "a1e5e02e813647c26d10b47739dac9f99c349aa044c28485c0ee60bcbf1f9a8e"
+      "sha256": "ea7e7e06225f716b2be7e1efcd7481d16f4db959b451fb7690959d3ac8e99535"
     },
     {
       "path": "plugin-sources/dsh-remote-ops/index.js",
-      "sha256": "604ce2c2ea2a9e8ae362f57c4b72dcc7c4e0de752ac3653d2a57e01040d37c52"
+      "sha256": "909a9b4016900abc4dbf70fb9cda7a20a4d481196f896f624617cab01a67ab8e"
     },
     {
       "path": "plugin-sources/dsh-remote-ops/package.json",
-      "sha256": "c51b6e686f7db6f1ffe09a605ca855b8a12101bad57b5bcb63e7df10d4e4ce90"
+      "sha256": "de60785139b869e321cfe1a827301a989355df56416c32b45cb3f3486a6d6631"
     },
     {
       "path": "plugin-sources/dsh-task-memory/.github/workflows/ci.yml",
@@ -416,6 +416,36 @@
     {
       "path": "templates/model.example.json",
       "sha256": "52af1c5a44284deeed3a58b82351d55d8c8f97a294fce763856e081f39103b57"
+    },
+    {
+      "path": "plugin-sources/dsh-remote-ops/backend.js",
+      "sha256": "13aaa9084807875eb646c6cbc86af346adffda390c5bbcc1d35c681bc494075a"
+    },
+    {
+      "path": "maintenance/qqbot-src/dist/session/session-manager.js",
+      "sha256": "1a0c484b9dd5be0733b542f2fb519468c767fff0601d7210a2379287c2f98f0a"
+    },
+    {
+      "path": "maintenance/qqbot-upstream-0.5.2/dist/session/session-manager.js",
+      "sha256": "592415a3417ce9b2654953b35f3bc47add4fceb9ee375dd92768e5a25427222c"
+    },
+    {
+      "path": "maintenance/qqbot-src/dist/model/prefs-store.js",
+      "sha256": "56e858a499abd21569d00427429da7ab74c91988a9387d88a40144234471cdd8"
+    },
+    {
+      "path": "maintenance/qqbot-upstream-0.5.2/dist/model/prefs-store.js",
+      "sha256": "47787266032527ba228947f01f894f8916bf5f0272c33fba5eae2cdc84518b8e"
+    },
+    {
+      "path": "plugin-packages/dsh-remote-ops-local-1.1.0.tgz",
+      "sha256": "3596ba85c832d5c1f223ad4ca2cfd3d2edabb8c7daa224f994af0065ea6bede3"
     }
-  ]
+  ],
+  "refactor": {
+    "at": "2026-10-19T01:14:03.830Z",
+    "remoteOps": "1.1.0",
+    "qqPatchFiles": 10,
+    "source": "reviewed local working tree; prior sourceRevisions describe original export"
+  }
 }

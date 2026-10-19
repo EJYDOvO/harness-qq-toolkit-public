@@ -12,6 +12,8 @@ import { setupMiddlewares } from "./middleware-setup.js";
 import { startMediaCleanup } from "../media/media-cleaner.js";
 import { ensureVisionInputModal, registerDescribeImageTool } from "../media/vision-tool.js";
 import { registerSendFileTool } from "../media/send-file-tool.js";
+// Shared across duplicate module copies in the same Host process.
+const gatewayLeases = globalThis[Symbol.for('dsh.qqGateway.leases.v1')] ??= new Map();
 /**
  * interaction 统一分发器：按 button_data 的顶层 `t` 判别字段，路由到对应
  * channel（question / approval）。QQ 只有一个 interaction 入口，集中路由
@@ -31,6 +33,11 @@ function dispatchInteraction(event, manager) {
     return false;
 }
 export async function bootstrapGateway(ctx, agents, config, logger) {
+    if (gatewayLeases.has(config.appId)) throw new Error('Duplicate QQ Gateway for this application');
+    const lease = {};
+    gatewayLeases.set(config.appId, lease);
+    let shutdown;
+    ctx.effect(() => async () => { await shutdown?.(); if (gatewayLeases.get(config.appId) === lease) gatewayLeases.delete(config.appId); });
     const manager = new SessionManager(ctx, agents, config, logger);
     // ── 初始化 QQ Bot SDK ──
     const userAgent = buildUserAgent();
@@ -89,7 +96,10 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
     const approvalChannel = new ApprovalChannel(manager, sender, logger);
     manager.approvalChannel = approvalChannel;
     approvalChannel.install(ctx);
-    ctx.get('qqRemoteOps')?.attach({ bot, manager, sender, config });
+    ctx.provide('qqGateway', Object.freeze({ bot, manager, sender }));
+    // Remote Ops is an optional extension. Core messaging and approval own no ops dependency.
+    const releaseRemoteOps = ctx.get('qqRemoteOps')?.attach({ bot, manager, sender, config });
+    if (typeof releaseRemoteOps === 'function') ctx.effect(() => releaseRemoteOps);
     // ── 按钮点击回调（interaction）：统一分发到问答/审批通道 ──
     bot.on('interaction', async (_iCtx, event) => {
         // scope/targetId 推导对齐消息事件（inbound.ts）：按 scene 判定类型，群用 group_openid，私聊用 user_openid
@@ -147,11 +157,12 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
         bot.start().catch((err) => {
             logger.error(`Bot start failed: ${err instanceof Error ? err.message : String(err)}`);
         });
-        return async () => {
+        let stopping;
+        shutdown = () => stopping ??= (async () => {
             logger.info('Shutting down');
-            await manager.disposeAll();
-            bot.stop();
-        };
+            try { await manager.disposeAll(); } finally { bot.stop(); }
+        })();
+        return shutdown;
     }, 'im-qqbot.lifecycle');
 }
 //# sourceMappingURL=bootstrap.js.map

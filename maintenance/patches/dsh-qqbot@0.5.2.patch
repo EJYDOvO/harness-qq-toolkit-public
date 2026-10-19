@@ -450,19 +450,17 @@ index 553fd46..785c954 100644
              }
              if (!existsSync(absPath)) {
 diff --git a/dist/index.js b/dist/index.js
-index c4998d0..166c01c 100644
+index c4998d0..33b0125 100644
 --- a/dist/index.js
 +++ b/dist/index.js
-@@ -4,7 +4,8 @@ import { getProfileDir, resolveEnv } from "./shared/index.js";
+@@ -4,6 +4,7 @@ import { getProfileDir, resolveEnv } from "./shared/index.js";
  import { ensureCredentials, persistCredentialsToProfile, registerBoundCredentialRoutes } from "./setup/index.js";
  // ── Cordis 插件元数据 ──
  export const name = 'im-qqbot';
--export const inject = ['agents'];
 +// Harness 0.2 uses a service-name map/array, not upstream Cordis required/optional metadata.
-+export const inject = ['agents', 'qqRemoteOps'];
+ export const inject = ['agents'];
  export const Config = ConfigSchema;
  // ── 插件主体 ──
- export async function apply(ctx, config) {
 @@ -58,4 +59,4 @@ export async function apply(ctx, config) {
      const resolvedConfig = { ...config, appId, appSecret };
      await bootstrapGateway(ctx, agents, resolvedConfig, logger);
@@ -471,14 +469,105 @@ index c4998d0..166c01c 100644
 \ No newline at end of file
 +//# sourceMappingURL=index.js.map
 diff --git a/dist/gateway/bootstrap.js b/dist/gateway/bootstrap.js
-index 070f21e..9bc8106 100644
+index 070f21e..574a5a1 100644
 --- a/dist/gateway/bootstrap.js
 +++ b/dist/gateway/bootstrap.js
-@@ -89,6 +89,7 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+@@ -12,6 +12,8 @@ import { setupMiddlewares } from "./middleware-setup.js";
+ import { startMediaCleanup } from "../media/media-cleaner.js";
+ import { ensureVisionInputModal, registerDescribeImageTool } from "../media/vision-tool.js";
+ import { registerSendFileTool } from "../media/send-file-tool.js";
++// Shared across duplicate module copies in the same Host process.
++const gatewayLeases = globalThis[Symbol.for('dsh.qqGateway.leases.v1')] ??= new Map();
+ /**
+  * interaction 统一分发器：按 button_data 的顶层 `t` 判别字段，路由到对应
+  * channel（question / approval）。QQ 只有一个 interaction 入口，集中路由
+@@ -31,6 +33,11 @@ function dispatchInteraction(event, manager) {
+     return false;
+ }
+ export async function bootstrapGateway(ctx, agents, config, logger) {
++    if (gatewayLeases.has(config.appId)) throw new Error('Duplicate QQ Gateway for this application');
++    const lease = {};
++    gatewayLeases.set(config.appId, lease);
++    let shutdown;
++    ctx.effect(() => async () => { await shutdown?.(); if (gatewayLeases.get(config.appId) === lease) gatewayLeases.delete(config.appId); });
+     const manager = new SessionManager(ctx, agents, config, logger);
+     // ── 初始化 QQ Bot SDK ──
+     const userAgent = buildUserAgent();
+@@ -89,6 +96,10 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
      const approvalChannel = new ApprovalChannel(manager, sender, logger);
      manager.approvalChannel = approvalChannel;
      approvalChannel.install(ctx);
-+    ctx.get('qqRemoteOps')?.attach({ bot, manager, sender, config });
++    ctx.provide('qqGateway', Object.freeze({ bot, manager, sender }));
++    // Remote Ops is an optional extension. Core messaging and approval own no ops dependency.
++    const releaseRemoteOps = ctx.get('qqRemoteOps')?.attach({ bot, manager, sender, config });
++    if (typeof releaseRemoteOps === 'function') ctx.effect(() => releaseRemoteOps);
      // ── 按钮点击回调（interaction）：统一分发到问答/审批通道 ──
      bot.on('interaction', async (_iCtx, event) => {
          // scope/targetId 推导对齐消息事件（inbound.ts）：按 scene 判定类型，群用 group_openid，私聊用 user_openid
+@@ -146,11 +157,12 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+         bot.start().catch((err) => {
+             logger.error(`Bot start failed: ${err instanceof Error ? err.message : String(err)}`);
+         });
+-        return async () => {
++        let stopping;
++        shutdown = () => stopping ??= (async () => {
+             logger.info('Shutting down');
+-            await manager.disposeAll();
+-            bot.stop();
+-        };
++            try { await manager.disposeAll(); } finally { bot.stop(); }
++        })();
++        return shutdown;
+     }, 'im-qqbot.lifecycle');
+ }
+-//# sourceMappingURL=bootstrap.js.map
+\ No newline at end of file
++//# sourceMappingURL=bootstrap.js.map
+diff --git a/dist/session/session-manager.js b/dist/session/session-manager.js
+index 5eae070..f431e01 100644
+--- a/dist/session/session-manager.js
++++ b/dist/session/session-manager.js
+@@ -346,22 +346,11 @@ export class SessionManager {
+     }
+     async composePreset(presetId) {
+         const presets = this.getPresetsService();
+-        if (!presets)
+-            return {};
+-        try {
+-            const resolved = await presets.resolve(presetId);
+-            const resolvedId = resolved.id;
+-            return {
+-                agentPreset: resolvedId,
+-                setup: async (agentCtx) => {
+-                    await presets.mount(agentCtx, resolvedId);
+-                },
+-            };
+-        }
+-        catch (err) {
+-            this.logger.warn(`im-qqbot: preset ${presetId ?? '(default)'} unavailable: ${err instanceof Error ? err.message : String(err)} — using host composition`);
+-            return {};
+-        }
++        if (!presets) throw new Error('QQ requires the Host agentPresets service; refusing fallback');
++        const resolved = await presets.resolve(presetId);
++        if (resolved.broken !== undefined || (presetId && resolved.id !== presetId))
++            throw new Error('QQ preset unavailable; refusing fallback');
++        return { agentPreset: resolved.id, setup: async (agentCtx) => { await presets.mount(agentCtx, resolved.id); } };
+     }
+     /** 获取或恢复或创建会话（get → resume → create） */
+     async getOrCreate(scope, peerId, senderId, replyTarget) {
+diff --git a/dist/model/prefs-store.js b/dist/model/prefs-store.js
+index a470376..ccdcf39 100644
+--- a/dist/model/prefs-store.js
++++ b/dist/model/prefs-store.js
+@@ -18,7 +18,10 @@ export class PrefsStore {
+     prefsPath;
+     debugLog;
+     constructor(debugLog) {
+-        this.prefsPath = resolve(homedir(), '.dsh-qqbot', 'model-prefs.json');
++        // Explicit DSH_HOME isolates projects and preserves this deployment's existing data/qqbot file.
++        // Unconfigured legacy hosts retain their original path; no automatic data migration.
++        const home = process.env.DSH_HOME?.trim();
++        this.prefsPath = home ? resolve(home, 'qqbot', 'model-prefs.json') : resolve(homedir(), '.dsh-qqbot', 'model-prefs.json');
+         this.debugLog = debugLog;
+         this.load();
+     }
