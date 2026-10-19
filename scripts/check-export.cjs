@@ -19,6 +19,7 @@ function inspect(data,name){
 function checkFiles(){
  const names=[...new Set(execFileSync('git',['-C',repo,'ls-files','--cached','--others','--exclude-standard','-z'],{encoding:'utf8',windowsHide:true}).split('\0').filter(Boolean))];
  for(const name of names){
+  assert(!/^(?:agents?|publication)\.md$/i.test(path.basename(name)),'Local guidance in public export: '+name);
   const full=path.join(repo,name);assert(fs.existsSync(full),'Tracked file missing; review deletion: '+name);
   assert(!fs.lstatSync(full).isSymbolicLink(),'Symlink in export: '+name);
   assert(!name.split('/').some(p=>['node_modules','data','resources','cache','tmp','browser-profile','backups'].includes(p)),'Runtime directory in export: '+name);

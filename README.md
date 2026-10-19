@@ -29,7 +29,6 @@ plugin-sources/
   dsh-task-memory/           # 旧项目记忆的适配源码，可选
 plugin-packages/             # 明确允许发布的小型固定版本包，含回滚旧版本
 templates/                   # 脱敏的配置示例与旧 Profile 快照
-default-workspace/AGENTS.md  # 原 QQ 工作区约定样例，不是仓库贡献规则
 scripts/                    # 源码导出及脱敏检查
 docs/                       # 通用集成、恢复和仓库管理说明
 licenses/                   # 第三方许可
@@ -47,7 +46,6 @@ licenses/                   # 第三方许可
 | 执行 Stage、部署、备份与恢复 | [Windows 维护手册](maintenance/README.md) |
 | 恢复原部署扩展 | [恢复边界与步骤](docs/RESTORE.md) |
 | 导出源码或向 GitHub 发布 | [仓库管理](docs/REPOSITORY.md) |
-| 修改本仓库，或让 Agent 接手 | [开发约定](AGENTS.md) |
 
 ## 接入方式
 
@@ -101,4 +99,4 @@ node maintenance/build-qqbot-patch.cjs --check
 
 已做过的验证和当时限制见 [通用接口验收](docs/GENERIC-INTEGRATION.md#实际验证) 与 [历史维护验收](maintenance/TEST-REPORT.md)。仓库源码、默认配置与某台机器的实际部署状态应分别核对。
 
-第三方文件保留原许可，见 `licenses/` 和各插件目录。功能、配置或操作方式变更时同步维护本 README 及对应专题文档，规则见 [AGENTS.md](AGENTS.md)。
+第三方文件保留原许可，见 `licenses/` 和各插件目录。功能、配置或操作方式变更时，同步维护本 README 及对应专题文档，明确区分通用能力、旧部署约定和实际验证范围。

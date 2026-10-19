@@ -8,6 +8,7 @@ const hash=data=>createHash('sha256').update(data).digest('hex');
 const git=(dir,...args)=>execFileSync('git',['-C',dir,...args],{encoding:'utf8',windowsHide:true}).trim();
 const exported=[];const revisions={};
 function save(relative,bytes){
+ assert(!/^(?:agents?|publication)\.md$/i.test(path.basename(relative)),'Local guidance cannot be exported');
  const target=path.resolve(destination,relative);assert(target.startsWith(destination+path.sep),'Export escaped repository');
  fs.mkdirSync(path.dirname(target),{recursive:true});fs.writeFileSync(target,bytes);
  exported.push({path:relative.replaceAll('\\','/'),sha256:hash(bytes)});
@@ -17,12 +18,12 @@ for(const relative of ['maintenance','plugin-sources/dsh-remote-ops','plugin-sou
  const source=path.join(root,relative);assert.equal(git(source,'status','--porcelain'),'','Checkpoint and review source changes before exporting: '+relative);
  revisions[relative]=git(source,'rev-parse','HEAD');
  for(const entry of git(source,'ls-files').split('\n').filter(Boolean)){
+  if(/^(?:agents?|publication)\.md$/i.test(path.basename(entry)))continue;
   assert(!entry.split('/').includes('node_modules')&&!entry.split('/').includes('.git'),'Unexpected tracked dependency');
   const resolved=fs.realpathSync(path.join(source,entry));assert(resolved.startsWith(fs.realpathSync(source)+path.sep),'Tracked link escaped source');
   copy(relative+'/'+entry);
  }
 }
-copy('default-workspace/AGENTS.md');revisions['default-workspace']=git(path.join(root,'default-workspace'),'rev-parse','HEAD');
 const policy=JSON.parse(fs.readFileSync(path.join(root,'maintenance/plugin-policy.json')));
 const archives=Object.values(policy.localPackages).map(p=>({path:p.source.slice(5),sha256:p.sha256}));
 archives.push({path:path.join(root,'plugin-packages/dsh-plugin-bilibili-0.2.4.tgz')});

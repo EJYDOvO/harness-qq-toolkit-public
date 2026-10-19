@@ -2,7 +2,7 @@
 
 公开入口：[EJYDOvO/harness-qq-toolkit-public](https://github.com/EJYDOvO/harness-qq-toolkit-public)。原私有仓库 `EJYDOvO/harness-qq-toolkit` 是不同发布目标。本机克隆可能同时配置 `origin`（旧私有仓库）与 `public`（公开仓库）；推送前运行 `git remote -v` 核对 URL，不凭远端名字猜测可见性。
 
-该目录保存可审查的源码和导出快照；运行中的插件依然由安装目录管理，不从 GitHub 自动拉取运行。开发文档维护规则见 [AGENTS.md](../AGENTS.md)。
+该目录保存可审查的源码和导出快照；运行中的插件依然由安装目录管理，不从 GitHub 自动拉取运行。功能、配置及操作方式变更应同步维护 README 和相关专题文档。本地 Agent 约定与发布检查笔记不随公开源码分发。
 
 ## 保存新的改动
 
