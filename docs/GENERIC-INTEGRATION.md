@@ -87,10 +87,10 @@ sessionLifecycle:
 
 运行中的 Agent、待处理 Inbox、待审批/问答、持久未完成轮次均会延后轮换，下一次安全交互重试，不自动 cancel。记录在 `getStatus().lifecycle` 中包含 lastUserAt、pendingReason、blockedBy、generation。并发 get、手动重置/模型切换/压缩采用每 Conversation 串行边界；路由和生命周期使用同一个偏好文件原子提交，失败不发布新路由。异常或外部更改的偏好文件拒绝覆盖；仍要求单活 Host，不提供跨机器锁。
 
-已有原生 Schedule 仍绑定旧 Session，**不迁移提醒**。通用 QQ 没有可信旧根桥接时，轮换因 `existing_schedule` 延后，避免丢提醒。Character Identity 提供 Host-only `manager.preserveScheduledSession(oldId)`，只接受已持久绑定的 Owner/项目/角色旧根，经原 Outbox 通知稳定 Conversation，不能改写当前主路由。历史部署 test.13 冷恢复曾重授完整身份；后续源码候选改为仅提醒绑定，拒绝历史根的模型、工具、Memory 与长期任务创建。其他项目若需要相同行为，须提供自己经过审查的桥接；不要简单返回 true。
+已有原生 Schedule 仍绑定旧 Session，**不迁移提醒**。通用 QQ 没有可信旧根桥接时，轮换因 `existing_schedule` 延后，避免丢提醒。Character Identity 提供 Host-only `manager.preserveScheduledSession(oldId)`，只接受已持久绑定的 Owner/项目/角色旧根，经原 Outbox 通知稳定 Conversation，不能改写当前主路由。历史部署 test.13 冷恢复曾重授完整身份；test.14 改为仅提醒绑定，拒绝历史根的模型、工具、Memory 与长期任务创建。其他项目若需要相同行为，须提供自己经过审查的桥接；不要简单返回 true。
 
-后续补丁的 `manager.isCurrentSession(record)` 检查真实 record 对象、manager 路由与 Agent 注册表；集成层必须在异步 admission 后重查，不能凭 Session ID/QQ 身份参数授权。QQTK 不决定具体 Identity 策略，普通 Agent 无须安装 Character。当前 rc.2 切模型使用原生 `snapshotEvents/buildForkSeed` 构建精确前缀，避免旧 `.events` API 和额外的临时活跃 fork；新根持久化成功后通过 `PrefsStore.commitSession` 一次提交模型偏好及路由。磁盘写入/外部修改/关闭失败时撤销候选，不发布新路由。自动空白轮换仍不 Fork。
+当前补丁的 `manager.isCurrentSession(record)` 检查真实 record 对象、manager 路由与 Agent 注册表；集成层必须在异步 admission 后重查，不能凭 Session ID/QQ 身份参数授权。QQTK 不决定具体 Identity 策略，普通 Agent 无须安装 Character。当前 rc.2 切模型使用原生 `snapshotEvents/buildForkSeed` 构建精确前缀，避免旧 `.events` API 和额外的临时活跃 fork；新根持久化成功后通过 `PrefsStore.commitSession` 一次提交模型偏好及路由。磁盘写入/外部修改/关闭失败时撤销候选，不发布新路由。自动空白轮换仍不 Fork。
 
 生命周期状态仍在 `$DSH_HOME/qqbot/model-prefs.json`；无 DSH_HOME 保留旧路径，不自动迁移。备份需同时保留偏好、原生 Session/Schedule，以及集成方身份/通知状态。停用开关保留已有最新路由，不重置历史或数据库。宿主崩溃后未完成的副作用无法自动证明结束，可能保持延后，需显式处理原任务，不能删除记录强迫轮换。
 
-验证：`node --test maintenance/session-lifecycle.test.mjs`；配套 Character `scripts/run-lifecycle.ps1` 在两个真实 rc.2 Host 进程中验证空白根、Memory 连续性、停机逾期、原提醒冷恢复和独立任务。模型/Sender 为合成替身，不启动 QQBot、不证明实机收件；已随 Character test.13 在 Windows 实例部署；真实 QQ 收件与手机审批仍待验收。
+验证：`node --test maintenance/session-lifecycle.test.mjs`；配套 Character `scripts/run-lifecycle.ps1` 在两个真实 rc.2 Host 进程中验证空白根、Memory 连续性、停机逾期、原提醒冷恢复和独立任务。模型/Sender 为合成替身，不启动 QQBot、不证明实机收件；已随 Character test.14 在 Windows 实例部署，保留 test.13 生命周期配置；真实 QQ 收件与手机审批仍待验收。

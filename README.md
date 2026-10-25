@@ -2,9 +2,9 @@
 
 为 DeepSeek Harness 提供 **QQ 接入兼容补丁、可选 Remote Ops 插件和维护工具**。普通 DSH Agent 可以独立使用 QQ 接入，不需要 Character Agent、角色 Preset 或记忆插件。
 
-源码提供默认关闭的 [QQ 主 Session 生命周期](docs/GENERIC-INTEGRATION.md#可选主-session-生命周期)：真实 Host 重启或 12 小时无用户输入后，下次安全交互创建空白根 Session，不 Fork 聊天。繁忙、审批和已有提醒有保护，启动预热不算用户输入。已随 Character test.13 部署并启用；真实 QQ 收件与手机验收仍待完成。
+源码提供默认关闭的 [QQ 主 Session 生命周期](docs/GENERIC-INTEGRATION.md#可选主-session-生命周期)：真实 Host 重启或 12 小时无用户输入后，下次安全交互创建空白根 Session，不 Fork 聊天。繁忙、审批和已有提醒有保护，启动预热不算用户输入。test.13 首次部署并启用，test.14 保留；真实 QQ 收件与手机验收仍待完成。
 
-后续未部署补丁增加 Host 当前 Session 核验及 rc.2 模型切换适配：Session/模型偏好原子提交，失败保留原路由；供 Character 将历史根收窄为提醒用途。QQTK 本身不增加 Character、Memory 或 Remote Ops 依赖，详见[生命周期契约](docs/GENERIC-INTEGRATION.md#可选主-session-生命周期)。
+配套 test.14 的补丁已部署，增加 Host 当前 Session 核验及 rc.2 模型切换适配：Session/模型偏好原子提交，失败保留原路由；供 Character 将历史根收窄为提醒用途。QQTK 本身不增加 Character、Memory 或 Remote Ops 依赖，详见[生命周期契约](docs/GENERIC-INTEGRATION.md#可选主-session-生命周期)。
 
 本仓库是扩展源码与维护材料，不包含 DSH 本体，也不是一键安装器。当前 Character 集成实例已验证 **Windows、DSH 0.2.1-rc.2、QQ Bot 0.5.2**；Remote Ops 为 **1.1.1-test.1**。原独立接入基线为 0.2.0-rc.2，新版本的适配范围与限制见 [兼容说明](docs/DSH-0.2.1.md)。其他版本和平台需要重新验证。
 
