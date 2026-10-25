@@ -77,6 +77,14 @@ export class PrefsStore {
         if(this.loadError)throw new Error('QQ preferences could not be loaded; refusing lifecycle reset', {cause:this.loadError});
         return this.lifecycle.get(key);
     }
+    /** Durable model-fork publication: no in-memory route change on failure. */
+    commitSession(key, sessionId, route) {
+        if(this.loadError)throw new Error('QQ preferences are unavailable', {cause:this.loadError});
+        const sessionIds=new Map(this.sessionIds),overrides=new Map(this.overrides);
+        sessionIds.set(key,sessionId);if(route)overrides.set(key,structuredClone(route));
+        this.persist({overrides:Object.fromEntries(overrides),presets:Object.fromEntries(this.presets),sessionIds:Object.fromEntries(sessionIds),lifecycle:Object.fromEntries(this.lifecycle)});
+        this.sessionIds=sessionIds;this.overrides=overrides;
+    }
     /** Commit routing and lifecycle together; failure must not publish a new Session. */
     commitLifecycle(key, value, sessionId=this.sessionIds.get(key)) {
         if(this.loadError)throw new Error('QQ preferences are unavailable', {cause:this.loadError});

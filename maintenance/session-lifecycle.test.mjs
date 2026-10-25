@@ -12,18 +12,30 @@ function factory(home,clock,durable=new Map()){
  const sandbox={...fs,resolve:path.resolve,dirname:path.dirname,homedir:()=>home,process:{pid:process.pid,env:{DSH_HOME:home}},structuredClone};
  const Prefs=vm.runInNewContext(source('model/prefs-store.js')+';PrefsStore;',sandbox);
  const live=new Map(),options=[],disposed=[];let creates=0;
- function handle(id,meta={agentPreset:'fixture'}){const agent={id,status:'idle',session:{header:{id,...meta},events:durable.get(id)?.events??[]},inbox:{hasPending:false},cancel(){this.cancelled=true;}};live.set(id,agent);return {agent,async dispose(){disposed.push(id);if(live.get(id)===agent)live.delete(id);}};}
+ function handle(id,meta={agentPreset:'fixture'}){const agent={id,status:'idle',session:{header:{id,...meta},events:durable.get(id)?.events??[],snapshotEvents(){return this.events;}},inbox:{hasPending:false},cancel(){this.cancelled=true;}};live.set(id,agent);return {agent,async dispose(){disposed.push(id);if(live.get(id)===agent)live.delete(id);}};}
  const agents={get:id=>live.get(id),async create(input){creates++;options.push(input);return handle(input.sessionId,input.meta);},async resume({resumeSessionId}){if(!durable.has(resumeSessionId))throw Object.assign(Error('absent'),{name:'SessionPersistenceNotFoundError'});return handle(resumeSessionId);}};
  class ModelResolver{constructor(_ctx,config){this.prefs=new Prefs();this.config=config;}getEffectiveRoute(k){return this.prefs.getOverride(k)??{provider:'fixture-provider',model:'fixture-model'};}getResumeRoute(k){return this.getEffectiveRoute(k);}getPreset(k){return this.prefs.getPreset(k);}getSessionId(k){return this.prefs.getSessionId(k);}setSessionId(k,v){this.prefs.setSessionId(k,v);}}
  class Clock extends Date{static now(){return clock.now;}}
  const timers=new Set(),IdleEvictor=vm.runInNewContext(source('session/idle-evictor.js')+';IdleEvictor;',{Date:Clock,setInterval:fn=>{timers.add(fn);return fn;},clearInterval:t=>timers.delete(t)});
- const Manager=vm.runInNewContext(source('session/session-manager.js')+';SessionManager;',{ModelResolver,IdleEvictor,SessionId:x=>x,createHash,randomUUID,Date:Clock,structuredClone,process:{cwd:()=>home}});
+ const Manager=vm.runInNewContext(source('session/session-manager.js')+';SessionManager;',{ModelResolver,IdleEvictor,SessionId:x=>x,buildForkSeed:(rows,boundary)=>structuredClone(rows.slice(0,boundary+1)),createHash,randomUUID,Date:Clock,structuredClone,process:{cwd:()=>home}});
  let reminders=[];const ctx={on(){},get(name){if(name==='agentPresets')return {async resolve(id){if(id==='broken')throw Error('broken preset');return {id:id??'fixture'};},async mount(){}};if(name==='sessionPersistence')return {async open(id,access){assert.equal(access,'read');if(!durable.has(id))throw Object.assign(Error('absent'),{name:'SessionPersistenceNotFoundError'});return {header:durable.get(id).meta,read:async()=>({events:durable.get(id).events}),close:async()=>{}};}};if(name==='schedule')return {async list(){return reminders;}};if(name==='sessions')return {async flush(session){durable.set(session.header.id,{meta:{agentPreset:session.header.agentPreset},events:structuredClone(session.events)});return true;}};}};
  const config={appId:'fixture-app',preset:'fixture',cwd:home,sessionIdleTimeout:1,sessionLifecycle:{enabled:true,freshOnHostRestart:true,inactivityMs:43200000}},manager=new Manager(ctx,agents,config,{info(){},warn(){},debug(){}});
  const get=id=>manager.getOrCreate('c2c','owner','owner',{scope:'c2c',targetId:'owner',msgId:id});
  return {manager,get,config,live,durable,options,disposed,creates:()=>creates,setReminders:rows=>reminders=rows};
 }
 const fixture=()=>{const home=fs.mkdtempSync(path.join(os.tmpdir(),'qq-lifecycle-')),clock={now:Date.now()},f=factory(home,clock);return {...f,home,clock};};
+test('current-session contract rejects spoofed records, superseded routes, replaced Agents and disposal',async()=>{
+ const f=fixture(),old=await f.get('first');assert(f.manager.isCurrentSession(old));assert.equal(f.manager.isCurrentSession({...old}),false);
+ f.clock.now+=43200001;const next=await f.get('rotate');assert.notEqual(next.sessionId,old.sessionId);assert.equal(f.manager.isCurrentSession(old),false);assert(f.manager.isCurrentSession(next));
+ f.live.set(next.sessionId,{...next.agent});assert.equal(f.manager.isCurrentSession(next),false);f.live.set(next.sessionId,next.agent);await f.manager.disposeAll();assert.equal(f.manager.isCurrentSession(next),false);
+});
+test('model switch publishes Session and preference atomically; failure preserves the old main and disposes the unbound candidate',async()=>{
+ const f=fixture(),old=await f.get('first'),id=old.sessionId,key=old.sessionKey,prefs=f.manager.modelResolver.prefs,original=prefs.persist.bind(prefs);
+ prefs.persist=()=>{throw Error('fixture disk failure');};await assert.rejects(()=>f.manager.setModelOverride('c2c','owner',{provider:'selected',model:'next'}),/disk failure/);
+ assert.equal(f.manager.currentSessionId(key),id);assert.equal(prefs.getOverride(key),undefined);assert(f.manager.isCurrentSession(old));assert(!f.disposed.includes(id));assert.equal(f.disposed.length,1);
+ prefs.persist=original;await f.manager.setModelOverride('c2c','owner',{provider:'selected',model:'next'});assert.notEqual(old.sessionId,id);assert(f.manager.isCurrentSession(old));assert(f.disposed.includes(id));
+ const disk=JSON.parse(fs.readFileSync(prefs.prefsPath));assert.equal(disk.sessionIds[key],old.sessionId);assert.equal(disk.overrides[key].model,'next');await f.manager.disposeAll();
+});
 test('opt-in restart rotation creates a blank root, preserves model/preset preferences and survives HMR in one process',async()=>{
  const f=fixture(),first=await f.get('first'),key=first.sessionKey,prefs=f.manager.modelResolver.prefs;
  prefs.setOverride(key,{provider:'selected',model:'selected-model'});prefs.setPreset(key,'fixture');first.agent.session.events.push({type:'user/message',data:{text:'old private history'}});await f.manager.ctx.get('sessions').flush(first.agent.session);

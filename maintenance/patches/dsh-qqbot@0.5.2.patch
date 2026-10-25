@@ -684,11 +684,15 @@ index 070f21e..d50afc8 100644
 \ No newline at end of file
 +//# sourceMappingURL=bootstrap.js.map
 diff --git a/dist/session/session-manager.js b/dist/session/session-manager.js
-index 5eae070..86928d8 100644
+index 5eae070..6d550a4 100644
 --- a/dist/session/session-manager.js
 +++ b/dist/session/session-manager.js
-@@ -16,6 +16,8 @@ import { createHash, randomUUID } from 'node:crypto';
- import { SessionId } from '@deepseek-ai/dsh-session';
+@@ -13,9 +13,11 @@
+  * 挂载 preset（工具集、prompt sections 等），实现场景化配置。
+  */
+ import { createHash, randomUUID } from 'node:crypto';
+-import { SessionId } from '@deepseek-ai/dsh-session';
++import { SessionId, buildForkSeed } from '@deepseek-ai/dsh-session';
  import { ModelResolver } from "../model/model-resolver.js";
  import { IdleEvictor } from "./idle-evictor.js";
 +// Stable through plugin reloads, different after an actual Host process restart.
@@ -725,7 +729,7 @@ index 5eae070..86928d8 100644
              return meta?.agentPreset;
          }
          catch {
-@@ -156,6 +160,9 @@ export class SessionManager {
+@@ -156,10 +160,13 @@ export class SessionManager {
       * 切换模型（fork + 重建会话，保留历史）
       */
      async setModelOverride(scope, peerId, route) {
@@ -733,8 +737,13 @@ index 5eae070..86928d8 100644
 +    }
 +    async changeModelOverride(scope, peerId, route) {
          const key = this.sessionKey(scope, peerId);
-         this.modelResolver.setOverride(key, route);
+-        this.modelResolver.setOverride(key, route);
          const record = this.sessions.get(key);
+         if (!record) {
++            this.modelResolver.prefs.commitSession(key,this.currentSessionId(key),route);
+             this.logger.info(`model pref saved (no active session): key=${key} → ${route.provider}/${route.model}`);
+             return;
+         }
 @@ -173,6 +180,9 @@ export class SessionManager {
       * 不 fork/rebuild 当前会话，避免历史工具调用与新 preset 工具集冲突。
       */
@@ -755,7 +764,47 @@ index 5eae070..86928d8 100644
          const key = this.sessionKey(scope, peerId);
          this.modelResolver.clearPreset(key);
          this.logger.info(`preset pref cleared: key=${key} (next session applies)`);
-@@ -273,6 +286,7 @@ export class SessionManager {
+@@ -219,9 +232,13 @@ export class SessionManager {
+             await record.handle.dispose().catch(() => { });
+             return;
+         }
+-        let seed;
++        let seed, inheritedEventCount;
+         try {
+-            seed = sessionsService.fork(record.agent.session).events;
++            // rc.2 fork() returns a live Session, not an .events bag. Use the
++            // exported native prefix builder, avoiding an orphan live fork.
++            const events = record.agent.session.snapshotEvents();
++            inheritedEventCount = events.length;
++            seed = events.length ? buildForkSeed(events, events.at(-1).seq) : [];
+         }
+         catch (err) {
+             this.logger.warn(`fork failed, fallback to dispose: key=${key} err=${err instanceof Error ? err.message : String(err)}`);
+@@ -236,16 +253,21 @@ export class SessionManager {
+         const created = await this.agents.create({
+             sessionId: childId,
+             seed,
++            inheritedEventCount,
+             meta: {
+                 cwd: this.config.cwd || process.cwd(),
+                 parentSession: record.sessionId,
+-                seedLength: seed.length,
++                isSeeded: true,
+                 ...(composed.agentPreset ? { agentPreset: composed.agentPreset } : {}),
+             },
+             ...(effectiveRoute ? { agentOptions: effectiveRoute } : {}),
+             ...(composed.setup ? { setup: composed.setup } : {}),
+         });
+-        this.modelResolver.setSessionId(key, childId);
++        try {
++            if(!await sessionsService.flush(created.agent.session))throw new Error('Model fork persistence did not acknowledge the Session');
++            if(this.closed||this.sessions.get(key)!==record)throw new Error('QQ route changed during model fork');
++            this.modelResolver.prefs.commitSession(key,childId,effectiveRoute);
++        } catch(error) { await created.dispose().catch(()=>{}); throw error; }
+         const oldHandle = record.handle;
+         record.sessionId = childId;
+         record.agent = created.agent;
+@@ -273,6 +295,7 @@ export class SessionManager {
      getStatus(scope, peerId) {
          const record = this.getSessionRecord(scope, peerId);
          const route = this.getEffectiveModel(scope, peerId);
@@ -763,7 +812,7 @@ index 5eae070..86928d8 100644
          return {
              active: !!record,
              sessionId: record?.sessionId,
-@@ -281,12 +295,13 @@ export class SessionManager {
+@@ -281,12 +304,13 @@ export class SessionManager {
              preset: record?.agentPreset,
              lastActivity: record?.lastActivity,
              messageCount: this.countMessages(record),
@@ -778,7 +827,7 @@ index 5eae070..86928d8 100644
          if (!events)
              return stats;
          for (const event of events) {
-@@ -303,7 +318,7 @@ export class SessionManager {
+@@ -303,7 +327,7 @@ export class SessionManager {
          const record = this.getSessionRecord(scope, peerId);
          if (!record)
              return '';
@@ -787,7 +836,7 @@ index 5eae070..86928d8 100644
          if (!events || events.length === 0)
              return '';
          const lines = [`# QQ 会话导出\n`, `> session: ${record.sessionId}\n`];
-@@ -322,7 +337,7 @@ export class SessionManager {
+@@ -322,7 +346,7 @@ export class SessionManager {
          return lines.join('\n');
      }
      countMessages(record) {
@@ -796,7 +845,7 @@ index 5eae070..86928d8 100644
          if (!events)
              return 0;
          let count = 0;
-@@ -334,6 +349,80 @@ export class SessionManager {
+@@ -334,6 +358,80 @@ export class SessionManager {
          return count;
      }
      // ── Session 生命周期管理 ──
@@ -877,8 +926,16 @@ index 5eae070..86928d8 100644
      sessionKey(scope, peerId) {
          return `qqbot:${this.config.appId}:${scope}:${peerId}`;
      }
-@@ -346,25 +435,28 @@ export class SessionManager {
+@@ -344,27 +442,36 @@ export class SessionManager {
+     currentSessionId(sessionKey) {
+         return this.modelResolver.getSessionId(sessionKey) ?? this.deriveSessionId(sessionKey);
      }
++    /** Host admission check, not a model-provided identity. Recheck after await. */
++    isCurrentSession(record) {
++        return !this.closed && this.sessions.get(record?.sessionKey) === record
++            && record.sessionId === this.currentSessionId(record.sessionKey)
++            && this.agents.get(record.sessionId) === record.agent;
++    }
      async composePreset(presetId) {
          const presets = this.getPresetsService();
 -        if (!presets)
@@ -922,7 +979,7 @@ index 5eae070..86928d8 100644
          const key = this.sessionKey(scope, peerId);
          const existing = this.sessions.get(key);
          if (existing) {
-@@ -445,6 +537,9 @@ export class SessionManager {
+@@ -445,6 +552,9 @@ export class SessionManager {
          return undefined;
      }
      async remove(scope, peerId) {
@@ -932,7 +989,7 @@ index 5eae070..86928d8 100644
          const key = this.sessionKey(scope, peerId);
          const record = this.sessions.get(key);
          this.modelResolver.setSessionId(key, randomUUID());
-@@ -462,6 +557,9 @@ export class SessionManager {
+@@ -462,6 +572,9 @@ export class SessionManager {
       * 这是「压缩上下文」的语义，区别于 remove() 的「换新会话」。
       */
      async compact(scope, peerId) {
@@ -942,7 +999,7 @@ index 5eae070..86928d8 100644
          const key = this.sessionKey(scope, peerId);
          const record = this.sessions.get(key);
          if (!record)
-@@ -507,6 +605,8 @@ export class SessionManager {
+@@ -507,6 +620,8 @@ export class SessionManager {
          }
      }
      async disposeAll() {
@@ -951,7 +1008,7 @@ index 5eae070..86928d8 100644
          this.evictor.dispose();
          const records = [...this.sessions.values()];
          this.sessions.clear();
-@@ -533,4 +633,4 @@ function extractMessageText(message) {
+@@ -533,4 +648,4 @@ function extractMessageText(message) {
      }
      return parts.join('\n').trim();
  }
@@ -959,7 +1016,7 @@ index 5eae070..86928d8 100644
 \ No newline at end of file
 +//# sourceMappingURL=session-manager.js.map
 diff --git a/dist/model/prefs-store.js b/dist/model/prefs-store.js
-index a470376..25a5bff 100644
+index a470376..cac2dff 100644
 --- a/dist/model/prefs-store.js
 +++ b/dist/model/prefs-store.js
 @@ -4,7 +4,7 @@
@@ -990,13 +1047,21 @@ index a470376..25a5bff 100644
          this.debugLog = debugLog;
          this.load();
      }
-@@ -67,13 +73,39 @@ export class PrefsStore {
+@@ -67,13 +73,47 @@ export class PrefsStore {
              this.write();
          return deleted;
      }
 +    getLifecycle(key) {
 +        if(this.loadError)throw new Error('QQ preferences could not be loaded; refusing lifecycle reset', {cause:this.loadError});
 +        return this.lifecycle.get(key);
++    }
++    /** Durable model-fork publication: no in-memory route change on failure. */
++    commitSession(key, sessionId, route) {
++        if(this.loadError)throw new Error('QQ preferences are unavailable', {cause:this.loadError});
++        const sessionIds=new Map(this.sessionIds),overrides=new Map(this.overrides);
++        sessionIds.set(key,sessionId);if(route)overrides.set(key,structuredClone(route));
++        this.persist({overrides:Object.fromEntries(overrides),presets:Object.fromEntries(this.presets),sessionIds:Object.fromEntries(sessionIds),lifecycle:Object.fromEntries(this.lifecycle)});
++        this.sessionIds=sessionIds;this.overrides=overrides;
 +    }
 +    /** Commit routing and lifecycle together; failure must not publish a new Session. */
 +    commitLifecycle(key, value, sessionId=this.sessionIds.get(key)) {
@@ -1030,7 +1095,7 @@ index a470376..25a5bff 100644
              if (data.overrides && typeof data.overrides === 'object') {
                  for (const [key, route] of Object.entries(data.overrides)) {
                      if (route.provider && route.model) {
-@@ -97,22 +129,25 @@ export class PrefsStore {
+@@ -97,22 +137,25 @@ export class PrefsStore {
              }
          }
          catch (err) {

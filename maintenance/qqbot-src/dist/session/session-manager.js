@@ -13,7 +13,7 @@
  * 挂载 preset（工具集、prompt sections 等），实现场景化配置。
  */
 import { createHash, randomUUID } from 'node:crypto';
-import { SessionId } from '@deepseek-ai/dsh-session';
+import { SessionId, buildForkSeed } from '@deepseek-ai/dsh-session';
 import { ModelResolver } from "../model/model-resolver.js";
 import { IdleEvictor } from "./idle-evictor.js";
 // Stable through plugin reloads, different after an actual Host process restart.
@@ -164,9 +164,9 @@ export class SessionManager {
     }
     async changeModelOverride(scope, peerId, route) {
         const key = this.sessionKey(scope, peerId);
-        this.modelResolver.setOverride(key, route);
         const record = this.sessions.get(key);
         if (!record) {
+            this.modelResolver.prefs.commitSession(key,this.currentSessionId(key),route);
             this.logger.info(`model pref saved (no active session): key=${key} → ${route.provider}/${route.model}`);
             return;
         }
@@ -232,9 +232,13 @@ export class SessionManager {
             await record.handle.dispose().catch(() => { });
             return;
         }
-        let seed;
+        let seed, inheritedEventCount;
         try {
-            seed = sessionsService.fork(record.agent.session).events;
+            // rc.2 fork() returns a live Session, not an .events bag. Use the
+            // exported native prefix builder, avoiding an orphan live fork.
+            const events = record.agent.session.snapshotEvents();
+            inheritedEventCount = events.length;
+            seed = events.length ? buildForkSeed(events, events.at(-1).seq) : [];
         }
         catch (err) {
             this.logger.warn(`fork failed, fallback to dispose: key=${key} err=${err instanceof Error ? err.message : String(err)}`);
@@ -249,16 +253,21 @@ export class SessionManager {
         const created = await this.agents.create({
             sessionId: childId,
             seed,
+            inheritedEventCount,
             meta: {
                 cwd: this.config.cwd || process.cwd(),
                 parentSession: record.sessionId,
-                seedLength: seed.length,
+                isSeeded: true,
                 ...(composed.agentPreset ? { agentPreset: composed.agentPreset } : {}),
             },
             ...(effectiveRoute ? { agentOptions: effectiveRoute } : {}),
             ...(composed.setup ? { setup: composed.setup } : {}),
         });
-        this.modelResolver.setSessionId(key, childId);
+        try {
+            if(!await sessionsService.flush(created.agent.session))throw new Error('Model fork persistence did not acknowledge the Session');
+            if(this.closed||this.sessions.get(key)!==record)throw new Error('QQ route changed during model fork');
+            this.modelResolver.prefs.commitSession(key,childId,effectiveRoute);
+        } catch(error) { await created.dispose().catch(()=>{}); throw error; }
         const oldHandle = record.handle;
         record.sessionId = childId;
         record.agent = created.agent;
@@ -432,6 +441,12 @@ export class SessionManager {
     }
     currentSessionId(sessionKey) {
         return this.modelResolver.getSessionId(sessionKey) ?? this.deriveSessionId(sessionKey);
+    }
+    /** Host admission check, not a model-provided identity. Recheck after await. */
+    isCurrentSession(record) {
+        return !this.closed && this.sessions.get(record?.sessionKey) === record
+            && record.sessionId === this.currentSessionId(record.sessionKey)
+            && this.agents.get(record.sessionId) === record.agent;
     }
     async composePreset(presetId) {
         const presets = this.getPresetsService();
