@@ -537,7 +537,7 @@ index c4998d0..33b0125 100644
 \ No newline at end of file
 +//# sourceMappingURL=index.js.map
 diff --git a/dist/gateway/bootstrap.js b/dist/gateway/bootstrap.js
-index 070f21e..d50afc8 100644
+index 070f21e..a7b4e64 100644
 --- a/dist/gateway/bootstrap.js
 +++ b/dist/gateway/bootstrap.js
 @@ -12,6 +12,8 @@ import { setupMiddlewares } from "./middleware-setup.js";
@@ -549,7 +549,7 @@ index 070f21e..d50afc8 100644
  /**
   * interaction 统一分发器：按 button_data 的顶层 `t` 判别字段，路由到对应
   * channel（question / approval）。QQ 只有一个 interaction 入口，集中路由
-@@ -30,7 +32,76 @@ function dispatchInteraction(event, manager) {
+@@ -30,7 +32,78 @@ function dispatchInteraction(event, manager) {
          return manager.approvalChannel?.handleInteraction(event) ?? false;
      return false;
  }
@@ -603,7 +603,9 @@ index 070f21e..d50afc8 100644
 +        if (policy) {
 +            if(event.type==='user/message'){
 +                const source=event.data?.message?.source??event.data?.source;
-+                if(source?.kind&&!['user','runtime-context','skill-catalog'].includes(source.kind)){record.interactionSuppressed=true;policy.stopOutput();}
++                // Native projections are context within the admitted turn, not
++                // another input channel. They never clear existing suppression.
++                if(source?.kind&&!['user','runtime-context','skill-catalog','time-context','agent-instructions'].includes(source.kind)){record.interactionSuppressed=true;policy.stopOutput();}
 +            }
 +            if(record.interactionSuppressed)return;
 +            const target = { ...record.replyTarget };
@@ -626,7 +628,7 @@ index 070f21e..d50afc8 100644
      const manager = new SessionManager(ctx, agents, config, logger);
      // ── 初始化 QQ Bot SDK ──
      const userAgent = buildUserAgent();
-@@ -70,15 +141,22 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+@@ -70,15 +143,22 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
      const replyLimiter = new ReplyLimiter({ limit: 4 });
      const sender = {
          sendMarkdown: (target, content, opts) => sendResolvedMarkdown(bot, resolveReplyTarget(target, replyLimiter, true), content, opts),
@@ -653,7 +655,7 @@ index 070f21e..d50afc8 100644
      ctx
          .on('session/event', outboundHandler);
      // ── 问答通道（ask_user_question → QQ 文本 + 按钮） ──
-@@ -89,6 +167,10 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+@@ -89,6 +169,10 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
      const approvalChannel = new ApprovalChannel(manager, sender, logger);
      manager.approvalChannel = approvalChannel;
      approvalChannel.install(ctx);
@@ -664,7 +666,7 @@ index 070f21e..d50afc8 100644
      // ── 按钮点击回调（interaction）：统一分发到问答/审批通道 ──
      bot.on('interaction', async (_iCtx, event) => {
          // scope/targetId 推导对齐消息事件（inbound.ts）：按 scene 判定类型，群用 group_openid，私聊用 user_openid
-@@ -146,11 +228,12 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+@@ -146,11 +230,12 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
          bot.start().catch((err) => {
              logger.error(`Bot start failed: ${err instanceof Error ? err.message : String(err)}`);
          });

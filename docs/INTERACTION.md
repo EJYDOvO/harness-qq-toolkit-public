@@ -4,6 +4,10 @@
 
 QQTK 的 `gateway/bootstrap.js` 使用原生 `agentPresets.serviceFor(agent, 'interactionPolicy')`。没有服务时保留旧出站；有服务时只把真实 Session 事件、Sender 和当前回复目标转给 Agent 策略，避免双发。Streaming 使用策略从原生 `agent/assistant-stream` 收到的帧，审批与问答仍使用原唯一通道。待审批/问答状态作为只读提示传给策略以抑制等待提示。
 
+原生 `runtime-context`、`skill-catalog`、`time-context`、`agent-instructions` 虽通过 `user/message` 出现，但只是当前轮的上下文，不是新的平台输入。QQTK 与 Interaction Policy 必须配套识别，保留此前可信 QQ 入站的呈现状态；上下文本身不能登记输入、解除后台抑制或恢复已取消输出。Web、Schedule、未知来源及未登记的普通用户消息仍不得借此输出到 QQ。
+
+2026-10-26 源码修复：补齐时间与工作区指令来源分类，避免首轮或时间刷新后模型正常完成但 QQ 无回复。回归覆盖静态/流式结果、工具步骤及背景/取消隔离；隔离测试不等于实际手机收件。此修复须同时更新 Agent Interaction 包及版本化 QQ 补丁，未因此自动更新运行实例。
+
 `gateway/middleware-setup.js` 保留白名单、问答、原消息合并和 `/stop`。仅运行中私人文本以 `更正：`/`更正:` 开头时走明确修正。若 Host 定义 `manager.admitInteractionInput(ctx)`，先等待可信入站确认并要求返回同一 Session record；失败不得继续调用策略。Character Identity 使用它复用 Owner 校验和真实来源记录，普通 QQ 项目无需 Character Identity。
 
 修正不是自动推测“等等”“不对”的含义。是否 cancel 或 steer 由 Agent 策略按真实工具状态决定；QQTK 不分类任务或生成回复。`/stop` 在调用既有 native handler 前关闭未发出的呈现内容，不承诺回滚外部工具副作用。

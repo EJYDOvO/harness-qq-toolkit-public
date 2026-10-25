@@ -116,6 +116,23 @@ test('Q15 native Web user source cannot impersonate a registered QQ input',async
  f.event('assistant/message',{turn:2,message:{content:[{type:'text',text:'QQ result'}]}});await f.policy.idle();assert.equal(f.payloads.at(-1).markdown.content,'QQ result');
 });
 
+for(const streaming of [false,true])test(`native Host context retains admitted QQ output through SDK (streaming=${streaming})`,async t=>{
+ const f=fixture(t,{streaming});
+ for(const kind of ['agent-instructions','runtime-context','skill-catalog','time-context'])f.event('user/message',{message:{id:kind,source:{kind}}});
+ f.policy.text('查询前缀');f.policy.update(f.policy.message);await f.policy.idle();
+ f.event('tool/call',{callId:'search'});f.event('user/message',{id:'new-time',source:{kind:'time-context'}});
+ f.event('tool/result',{message:{source:{callId:'search'}}});f.final('查询前缀，完整结果');
+ f.event('turn/end',{turn:1,reason:{kind:'completed'}});await f.policy.idle();
+ const delivered=streaming?f.payloads.filter(b=>b.input_state===StreamInputState.DONE).map(b=>b.content_raw).join(''):f.payloads.map(b=>b.markdown.content).join('');
+ assert.equal(delivered,'查询前缀，完整结果');assert.equal(f.record.interactionSuppressed,false);
+});
+
+for(const kind of ['web','schedule','unknown','user'])test(`native context cannot reactivate unadmitted ${kind} output`,async t=>{
+ const f=fixture(t);f.event('user/message',{id:'not-admitted',source:{kind}});
+ for(const context of ['agent-instructions','runtime-context','skill-catalog','time-context'])f.event('user/message',{source:{kind:context}});
+ f.policy.hangOn();f.final('非QQ结果');await f.policy.idle();assert.deepEqual(f.payloads,[]);
+});
+
 test('Q16 cancellation during a settled long static send suppresses remaining protocol chunks',async t=>{
  let release;const gate=new Promise(r=>release=r);const f=fixture(t,{onRequest:()=>gate});
  f.final('字'.repeat(10001));await micro();assert.equal(f.payloads.length,1);f.policy.stopOutput();release();await f.policy.idle();assert.equal(f.payloads.length,1);

@@ -28,6 +28,19 @@ test('QQ bridge delegates policy output once, keeps tool errors on ordered exter
 test('QQ no-stream configuration does not accidentally open a stream',async()=>{
  const p={bind(t){this.transport=t;},event(){}};const f=outbound(p,false);f.handler(f.session,{type:'turn/start'});assert.equal(p.transport.openStream,undefined);await p.transport.sendText('test');assert.equal(f.sent.length,1);
 });
+
+test('native Host context does not stop QQ output, and cannot clear background suppression',()=>{
+ const events=[],p={bind(t){this.transport=t;},admitInput(){},event:e=>events.push(e.type),stopOutput(){this.stops=(this.stops??0)+1;}};
+ const f=outbound(p);f.manager.registerInteractionInput(f.record,{id:'qq',source:{kind:'user'}});
+ const context=kind=>f.handler(f.session,{type:'user/message',data:{message:{source:{kind}}}});
+ for(const kind of ['agent-instructions','runtime-context','skill-catalog','time-context'])context(kind);
+ f.handler(f.session,{type:'assistant/message'});assert.equal(p.stops??0,0);assert.equal(events.at(-1),'assistant/message');
+ for(const kind of ['web','schedule','unknown']){
+  context(kind);const before=events.length;context('time-context');context('agent-instructions');
+  f.handler(f.session,{type:'assistant/message'});assert.equal(events.length,before);assert.equal(f.record.interactionSuppressed,true);
+  f.manager.registerInteractionInput(f.record,{id:'next-qq',source:{kind:'user'}});
+ }
+});
 function middleware(enabled=true){
  const source=fs.readFileSync(new URL('middleware-setup.js',base),'utf8').replace(/^import .*;\r?\n/gm,'').replace('export function setupMiddlewares','function setupMiddlewares');
  const chain=[],events=[],agent={status:'running'},policy={revise:m=>events.push(['revise',m]),stopOutput:()=>events.push(['stop-output'])};

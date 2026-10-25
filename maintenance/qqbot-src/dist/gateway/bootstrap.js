@@ -82,7 +82,9 @@ export function createInteractionOutbound(ctx, manager, sender, config, logger, 
         if (policy) {
             if(event.type==='user/message'){
                 const source=event.data?.message?.source??event.data?.source;
-                if(source?.kind&&!['user','runtime-context','skill-catalog'].includes(source.kind)){record.interactionSuppressed=true;policy.stopOutput();}
+                // Native projections are context within the admitted turn, not
+                // another input channel. They never clear existing suppression.
+                if(source?.kind&&!['user','runtime-context','skill-catalog','time-context','agent-instructions'].includes(source.kind)){record.interactionSuppressed=true;policy.stopOutput();}
             }
             if(record.interactionSuppressed)return;
             const target = { ...record.replyTarget };
