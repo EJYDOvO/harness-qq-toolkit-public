@@ -65,9 +65,30 @@ patchedDependencies:
 
 ## 更新维护
 
-未发布修复候选包含 QQ Bot 13 文件和 SDK 3 文件的审查快照；原文件哈希分别在 qqbot-upstream-0.5.2/manifest.json 和 sdk-upstream-1.0.5/manifest.json。修改后分别构建并检查两份补丁（SDK 使用 `--sdk`），安装示例见 [审计修复说明](INTERACTION-AUDIT-FIXES.md)。升级上游版本时重新比对，不能跨版本盲目应用。
+维护源码包含 QQ Bot 15 文件和 SDK 3 文件的审查快照（含未改动的 IdleEvictor 供回归验证）；原文件哈希分别在 qqbot-upstream-0.5.2/manifest.json 和 sdk-upstream-1.0.5/manifest.json。修改后分别构建并检查两份补丁（SDK 使用 `--sdk`），安装示例见 [审计修复说明](INTERACTION-AUDIT-FIXES.md)。升级上游版本时重新比对，不能跨版本盲目应用。
 
 原 templates/profile 是旧安装快照；新项目优先使用本文件的最小装配，不直接复制旧绝对路径/可选插件清单。更新配置与状态目录时先备份；不要删除通知账本来“重试”不确定投递。
 # Interaction 可选接入
 
 开发候选可对接 Agent 层 Interaction 服务，详见 [接口与验证边界](INTERACTION.md)。QQ 基础接入仍不依赖它，不增加 Gateway、数据库或额外模型。安装包、在 Preset 中声明并隔离服务、应用 QQ 补丁和部署是不同步骤；本轮没有部署。
+
+## 可选主 Session 生命周期
+
+基于 DSH 0.2.1-rc.2 / QQ Bot 0.5.2 配套补丁，在 QQ 配置中显式启用：
+
+```yaml
+sessionLifecycle:
+  enabled: true                  # 默认 false，保持旧路由/恢复行为
+  freshOnHostRestart: true        # 真实 Host 进程重启；HMR 不算重启
+  inactivityMs: 43200000          # 距上次可信用户入站 12 小时
+```
+
+只对 c2c 生效。用户消息通过访问/mention 校验后记录活动，包括命令与问答输入；模型回复、Schedule、后台任务和 Agent 状态不延长用户活动时间。下一次实际取得聊天 Agent 时，创建无 parent/seed 的新根 Session，保留模型/目标 Preset 偏好；不 Fork、复制或删除旧历史。换新 Session 与 Agent 内存空闲回收分开：回收后仍可恢复同一 Session。
+
+运行中的 Agent、待处理 Inbox、待审批/问答、持久未完成轮次均会延后轮换，下一次安全交互重试，不自动 cancel。记录在 `getStatus().lifecycle` 中包含 lastUserAt、pendingReason、blockedBy、generation。并发 get、手动重置/模型切换/压缩采用每 Conversation 串行边界；路由和生命周期使用同一个偏好文件原子提交，失败不发布新路由。异常或外部更改的偏好文件拒绝覆盖；仍要求单活 Host，不提供跨机器锁。
+
+已有原生 Schedule 仍绑定旧 Session，**不迁移提醒**。通用 QQ 没有可信旧根桥接时，轮换因 `existing_schedule` 延后，避免丢提醒。Character Identity 提供 Host-only `manager.preserveScheduledSession(oldId)`，只接受已持久绑定的 Owner/项目/角色旧根，并在冷恢复时重绑身份、经原 Outbox 通知稳定 Conversation，不能改写当前主路由。其他项目若需要相同行为，须提供自己经过审查的桥接；不要简单返回 true。
+
+生命周期状态仍在 `$DSH_HOME/qqbot/model-prefs.json`；无 DSH_HOME 保留旧路径，不自动迁移。备份需同时保留偏好、原生 Session/Schedule，以及集成方身份/通知状态。停用开关保留已有最新路由，不重置历史或数据库。宿主崩溃后未完成的副作用无法自动证明结束，可能保持延后，需显式处理原任务，不能删除记录强迫轮换。
+
+验证：`node --test maintenance/session-lifecycle.test.mjs`；配套 Character `scripts/run-lifecycle.ps1` 在两个真实 rc.2 Host 进程中验证空白根、Memory 连续性、停机逾期、原提醒冷恢复和独立任务。模型/Sender 为合成替身，不启动 QQBot、不证明实机收件；本轮未部署。

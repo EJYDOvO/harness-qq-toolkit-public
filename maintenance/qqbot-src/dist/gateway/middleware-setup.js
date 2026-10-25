@@ -42,6 +42,11 @@ export function setupMiddlewares(bot, config, manager, logger) {
     bot.use(mentionGate({
         requireMentionInGroup: config.requireMention,
     }));
+    bot.use(async(mCtx,next)=>{
+        const msg=mCtx.message,scope=msg.kind==='group'?'group':'c2c';
+        manager.noteUserMessage?.(scope,scope==='group'?(msg.groupOpenid??msg.senderId):msg.senderId,msg.senderId,msg.messageId);
+        return next();
+    });
     // 6. 内容清洗（去 @marker、表情标签、多余空白）
     bot.use(contentSanitizer({
         parseFaceTags: true,

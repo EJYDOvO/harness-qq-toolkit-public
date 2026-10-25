@@ -4,7 +4,7 @@
  * 隔离文件 I/O 操作，便于单元测试时 mock。
  * 存储路径：~/.dsh-qqbot/model-prefs.json
  */
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, openSync, fsyncSync, closeSync, unlinkSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { homedir } from 'node:os';
 export class PrefsStore {
@@ -14,6 +14,9 @@ export class PrefsStore {
     sessionIds = new Map();
     /** per-peer preset 偏好（内存态） */
     presets = new Map();
+    lifecycle = new Map();
+    loadError;
+    fileContent;
     /** 隔离偏好文件路径 */
     prefsPath;
     debugLog;
@@ -70,13 +73,39 @@ export class PrefsStore {
             this.write();
         return deleted;
     }
+    getLifecycle(key) {
+        if(this.loadError)throw new Error('QQ preferences could not be loaded; refusing lifecycle reset', {cause:this.loadError});
+        return this.lifecycle.get(key);
+    }
+    /** Commit routing and lifecycle together; failure must not publish a new Session. */
+    commitLifecycle(key, value, sessionId=this.sessionIds.get(key)) {
+        if(this.loadError)throw new Error('QQ preferences are unavailable', {cause:this.loadError});
+        const lifecycle=new Map(this.lifecycle),sessionIds=new Map(this.sessionIds);
+        lifecycle.set(key,structuredClone(value));if(sessionId)sessionIds.set(key,sessionId);
+        this.persist({overrides:Object.fromEntries(this.overrides),presets:Object.fromEntries(this.presets),sessionIds:Object.fromEntries(sessionIds),lifecycle:Object.fromEntries(lifecycle)});
+        this.lifecycle=lifecycle;this.sessionIds=sessionIds;
+    }
+    persist(data) {
+        mkdirSync(dirname(this.prefsPath),{recursive:true});
+        const current=existsSync(this.prefsPath)?readFileSync(this.prefsPath,'utf8'):undefined;
+        if(current!==this.fileContent)throw Error('QQ preferences changed externally; reload before committing');
+        const content=JSON.stringify(data,null,2);
+        const temp=this.prefsPath+'.'+process.pid+'.tmp';let fd;
+        try{fd=openSync(temp,'w',0o600);writeFileSync(fd,content,'utf8');fsyncSync(fd);closeSync(fd);fd=undefined;renameSync(temp,this.prefsPath);this.fileContent=content;}
+        finally{if(fd!==undefined)closeSync(fd);if(existsSync(temp))unlinkSync(temp);}
+    }
     // ── 私有方法 ──
     load() {
         try {
             if (!existsSync(this.prefsPath))
                 return;
             const content = readFileSync(this.prefsPath, 'utf8');
+            this.fileContent=content;
             const data = JSON.parse(content);
+            for(const [key,value]of Object.entries(data.lifecycle??{})){
+                if(!value||typeof value!=='object'||!Number.isFinite(value.lastUserAt)||typeof value.bootId!=='string')throw Error('Invalid persisted QQ lifecycle');
+                this.lifecycle.set(key,value);
+            }
             if (data.overrides && typeof data.overrides === 'object') {
                 for (const [key, route] of Object.entries(data.overrides)) {
                     if (route.provider && route.model) {
@@ -100,18 +129,21 @@ export class PrefsStore {
             }
         }
         catch (err) {
+            this.loadError=err;
             this.debugLog?.(`loadPrefs failed: ${err instanceof Error ? err.message : String(err)}`);
         }
     }
     write() {
         try {
+            if(this.loadError)throw Error('Unreadable QQ preferences cannot be replaced');
             mkdirSync(dirname(this.prefsPath), { recursive: true });
             const data = {
                 overrides: Object.fromEntries(this.overrides.entries()),
                 sessionIds: Object.fromEntries(this.sessionIds.entries()),
                 presets: Object.fromEntries(this.presets.entries()),
+                lifecycle: Object.fromEntries(this.lifecycle.entries()),
             };
-            writeFileSync(this.prefsPath, JSON.stringify(data, null, 2), 'utf8');
+            this.persist(data);
         }
         catch (err) {
             this.debugLog?.(`writePrefs failed: ${err instanceof Error ? err.message : String(err)}`);

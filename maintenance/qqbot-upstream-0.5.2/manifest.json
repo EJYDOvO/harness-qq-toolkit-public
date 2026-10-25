@@ -15,6 +15,8 @@
     "dist/model/prefs-store.js": "47787266032527ba228947f01f894f8916bf5f0272c33fba5eae2cdc84518b8e",
     "dist/transport/reply-limiter.js": "aefe4b5b84d48d624662cc8b198dd83ee54e60316e61bf0d353a2e971998cf04",
     "dist/transport/reply-target.js": "3c7bad103415f857177afd3444801cf4c25b4c6a2fcbd3d7be314d8dce3b5da4",
-    "dist/transport/inbound.js": "5e7da8b6a8441d4d166bcb1129d61a7afd85d52f187b33f89edf27d354f080fe"
+    "dist/transport/inbound.js": "5e7da8b6a8441d4d166bcb1129d61a7afd85d52f187b33f89edf27d354f080fe",
+    "dist/config.js": "a52f0010155d57fda33c84c5345c6de49eeb3a6db7961b212555aff896a804c0",
+    "dist/session/idle-evictor.js": "a20dda7f1e2f06b7d1797f752fcb0774606021862da1757d0c11189b351b8385"
   }
 }

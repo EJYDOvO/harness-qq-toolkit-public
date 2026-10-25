@@ -16,6 +16,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { SessionId } from '@deepseek-ai/dsh-session';
 import { ModelResolver } from "../model/model-resolver.js";
 import { IdleEvictor } from "./idle-evictor.js";
+// Stable through plugin reloads, different after an actual Host process restart.
+const hostBootId=globalThis[Symbol.for('dsh.qq.sessionBoot.v1')]??=randomUUID();
 /** ManualCompactionError 各 code 的友好提示 */
 const COMPACTION_ERROR_HINTS = {
     busy: '压缩服务忙，请稍后重试',
@@ -36,6 +38,8 @@ export class SessionManager {
     questionChannel;
     /** 由 bootstrap 注入的审批通道（approval/request → QQ），会话回收时清理其待批审批 */
     approvalChannel;
+    lifecycleLocks = new Map();
+    closed = false;
     constructor(ctx, agents, config, logger) {
         this.ctx = ctx;
         this.agents = agents;
@@ -43,9 +47,9 @@ export class SessionManager {
         this.logger = logger;
         this.modelResolver = new ModelResolver(ctx, config, logger);
         this.evictor = new IdleEvictor(this.sessions, config.sessionIdleTimeout, (key, record) => {
+            if(this.protectedSession(record))return;
             this.logger.info(`evicting idle session: key=${key}`);
             this.sessions.delete(key);
-            record.agent.cancel({ kind: 'user' });
             void record.handle.dispose().catch(() => { });
             // 回收会话时统一清理其待答问题/待批审批，避免 pending 悬挂泄漏
             this.questionChannel?.cancelPending(key);
@@ -115,7 +119,7 @@ export class SessionManager {
         if (!persistence)
             return undefined;
         try {
-            const { meta } = await persistence.load(sessionId);
+            const { meta } = await this.readPersistedSession(sessionId);
             return meta?.agentPreset;
         }
         catch {
@@ -156,6 +160,9 @@ export class SessionManager {
      * 切换模型（fork + 重建会话，保留历史）
      */
     async setModelOverride(scope, peerId, route) {
+        return this.inConversation(this.sessionKey(scope,peerId),()=>this.changeModelOverride(scope,peerId,route));
+    }
+    async changeModelOverride(scope, peerId, route) {
         const key = this.sessionKey(scope, peerId);
         this.modelResolver.setOverride(key, route);
         const record = this.sessions.get(key);
@@ -173,6 +180,9 @@ export class SessionManager {
      * 不 fork/rebuild 当前会话，避免历史工具调用与新 preset 工具集冲突。
      */
     async setPresetOverride(scope, peerId, presetId) {
+        return this.inConversation(this.sessionKey(scope,peerId),()=>this.changePresetOverride(scope,peerId,presetId));
+    }
+    async changePresetOverride(scope, peerId, presetId) {
         const key = this.sessionKey(scope, peerId);
         // 1. 校验 preset 存在 + 可加载（broken 拒绝）
         const presets = this.getPresetsService();
@@ -198,6 +208,9 @@ export class SessionManager {
      * 清除 per-peer preset 覆盖，回到 config.preset / 默认（新会话生效）
      */
     async clearPresetOverride(scope, peerId) {
+        return this.inConversation(this.sessionKey(scope,peerId),()=>this.clearPresetPreference(scope,peerId));
+    }
+    async clearPresetPreference(scope, peerId) {
         const key = this.sessionKey(scope, peerId);
         this.modelResolver.clearPreset(key);
         this.logger.info(`preset pref cleared: key=${key} (next session applies)`);
@@ -273,6 +286,7 @@ export class SessionManager {
     getStatus(scope, peerId) {
         const record = this.getSessionRecord(scope, peerId);
         const route = this.getEffectiveModel(scope, peerId);
+        const policy=this.lifecycleEnabled(scope)?this.modelResolver.prefs.getLifecycle(this.sessionKey(scope,peerId)):null;
         return {
             active: !!record,
             sessionId: record?.sessionId,
@@ -281,12 +295,13 @@ export class SessionManager {
             preset: record?.agentPreset,
             lastActivity: record?.lastActivity,
             messageCount: this.countMessages(record),
+            lifecycle:policy?{enabled:true,lastUserAt:policy.lastUserAt,pendingReason:policy.due,blockedBy:policy.blocker??null,generation:policy.generation??0}:{enabled:false},
         };
     }
     getTokenUsage(scope, peerId) {
         const record = this.getSessionRecord(scope, peerId);
         const stats = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-        const events = record?.agent.session.events;
+        const events = record?.agent.session.snapshotEvents?.()??record?.agent.session.events;
         if (!events)
             return stats;
         for (const event of events) {
@@ -303,7 +318,7 @@ export class SessionManager {
         const record = this.getSessionRecord(scope, peerId);
         if (!record)
             return '';
-        const events = record.agent.session.events;
+        const events = record.agent.session.snapshotEvents?.()??record.agent.session.events;
         if (!events || events.length === 0)
             return '';
         const lines = [`# QQ 会话导出\n`, `> session: ${record.sessionId}\n`];
@@ -322,7 +337,7 @@ export class SessionManager {
         return lines.join('\n');
     }
     countMessages(record) {
-        const events = record?.agent.session.events;
+        const events = record?.agent.session.snapshotEvents?.()??record?.agent.session.events;
         if (!events)
             return 0;
         let count = 0;
@@ -334,6 +349,80 @@ export class SessionManager {
         return count;
     }
     // ── Session 生命周期管理 ──
+    async readPersistedSession(id){
+        const persistence=this.ctx.get('sessionPersistence');
+        if(!persistence)throw Error('Session persistence unavailable');
+        if(typeof persistence.open!=='function'){
+            if(typeof persistence.load==='function')return persistence.load(id);
+            throw Error('Unsupported Session persistence API');
+        }
+        const handle=await persistence.open(id,'read');
+        try{return {meta:handle.header,events:(await handle.read()).events};}finally{await handle.close();}
+    }
+    protectedSession(record) {
+        return !!record&&(record.agent.status==='running'||record.agent.inbox?.hasPending===true||this.questionChannel?.pending.has(record.sessionKey)||this.approvalChannel?.pending.has(record.sessionKey));
+    }
+    lifecycleEnabled(scope){return scope==='c2c'&&this.config.sessionLifecycle?.enabled===true;}
+    /** Called only after SDK access/mention admission, before command or answer interception. */
+    noteUserMessage(scope,peerId,senderId,messageId) {
+        if(this.closed)throw Error('QQ manager disposed');
+        if(!this.lifecycleEnabled(scope)||scope!=='c2c'||peerId!==senderId)return;
+        const key=this.sessionKey(scope,peerId),prefs=this.modelResolver.prefs,old=prefs.getLifecycle(key);
+        if(messageId&&old?.lastMessageId===messageId&&old?.bootId===hostBootId)return;
+        const now=Date.now(),idle=this.config.sessionLifecycle.inactivityMs??43200000;
+        if(!Number.isFinite(idle)||idle<1)throw Error('Invalid QQ inactivity interval');
+        const value={...old,bootId:old?.bootId??'',lastUserAt:now,lastMessageId:messageId??null,
+            due:old?.due??((this.config.sessionLifecycle.freshOnHostRestart!==false&&old?.bootId!==hostBootId)?'host_restart':old&&now-old.lastUserAt>=idle?'user_inactivity':null)};
+        prefs.commitLifecycle(key,value);
+    }
+    async inConversation(key,operation){
+        const run=(this.lifecycleLocks.get(key)??Promise.resolve()).catch(()=>{}).then(()=>{if(this.closed)throw Error('QQ manager disposed');return operation();});
+        this.lifecycleLocks.set(key,run);
+        try{return await run;}finally{if(this.lifecycleLocks.get(key)===run)this.lifecycleLocks.delete(key);}
+    }
+    async unfinishedPersisted(sessionId){
+        const persistence=this.ctx.get('sessionPersistence');
+        if(!persistence)throw Error('QQ lifecycle requires Session persistence');
+        let loaded;
+        try{loaded=await this.readPersistedSession(sessionId);}catch(error){
+            // Only proven absence permits a fresh session. Corruption/I/O is not absence.
+            if(error?.code==='ENOENT'||error?.name==='SessionPersistenceNotFoundError')return false;
+            throw error;
+        }
+        let open=false;const pending={'next-turn':[], 'next-step':[]};
+        for(const event of loaded.events??[]){
+            if(event.type==='turn/start')open=true;if(event.type==='turn/end')open=false;
+            if(event.type==='agent/inbox/spliced'){const d=event.data,list=pending[d.target];if(list)list.splice(d.start,d.removedCount??d.deleteCount??0,...(d.inserted??[]));}
+        }
+        return open||Object.values(pending).some(a=>a.length>0);
+    }
+    async rotateSession(scope,peerId,senderId,replyTarget,old,state){
+        const key=this.sessionKey(scope,peerId),previous=old?.sessionId??this.currentSessionId(key);
+        const protectedOld=()=>{const live=this.agents.get(previous);return this.protectedSession(old)||!!live&&(live.status==='running'||live.inbox?.hasPending);};
+        if(protectedOld()){state.blocker='unfinished_interaction';this.modelResolver.prefs.commitLifecycle(key,state);return null;}
+        if(!old&&await this.unfinishedPersisted(previous)){state.blocker='unfinished_persisted_work';this.modelResolver.prefs.commitLifecycle(key,state);return null;}
+        // Generic QQ keeps existing reminders on their original roots. Character
+        // provides a stable-conversation bridge; other integrations defer safely.
+        const schedules=this.ctx.get('schedule');
+        const reminders=schedules?await schedules.list({sessionId:previous}):[];
+        if(reminders.length&&this.preserveScheduledSession?.(previous)!==true){state.blocker='existing_schedule';this.modelResolver.prefs.commitLifecycle(key,state);return null;}
+        if(protectedOld())return null;
+        const composed=await this.composePreset(old?.agentPreset??this.getEffectivePresetByKey(key)),route=this.modelResolver.getEffectiveRoute(key),id=SessionId(randomUUID());
+        const handle=await this.agents.create({sessionId:id,meta:{cwd:this.config.cwd||process.cwd(),agentPreset:composed.agentPreset},...(route?{agentOptions:route}:{}),setup:composed.setup});
+        try{
+            if(this.closed)throw Error('QQ gateway closed during rotation');
+            if(protectedOld()){await handle.dispose();return null;}
+            const sessions=this.ctx.get('sessions');if(!sessions||!await sessions.flush(handle.agent.session))throw Error('Fresh QQ Session was not durably stored');
+            if(this.closed)throw Error('QQ gateway closed during rotation');
+            if(protectedOld()){await handle.dispose();return null;}
+            const next={...this.modelResolver.prefs.getLifecycle(key),bootId:hostBootId,due:null,blocker:null,generation:(state.generation??0)+1,previousSessionId:previous};
+            this.modelResolver.prefs.commitLifecycle(key,next,id);
+            const record={sessionKey:key,sessionId:id,agent:handle.agent,handle,replyTarget,scope,peerId,senderId,lastActivity:Date.now(),agentPreset:composed.agentPreset};
+            this.sessions.set(key,record);
+            if(old)await old.handle.dispose();
+            return record;
+        }catch(error){if(this.sessions.get(key)?.sessionId!==id)await handle.dispose().catch(()=>{});throw error;}
+    }
     sessionKey(scope, peerId) {
         return `qqbot:${this.config.appId}:${scope}:${peerId}`;
     }
@@ -354,6 +443,17 @@ export class SessionManager {
     }
     /** 获取或恢复或创建会话（get → resume → create） */
     async getOrCreate(scope, peerId, senderId, replyTarget) {
+        return this.inConversation(this.sessionKey(scope,peerId),async()=>{
+            if(this.lifecycleEnabled(scope)){
+                const key=this.sessionKey(scope,peerId);
+                this.noteUserMessage(scope,peerId,senderId,replyTarget?.msgId);
+                const state=this.modelResolver.prefs.getLifecycle(key),old=this.sessions.get(key);
+                if(state?.due){const rotated=await this.rotateSession(scope,peerId,senderId,replyTarget,old,state);if(rotated)return rotated;}
+            }
+            return this.getOrRestore(scope,peerId,senderId,replyTarget);
+        });
+    }
+    async getOrRestore(scope, peerId, senderId, replyTarget) {
         const key = this.sessionKey(scope, peerId);
         const existing = this.sessions.get(key);
         if (existing) {
@@ -434,6 +534,9 @@ export class SessionManager {
         return undefined;
     }
     async remove(scope, peerId) {
+        return this.inConversation(this.sessionKey(scope,peerId),()=>this.removeSession(scope,peerId));
+    }
+    async removeSession(scope, peerId) {
         const key = this.sessionKey(scope, peerId);
         const record = this.sessions.get(key);
         this.modelResolver.setSessionId(key, randomUUID());
@@ -451,6 +554,9 @@ export class SessionManager {
      * 这是「压缩上下文」的语义，区别于 remove() 的「换新会话」。
      */
     async compact(scope, peerId) {
+        return this.inConversation(this.sessionKey(scope,peerId),()=>this.compactSession(scope,peerId));
+    }
+    async compactSession(scope, peerId) {
         const key = this.sessionKey(scope, peerId);
         const record = this.sessions.get(key);
         if (!record)
@@ -496,6 +602,8 @@ export class SessionManager {
         }
     }
     async disposeAll() {
+        this.closed=true;
+        await Promise.allSettled([...this.lifecycleLocks.values()]);
         this.evictor.dispose();
         const records = [...this.sessions.values()];
         this.sessions.clear();

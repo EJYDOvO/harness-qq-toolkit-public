@@ -11,6 +11,7 @@ const {ApiError,StreamInputState}=await import(pathToFileURL(path.join(sdk,'prot
 const {concurrencyGuard}=await import(pathToFileURL(path.join(sdk,'middleware/concurrency-guard.js')));
 const {ReplyLimiter}=await import(pathToFileURL(path.join(qq,'transport/reply-limiter.js')));
 const {cacheMsgId,getCachedReplyIds}=await import(pathToFileURL(path.join(qq,'transport/msgid-cache.js')));
+const {ConfigSchema}=await import(pathToFileURL(path.join(qq,'config.js')));
 const source=fs.readFileSync(new URL('../qqbot-src/dist/gateway/bootstrap.js',import.meta.url),'utf8');
 const targetSource=fs.readFileSync(path.join(qq,'transport/reply-target.js'),'utf8').replace(/^import .*;\r?\n/gm,'').replaceAll('export function','function');
 const {resolveReplyTarget,sendResolvedMarkdown}=vm.runInNewContext(targetSource+'\n;({resolveReplyTarget,sendResolvedMarkdown});',{getCachedReplyIds,MsgType:{MARKDOWN:2}});
@@ -129,4 +130,9 @@ test('Q18 a long uncommitted stream never completes overflow bubbles',async t=>{
  const f=fixture(t,{streaming:true});f.policy.text('草'.repeat(10001));f.policy.update(f.policy.message);await f.policy.idle();
  assert(!f.payloads.some(b=>b.input_state===StreamInputState.DONE));assert(f.payloads.every(b=>b.content_raw.length<=4500));
  f.policy.stopOutput();await f.policy.idle();assert(!f.payloads.some(b=>b.input_state===StreamInputState.DONE));
+});
+test('QQ lifecycle configuration parses through the installed Host schema and remains opt-in',()=>{
+ const legacy=ConfigSchema({});assert.deepEqual(legacy.sessionLifecycle,{enabled:false,freshOnHostRestart:true,inactivityMs:43200000});
+ const enabled=ConfigSchema({sessionLifecycle:{enabled:true}});assert.equal(enabled.sessionLifecycle.inactivityMs,43200000);assert.equal(enabled.sessionLifecycle.freshOnHostRestart,true);
+ assert.throws(()=>ConfigSchema({sessionLifecycle:{enabled:true,inactivityMs:0}}));
 });
