@@ -684,7 +684,7 @@ index 070f21e..d50afc8 100644
 \ No newline at end of file
 +//# sourceMappingURL=bootstrap.js.map
 diff --git a/dist/session/session-manager.js b/dist/session/session-manager.js
-index 5eae070..cd80ae7 100644
+index 5eae070..86928d8 100644
 --- a/dist/session/session-manager.js
 +++ b/dist/session/session-manager.js
 @@ -16,6 +16,8 @@ import { createHash, randomUUID } from 'node:crypto';
@@ -877,7 +877,7 @@ index 5eae070..cd80ae7 100644
      sessionKey(scope, peerId) {
          return `qqbot:${this.config.appId}:${scope}:${peerId}`;
      }
-@@ -346,25 +435,25 @@ export class SessionManager {
+@@ -346,25 +435,28 @@ export class SessionManager {
      }
      async composePreset(presetId) {
          const presets = this.getPresetsService();
@@ -906,7 +906,10 @@ index 5eae070..cd80ae7 100644
      /** 获取或恢复或创建会话（get → resume → create） */
      async getOrCreate(scope, peerId, senderId, replyTarget) {
 +        return this.inConversation(this.sessionKey(scope,peerId),async()=>{
-+            if(this.lifecycleEnabled(scope)){
++            // Remote Ops restores the owner route at Gateway startup without a
++            // message id. Restoration must neither count as user activity nor
++            // consume a deferred rotation; only actual QQ input may do that.
++            if(this.lifecycleEnabled(scope)&&typeof replyTarget?.msgId==='string'&&replyTarget.msgId.length>0){
 +                const key=this.sessionKey(scope,peerId);
 +                this.noteUserMessage(scope,peerId,senderId,replyTarget?.msgId);
 +                const state=this.modelResolver.prefs.getLifecycle(key),old=this.sessions.get(key);
@@ -919,7 +922,7 @@ index 5eae070..cd80ae7 100644
          const key = this.sessionKey(scope, peerId);
          const existing = this.sessions.get(key);
          if (existing) {
-@@ -445,6 +534,9 @@ export class SessionManager {
+@@ -445,6 +537,9 @@ export class SessionManager {
          return undefined;
      }
      async remove(scope, peerId) {
@@ -929,7 +932,7 @@ index 5eae070..cd80ae7 100644
          const key = this.sessionKey(scope, peerId);
          const record = this.sessions.get(key);
          this.modelResolver.setSessionId(key, randomUUID());
-@@ -462,6 +554,9 @@ export class SessionManager {
+@@ -462,6 +557,9 @@ export class SessionManager {
       * 这是「压缩上下文」的语义，区别于 remove() 的「换新会话」。
       */
      async compact(scope, peerId) {
@@ -939,7 +942,7 @@ index 5eae070..cd80ae7 100644
          const key = this.sessionKey(scope, peerId);
          const record = this.sessions.get(key);
          if (!record)
-@@ -507,6 +602,8 @@ export class SessionManager {
+@@ -507,6 +605,8 @@ export class SessionManager {
          }
      }
      async disposeAll() {
@@ -948,7 +951,7 @@ index 5eae070..cd80ae7 100644
          this.evictor.dispose();
          const records = [...this.sessions.values()];
          this.sessions.clear();
-@@ -533,4 +630,4 @@ function extractMessageText(message) {
+@@ -533,4 +633,4 @@ function extractMessageText(message) {
      }
      return parts.join('\n').trim();
  }

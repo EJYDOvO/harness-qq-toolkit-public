@@ -444,7 +444,10 @@ export class SessionManager {
     /** 获取或恢复或创建会话（get → resume → create） */
     async getOrCreate(scope, peerId, senderId, replyTarget) {
         return this.inConversation(this.sessionKey(scope,peerId),async()=>{
-            if(this.lifecycleEnabled(scope)){
+            // Remote Ops restores the owner route at Gateway startup without a
+            // message id. Restoration must neither count as user activity nor
+            // consume a deferred rotation; only actual QQ input may do that.
+            if(this.lifecycleEnabled(scope)&&typeof replyTarget?.msgId==='string'&&replyTarget.msgId.length>0){
                 const key=this.sessionKey(scope,peerId);
                 this.noteUserMessage(scope,peerId,senderId,replyTarget?.msgId);
                 const state=this.modelResolver.prefs.getLifecycle(key),old=this.sessions.get(key);

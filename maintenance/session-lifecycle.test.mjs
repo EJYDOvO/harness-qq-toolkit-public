@@ -85,3 +85,13 @@ test('work starting or shutdown during the final durable flush cannot be interru
   else{old.agent.status='running';release();assert.equal((await rotation).sessionId,old.sessionId);assert(!old.agent.cancelled);assert.equal(f.manager.currentSessionId(old.sessionKey),old.sessionId);old.agent.status='idle';await f.manager.disposeAll();}
  }
 });
+test('Remote Ops startup restore cannot rotate, refresh user inactivity or consume a deferred reset',async()=>{
+ const f=fixture();f.config.sessionLifecycle.enabled=false;const old=await f.get('legacy');await f.manager.ctx.get('sessions').flush(old.agent.session);await f.manager.disposeAll();
+ const next=factory(f.home,f.clock,f.durable),restore=()=>next.manager.getOrCreate('c2c','owner','owner',{scope:'c2c',targetId:'owner'});
+ assert.equal((await restore()).sessionId,old.sessionId);assert.equal(next.manager.modelResolver.prefs.getLifecycle(old.sessionKey),undefined);
+ const first=await next.get('real-input'),before=JSON.stringify(next.manager.modelResolver.prefs.getLifecycle(old.sessionKey));assert.notEqual(first.sessionId,old.sessionId);
+ f.clock.now+=43200001;assert.equal((await restore()).sessionId,first.sessionId);assert.equal(JSON.stringify(next.manager.modelResolver.prefs.getLifecycle(old.sessionKey)),before);
+ first.agent.status='running';await next.get('busy-real-input');first.agent.status='idle';const pending=JSON.stringify(next.manager.modelResolver.prefs.getLifecycle(old.sessionKey));
+ assert.equal((await restore()).sessionId,first.sessionId);assert.equal(JSON.stringify(next.manager.modelResolver.prefs.getLifecycle(old.sessionKey)),pending);
+ assert.notEqual((await next.get('next-real-input')).sessionId,first.sessionId);await next.manager.disposeAll();
+});

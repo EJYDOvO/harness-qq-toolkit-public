@@ -83,7 +83,7 @@ sessionLifecycle:
   inactivityMs: 43200000          # 距上次可信用户入站 12 小时
 ```
 
-只对 c2c 生效。用户消息通过访问/mention 校验后记录活动，包括命令与问答输入；模型回复、Schedule、后台任务和 Agent 状态不延长用户活动时间。下一次实际取得聊天 Agent 时，创建无 parent/seed 的新根 Session，保留模型/目标 Preset 偏好；不 Fork、复制或删除旧历史。换新 Session 与 Agent 内存空闲回收分开：回收后仍可恢复同一 Session。
+只对 c2c 生效。用户消息通过访问/mention 校验后记录活动，包括命令与问答输入；模型回复、Schedule、后台任务和 Agent 状态不延长用户活动时间。Remote Ops 启动预热等不带 QQ messageId 的恢复调用不更新用户计时，也不触发或消费待执行轮换。下一次实际用户输入取得聊天 Agent 时，创建无 parent/seed 的新根 Session，保留模型/目标 Preset 偏好；不 Fork、复制或删除旧历史。换新 Session 与 Agent 内存空闲回收分开：回收后仍可恢复同一 Session。
 
 运行中的 Agent、待处理 Inbox、待审批/问答、持久未完成轮次均会延后轮换，下一次安全交互重试，不自动 cancel。记录在 `getStatus().lifecycle` 中包含 lastUserAt、pendingReason、blockedBy、generation。并发 get、手动重置/模型切换/压缩采用每 Conversation 串行边界；路由和生命周期使用同一个偏好文件原子提交，失败不发布新路由。异常或外部更改的偏好文件拒绝覆盖；仍要求单活 Host，不提供跨机器锁。
 
