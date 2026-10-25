@@ -10,6 +10,8 @@
 
 本次增加 [Interaction 可选适配](docs/INTERACTION.md)，Remote Ops 为 **1.1.1-test.1**。它不强制安装 Interaction；没有该插件时沿用原 QQ 流程。配套 Character 实例已部署，原生 Session 恢复和单 Gateway 检查通过；手机验收单独记录。仓库旧恢复包不包含这些新增改动。
 
+当前配套 Interaction **0.1.0-test.3**，修复 DSH 时间/工作区上下文注入后 QQ 回复被误拦截的问题；QQ 补丁与 Agent 插件须同步更新。已完成隔离回归和授权后的部署检查，真实手机收件待验收，详见 [Interaction 契约](docs/INTERACTION.md)。
+
 后续[Interaction 隔离审计](docs/AUDIT-INTERACTION-test10.md)的复现问题已进行[修复及隔离复测](docs/INTERACTION-AUDIT-FIXES.md)。36/36 自动测试及 10/10 SDK 边界测试通过；新增 qqbot-nodejs 1.0.5 补丁，须与 QQ Bot 补丁配套。已随 Character test.11 部署，新宿主及 QQ ready 检查通过；实机投递、完整 HMR 与生产回滚演练尚未验收。
 
 ## 按需使用
