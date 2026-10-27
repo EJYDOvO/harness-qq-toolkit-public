@@ -6,10 +6,11 @@ const { root, profile, policy, atomic, configure, configureFeatures } = require(
 const yaml = require(require.resolve('js-yaml',{paths:[profile]}));
 const stage = path.join(root,'data/profiles/qqbot-validation');
 const state = path.join(root,'data/maintenance/candidate.json');
+const selectedRuntime=()=>require('./runtime.cjs').resolveRuntime(root);
 const files = ['package.json','pnpm-lock.yaml','pnpm-workspace.yaml','cordis.patch.yml'];
 const hash = file => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 const hashes = dir => Object.fromEntries(files.map(f=>[f,hash(path.join(dir,f))]));
-const helperHashes=()=>Object.fromEntries(['ops.cjs','remote.cjs','local-client.cjs','manage.ps1','backup-integrity.cjs','stage.cjs'].map(f=>[f,hash(path.join(__dirname,f))]));
+const helperHashes=()=>Object.fromEntries(['ops.cjs','remote.cjs','local-client.cjs','manage.ps1','backup-integrity.cjs','stage.cjs','runtime.cjs','read-asar.cjs'].map(f=>[f,hash(path.join(__dirname,f))]));
 const cmd = process.argv[2];
 if (cmd === 'seal') {
   const record=JSON.parse(fs.readFileSync(state,'utf8'));
@@ -17,7 +18,7 @@ if (cmd === 'seal') {
   record.candidate=hashes(stage);
   record.patch=hash(path.join(stage,policy.qqPatch));
   record.sdkPatch=hash(path.join(stage,'patches/qqbot-nodejs@1.0.5.patch'));
-  record.runtime=hash(path.join(root,'resources/app.asar'));
+  record.runtime=hash(selectedRuntime().archive);record.runtimeRoot=selectedRuntime().runtimeRoot;
   record.features=hash(path.join(__dirname,'features.json'));
   record.policy=hash(path.join(__dirname,'plugin-policy.json'));
   record.helpers=helperHashes();
@@ -32,7 +33,8 @@ if (cmd === 'seal') {
   assert.deepEqual(record.candidate,hashes(stage),'Candidate changed: stage again');
   assert.equal(record.patch,hash(path.join(stage,policy.qqPatch)));
   assert.equal(record.sdkPatch,hash(path.join(stage,'patches/qqbot-nodejs@1.0.5.patch')));
-  assert.equal(record.runtime,hash(path.join(root,'resources/app.asar')),'Core changed: stage again');
+  assert.equal(record.runtimeRoot,selectedRuntime().runtimeRoot,'Host runtime moved: stage again');
+  assert.equal(record.runtime,hash(selectedRuntime().archive),'Core changed: stage again');
   assert.equal(record.features,hash(path.join(__dirname,'features.json')),'Features changed: stage again');
   assert.equal(record.policy,hash(path.join(__dirname,'plugin-policy.json')),'Policy changed: stage again');
   assert.deepEqual(record.helpers,helperHashes(),'Maintenance helpers changed: stage again');

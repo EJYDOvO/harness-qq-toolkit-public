@@ -14,7 +14,9 @@ $taskProfile = Join-Path $taskRoot 'data\profiles\desktop'
 $taskStage = Join-Path $taskRoot 'data\profiles\qqbot-validation'
 $taskStore = Join-Path $taskRoot 'cache\pnpm-store'
 $taskPnpm = Join-Path $taskRoot 'resources\runtime\pnpm\bin\pnpm.mjs'
-$taskExe = Join-Path $taskRoot 'DeepSeek Harness.exe'
+$taskRuntime = & $taskNode (Join-Path $PSScriptRoot 'runtime.cjs')
+if($LASTEXITCODE -ne 0){throw 'Invalid Host runtime selection'}
+$taskExe = Join-Path $taskRuntime 'DeepSeek Harness.exe'
 $taskState = Join-Path $taskRoot 'data\maintenance'
 $taskStamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
 if ($JobId) {

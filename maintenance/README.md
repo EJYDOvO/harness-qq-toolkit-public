@@ -86,3 +86,7 @@ node .\maintenance\ops.cjs access remove group <群openid>
 本体保留官方桌面更新通道，不改 `app.asar`。自定义文件放在 `data`、`default-workspace`、`plugin-sources`、`plugin-packages`、`maintenance`，更新前应保留这些目录；跨安装目录迁移需要修正原配置中的绝对路径。官方本体升级后，先运行 `ops.cjs verify`，再 Stage；需要检查真实 QQ 收发、审批和多 Agent。`runtimeReviewRequired: true` 表示版本超出当前验证范围，不能视为已完成兼容认证。
 
 远程操作依赖这台 Windows 主机在线。已注册当前用户登录后启动的 `DeepSeekHarness-QQ-Watchdog` 计划任务，使用 `maintenance/autostart.ps1` 管理；它检查宿主缺失和 QQ 永久断线，遵守维护锁、空闲门槛和重启次数限制。没有改变休眠或断电恢复设置；无人登录时不会启动桌面宿主。功能详情见 FEATURES.md。
+
+### 运行目录选择
+
+官方更新迁移安装目录时，配置 `data/maintenance/host-runtime.json`（schemaVersion 1、绝对 runtimeRoot），保持原数据目录。`runtime.cjs` 为启动、重启、守护和只读 ASAR 检查提供同一目标；`stage.cjs` 同时校验选定目录与 ASAR 哈希，改目录必须重新 Stage。旧布局未配置时维持原行为，不猜测用户目录。仅在空闲、备份、兼容验证和旧进程退出后切换；不改官方文件。

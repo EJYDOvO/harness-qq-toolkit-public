@@ -94,3 +94,7 @@ sessionLifecycle:
 生命周期状态仍在 `$DSH_HOME/qqbot/model-prefs.json`；无 DSH_HOME 保留旧路径，不自动迁移。备份需同时保留偏好、原生 Session/Schedule，以及集成方身份/通知状态。停用开关保留已有最新路由，不重置历史或数据库。宿主崩溃后未完成的副作用无法自动证明结束，可能保持延后，需显式处理原任务，不能删除记录强迫轮换。
 
 验证：`node --test maintenance/session-lifecycle.test.mjs`；配套 Character `scripts/run-lifecycle.ps1` 在两个真实 rc.2 Host 进程中验证空白根、Memory 连续性、停机逾期、原提醒冷恢复和独立任务。模型/Sender 为合成替身，不启动 QQBot、不证明实机收件；已随 Character test.14 在 Windows 实例部署，保留 test.13 生命周期配置；真实 QQ 收件与手机审批仍待验收。
+
+## DSH 0.2.1-rc.3
+
+已在安装目录与数据目录分离的实际 rc.3 中验证 QQ 适配、Interaction、Session 生命周期及提醒/任务恢复，QQ Bot/SDK 版本及两份补丁未变。通用 QQ 仍不依赖 Character。自有 Windows 维护入口增加可信宿主目录选择；这是维护脚本能力，不是 QQ 运行插件的依赖。测试使用合成模型和 Sender，没有手机收件证明。

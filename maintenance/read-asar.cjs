@@ -1,8 +1,8 @@
 // Read selected packaged files without modifying the official desktop archive.
 const fs = require('node:fs');
 const path = require('node:path');
-const archive = path.resolve(__dirname, '../resources/app.asar');
 function openArchive() {
+  const {archive}=require('./runtime.cjs').resolveRuntime(path.resolve(__dirname,'..'));
   const fd = fs.openSync(archive, 'r');
   const prefix = Buffer.alloc(16);
   fs.readSync(fd, prefix, 0, 16, 0);

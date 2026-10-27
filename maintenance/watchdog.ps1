@@ -2,7 +2,10 @@ param([switch]$Once)
 $ErrorActionPreference='Stop'
 $taskRoot=Split-Path -Parent $PSScriptRoot
 $taskState=Join-Path $taskRoot 'data\maintenance'
-$taskExe=Join-Path $taskRoot 'DeepSeek Harness.exe'
+$taskNode=Join-Path $taskRoot 'resources/runtime/primary-runtime/dependencies/node/bin/node.exe'
+$taskRuntime=& $taskNode (Join-Path $PSScriptRoot 'runtime.cjs')
+if($LASTEXITCODE -ne 0){throw 'Invalid Host runtime selection'}
+$taskExe=Join-Path $taskRuntime 'DeepSeek Harness.exe'
 $taskSingleton=$null
 try { $taskSingleton=[IO.File]::Open((Join-Path $taskState 'watchdog.lock'),[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None) } catch { exit }
 $taskAbsentSince=$null

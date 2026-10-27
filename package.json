@@ -2,10 +2,12 @@
   "name": "harness-qq-toolkit",
   "version": "1.0.0",
   "private": true,
-  "engines": { "node": ">=22" },
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "pretest": "node -e \"require('node:fs').mkdirSync('tmp',{recursive:true})\"",
-    "test": "node --test maintenance/remote-ops.test.mjs maintenance/interaction.test.mjs maintenance/session-lifecycle.test.mjs plugin-sources/dsh-task-memory/tests/render.test.mjs",
+    "test": "node --test maintenance/remote-ops.test.mjs maintenance/interaction.test.mjs maintenance/session-lifecycle.test.mjs plugin-sources/dsh-task-memory/tests/render.test.mjs maintenance/runtime.test.mjs",
     "test:audit": "node --test maintenance/audit/*.test.mjs"
   }
 }

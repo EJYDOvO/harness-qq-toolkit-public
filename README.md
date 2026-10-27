@@ -110,3 +110,9 @@ node maintenance/build-qqbot-patch.cjs --check
 已做过的验证和当时限制见 [通用接口验收](docs/GENERIC-INTEGRATION.md#实际验证) 与 [历史维护验收](maintenance/TEST-REPORT.md)。仓库源码、默认配置与某台机器的实际部署状态应分别核对。
 
 第三方文件保留原许可，见 `licenses/` 和各插件目录。功能、配置或操作方式变更时，同步维护本 README 及对应专题文档，明确区分通用能力、旧部署约定和实际验证范围。
+
+### 官方更新后的运行目录
+
+自有维护脚本通过 `maintenance/runtime.cjs` 选择官方运行目录，数据/Profile 仍保留原位置。可在本地 `data/maintenance/host-runtime.json` 配置 `{ "schemaVersion": 1, "runtimeRoot": "<absolute official install directory>" }`，也可用可信 Host 环境变量 `DSH_CHARACTER_HOST_ROOT` 或 `DSH_RUNTIME_ROOT` 显式覆盖。配置文件不提交仓库；含 BOM 的 Windows JSON 可读取，损坏或相对路径直接拒绝。
+
+`start-desktop.ps1`、维护重启/守护和 ASAR 审查使用同一选择，候选同时封存目录与哈希，目录变化后需重新验证。先停止旧宿主再切换，不复制或修改官方发行文件，不并行启动两个 QQ Gateway。运行时兼容已在 DSH rc.3 完成隔离与单实例验证，原 QQ Bot 0.5.2 / SDK 1.0.5 补丁保持不变；修改前应备份本机维护策略，确认后仅更新实际 `testedRuntime`，不要用仓库历史策略模板覆盖本机包版本、Owner 或产物 pin。
