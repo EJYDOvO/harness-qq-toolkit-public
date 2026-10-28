@@ -15,23 +15,43 @@ const {ConfigSchema}=await import(pathToFileURL(path.join(qq,'config.js')));
 const source=fs.readFileSync(new URL('../qqbot-src/dist/gateway/bootstrap.js',import.meta.url),'utf8');
 const targetSource=fs.readFileSync(path.join(qq,'transport/reply-target.js'),'utf8').replace(/^import .*;\r?\n/gm,'').replaceAll('export function','function');
 const {resolveReplyTarget,sendResolvedMarkdown}=vm.runInNewContext(targetSource+'\n;({resolveReplyTarget,sendResolvedMarkdown});',{getCachedReplyIds,MsgType:{MARKDOWN:2}});
-const makeSender=vm.runInNewContext('(function(bot){'+source.slice(source.indexOf('    const replyLimiter ='),source.indexOf('    // Optional Agent policy.'))+'return {sender,replyLimiter};})',{ReplyLimiter,resolveReplyTarget,sendResolvedMarkdown});
+const makeSender=vm.runInNewContext('(function(bot,deliveryRecorder){'+source.slice(source.indexOf('    const replyLimiter ='),source.indexOf('    // Optional Agent policy.'))+'return {sender,replyLimiter};})',{ReplyLimiter,resolveReplyTarget,sendResolvedMarkdown,randomUUID:()=> 'fixture-stream-id'});
 const makeOutbound=vm.runInNewContext(source.slice(source.indexOf('export function createInteractionOutbound'),source.indexOf('export async function bootstrapGateway')).replace('export function','function')+';createInteractionOutbound;',{createOutboundHandler:()=>()=>{}});
 const micro=()=>new Promise(r=>setImmediate(r));
-function fixture(t,{streaming=false,rejectOver=Infinity,onRequest}={}){
+function fixture(t,{streaming=false,rejectOver=Infinity,onRequest,diagnostics}={}){
  const payloads=[],bubbles=[],agent={session:{header:{id:'fixture'}},status:'running'},key={},timers=new Map();let timer=0;
  const policy=new Interaction(agent,{throttleMs:0},{now:Date.now,set:fn=>{timers.set(++timer,fn);return timer;},clear:id=>timers.delete(id)});t.after(()=>policy.dispose());
  const api=new MessageApi({async request(_token,_method,_path,body){payloads.push(structuredClone(body));if((body.markdown?.content??body.content_raw??'').length>rejectOver)throw Error('fixture: over platform limit');if(onRequest)await onRequest(body);return {id:'synthetic-stream'};}},{getAccessToken:async()=> 'synthetic-token'},{markdownSupport:true});
  const bot={sendMarkdown:(target,text)=>api.sendRaw(target.scope,target.targetId,{appId:'fixture',clientSecret:'dummy'},{markdown:{content:text},msg_id:target.msgId}),send:opts=>api.sendRaw(opts.target.scope,opts.target.targetId,{appId:'fixture',clientSecret:'dummy'},{markdown:opts.markdown,...opts.extra}),openStream:({target})=>{const stream=new StreamSession(api,{openid:target.targetId,msgId:target.msgId,creds:{appId:'fixture',clientSecret:'dummy'},throttleMs:300});bubbles.push(stream);return stream;}};
- const {sender,replyLimiter}=makeSender(bot);
+ const {sender,replyLimiter}=makeSender(bot,diagnostics);
  const record={agent,sessionKey:'fixture',replyTarget:{scope:'c2c',targetId:'fixture-owner',msgId:'fixture-message'}};
  const manager={getSessionRecord:()=>record,findBySessionId:()=>record};
- const outbound=makeOutbound({get:()=>({serviceFor:()=>({get:()=>policy})})},manager,sender,{streaming,textChunkLimit:4500},{});
+ const outbound=makeOutbound({get:()=>({serviceFor:()=>({get:()=>policy})})},manager,sender,{streaming,textChunkLimit:4500},{},undefined,diagnostics);
  const event=(type,data={})=>outbound(agent.session,{type,data});
  const input={id:'native-fixture-input',source:{kind:'user'}};manager.registerInteractionInput(record,input);event('turn/start',{turn:1});event('user/message',{turn:1,message:input});
  const final=text=>event('assistant/message',{turn:1,message:{content:[{type:'text',text}]}});
- return {policy,record,manager,sender,replyLimiter,payloads,bubbles,event,final};
+ return {policy,record,manager,sender,replyLimiter,payloads,bubbles,event,final,timers};
 }
+
+test('QQ receipt, not buffered update, confirms delivery; diagnostics connect settlement and SDK frames',async t=>{
+ const traces=[],diagnostics={hash:()=> 'a'.repeat(24),trace:(event,fields)=>traces.push({event,...fields})};
+ let release;const f=fixture(t,{streaming:true,diagnostics,onRequest:()=>new Promise(r=>release=r)});
+ f.policy.text('QQ接口尚未确认');f.policy.update(f.policy.message);await micro();assert.equal(f.policy.delivered,false);assert(traces.some(x=>x.event==='stream-request'));
+ release();await f.policy.idle();assert.equal(f.policy.delivered,true);
+ f.final('QQ接口尚未确认');await micro();release();await f.policy.idle();
+ assert(traces.some(x=>x.event==='assistant-settlement'));assert(traces.some(x=>x.event==='stream-receipt'&&x.receipt));
+ const requests=traces.filter(x=>x.event==='stream-request');assert.equal(new Set(requests.map(x=>x.stream)).size,1);assert.equal(requests.at(-1).associated,true);
+});
+
+test('missing stream receipt ID is observable without inventing association or retrying',async()=>{
+ const events=[],stream=new StreamSession({sendC2CStreamMessage:async()=>({})},{openid:'fixture',msgId:'fixture',creds:{}}).observe(e=>events.push(e));
+ await stream.update('fixture');await stream.complete();assert.equal(events.filter(e=>e.type==='request').length,2);assert(events.filter(e=>e.type==='receipt').every(e=>e.receiptId===undefined));assert(events.every(e=>!e.streamMsgId));
+});
+
+test('SDK observer failure cannot break sending or change retry policy',async()=>{
+ let calls=0;const stream=new StreamSession({sendC2CStreamMessage:async()=>{calls++;return {id:'fixture'};}},{openid:'fixture',msgId:'fixture',creds:{}}).observe(()=>{throw Error('diagnostic error');});
+ await stream.update('fixture');await stream.complete();assert.equal(calls,2);
+});
 for(const streaming of [false,true])for(const length of [4501,5001,10001])test(`Q01 ${streaming?'stream':'static'} ${length} chars respect configured 4500 limit and retain the entire message`,async t=>{
  const f=fixture(t,{streaming,rejectOver:5000}),text='长'.repeat(length);f.final(text);await f.policy.idle();
  assert(f.payloads.every(b=>(b.markdown?.content??b.content_raw).length<=4500),'adapter emitted an oversized payload');

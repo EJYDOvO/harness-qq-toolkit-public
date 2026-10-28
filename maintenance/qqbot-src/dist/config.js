@@ -39,6 +39,7 @@ export const ConfigSchema = Schema.object({
     }).description('访问控制'),
     showToolResults: Schema.boolean().default(false).description('是否展示工具调用成功结果（错误始终展示）'),
     debug: Schema.boolean().default(false),
+    deliveryDiagnostics: Schema.boolean().default(false).description('本机限量投递关联日志；不保存正文、原始标识或凭据'),
     media: Schema.object({
         enabled: Schema.boolean().default(true).description('是否启用富媒体理解（图片/视频下载 + 工具分析）'),
         maxMB: Schema.number().default(200).description('富媒体下载大小上限(MB)'),

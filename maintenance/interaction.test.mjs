@@ -11,7 +11,7 @@ function outbound(policy,streaming=true){
  const manager={getSessionRecord:()=>record,findBySessionId:()=>record,approvalChannel:{pending:new Map()},questionChannel:{pending:new Map()}};
  const sender={sendMarkdown:async(t,s)=>sent.push([t,s]),openStream:()=>({update:async()=>{},complete:async()=>{}})};
  const handler=vm.runInNewContext('(function(){'+body+';return outboundHandler;})()',{
-  ctx:{get:()=>({serviceFor:()=>policy?{get:a=>{assert.equal(a,record.agent);return policy;}}:undefined})},manager,sender,config:{streaming},logger:{},toolsRegistry:undefined,
+  ctx:{get:()=>({serviceFor:()=>policy?{get:a=>{assert.equal(a,record.agent);return policy;}}:undefined})},manager,sender,config:{streaming},logger:{},toolsRegistry:undefined,diagnostics:undefined,
   createOutboundHandler:(_m,s)=>async(session,event)=>{legacy.push(event.type);if(event.type==='tool/result')await s.sendMarkdown(record.replyTarget,'tool error');}
  });
  return {handler,sent,legacy,record,manager,session:{header:{id:'fixture'}}};

@@ -537,24 +537,65 @@ index c4998d0..33b0125 100644
 \ No newline at end of file
 +//# sourceMappingURL=index.js.map
 diff --git a/dist/gateway/bootstrap.js b/dist/gateway/bootstrap.js
-index 070f21e..a7b4e64 100644
+index 070f21e..07dad93 100644
 --- a/dist/gateway/bootstrap.js
 +++ b/dist/gateway/bootstrap.js
-@@ -12,6 +12,8 @@ import { setupMiddlewares } from "./middleware-setup.js";
+@@ -1,4 +1,8 @@
+ import { QQBot } from '@tencent-connect/qqbot-nodejs';
++import { createHmac, randomBytes, randomUUID } from 'node:crypto';
++import * as diagnosticFs from 'node:fs/promises';
++import { resolve as diagnosticPath } from 'node:path';
++import { homedir as diagnosticHome } from 'node:os';
+ import { SessionManager } from "../session/index.js";
+ import { handleInbound, createOutboundHandler } from "../transport/index.js";
+ import { ReplyLimiter } from "../transport/reply-limiter.js";
+@@ -12,6 +16,40 @@ import { setupMiddlewares } from "./middleware-setup.js";
  import { startMediaCleanup } from "../media/media-cleaner.js";
  import { ensureVisionInputModal, registerDescribeImageTool } from "../media/vision-tool.js";
  import { registerSendFileTool } from "../media/send-file-tool.js";
 +// Shared across duplicate module copies in the same Host process.
 +const gatewayLeases = globalThis[Symbol.for('dsh.qqGateway.leases.v1')] ??= new Map();
++// Opt-in bounded local diagnostics. HMAC keys live only in this Gateway instance;
++// neither source text, raw identifiers, errors nor credentials enter this file.
++export function createDeliveryRecorder(enabled, logger, directory) {
++    if(!enabled)return null;
++    const home=process.env.DSH_HOME?.trim();
++    const dir=directory??(home?diagnosticPath(home,'qqbot','diagnostics'):diagnosticPath(diagnosticHome(),'.dsh-qqbot','diagnostics'));
++    const file=diagnosticPath(dir,'delivery.jsonl'),key=randomBytes(32),boot=randomUUID();
++    let pending=[],timer,chain=Promise.resolve(),closed=false,warned=false,writing=false;
++    const hash=value=>value===undefined?undefined:createHmac('sha256',key).update(String(value)).digest('hex').slice(0,24);
++    function flush(){
++        clearTimeout(timer);timer=undefined;if(writing)return chain.then(flush);if(!pending.length)return chain;
++        const batch=pending;pending=[];
++        writing=true;
++        chain=chain.then(async()=>{
++            await diagnosticFs.mkdir(dir,{recursive:true,mode:0o700});
++            const size=await diagnosticFs.stat(file).then(s=>s.size,e=>{if(e.code==='ENOENT')return 0;throw e;});
++            if(size>=1024*1024){await diagnosticFs.rm(file+'.1',{force:true});await diagnosticFs.rename(file,file+'.1');}
++            await diagnosticFs.appendFile(file,batch.join(''),{mode:0o600});
++        }).catch(()=>{if(!warned){warned=true;logger?.warn?.('QQ delivery diagnostics unavailable; messaging continues without file diagnostics');}}).finally(()=>{writing=false;});
++        return chain;
++    }
++    const trace=(event,fields={})=>{
++        if(closed||pending.length>=512||!/^[-a-z]+$/.test(event))return;
++        const row={time:Date.now(),boot,event};
++        for(const k of ['turn','reply','bubble','seq','length','index','msgSeq','state','retry','httpStatus','bizCode'])if(Number.isFinite(fields[k]))row[k]=fields[k];
++        for(const k of ['session','input','stream','receipt','association','textHash','attempt'])if(typeof fields[k]==='string'&&/^[a-f0-9]{24}$/.test(fields[k]))row[k]=fields[k];
++        for(const k of ['passive','associated','missingReceipt'])if(typeof fields[k]==='boolean')row[k]=fields[k];
++        pending.push(JSON.stringify(row)+'\n');
++        if(!timer){timer=setTimeout(flush,100);timer.unref?.();}
++    };
++    return {hash,trace,flush,async close(){closed=true;await flush();}};
++}
  /**
   * interaction 统一分发器：按 button_data 的顶层 `t` 判别字段，路由到对应
   * channel（question / approval）。QQ 只有一个 interaction 入口，集中路由
-@@ -30,7 +32,78 @@ function dispatchInteraction(event, manager) {
+@@ -30,8 +68,84 @@ function dispatchInteraction(event, manager) {
          return manager.approvalChannel?.handleInteraction(event) ?? false;
      return false;
  }
 +// Reusable transport wiring, separately testable without creating a QQ gateway.
-+export function createInteractionOutbound(ctx, manager, sender, config, logger, toolsRegistry) {
++export function createInteractionOutbound(ctx, manager, sender, config, logger, toolsRegistry, diagnostics) {
 +    const policyFor = record => { try { return record && ctx.get('agentPresets')?.serviceFor?.(record.agent, 'interactionPolicy')?.get(record.agent); } catch { logger.warn?.('Interaction scope temporarily unavailable; withholding output');return null; } };
 +    manager.registerInteractionInput=(record,message)=>{
 +        const policy=policyFor(record);
@@ -566,14 +607,14 @@ index 070f21e..a7b4e64 100644
 +        while(text.length){let end=Math.min(limit,text.length);if(end<text.length&&/[\uD800-\uDBFF]/u.test(text[end-1]))end--;parts.push(text.slice(0,end));text=text.slice(end);}
 +        return parts;
 +    }
-+    function boundedStream(target) {
++    function boundedStream(target,meta) {
 +        let stream, latest='', cancelled=false;
 +        return {
 +            async update(text) {
 +                if(cancelled)return;
 +                latest=text;
 +                const first=pieces(text)[0];if(first===undefined)return;
-+                stream??=sender.openStream(target);
++                stream??=sender.openStream(target,meta);
 +                await stream.update(first);
 +            },
 +            async complete(){
@@ -581,7 +622,7 @@ index 070f21e..a7b4e64 100644
 +                const parts=pieces(latest);
 +                for(let i=0;i<parts.length;i++){
 +                    if(cancelled)return;
-+                    if(i>0){stream=sender.openStream(target);await stream.update(parts[i]);}
++                    if(i>0){stream=sender.openStream(target,meta);await stream.update(parts[i]);}
 +                    if(cancelled)return;
 +                    await stream?.complete();
 +                }
@@ -609,9 +650,12 @@ index 070f21e..a7b4e64 100644
 +            }
 +            if(record.interactionSuppressed)return;
 +            const target = { ...record.replyTarget };
-+            policy.bind({ key: manager, requireIngress: true, sendText: async (text,meta) => {for(const part of pieces(text)){if(meta?.cancelled?.())return;await sender.sendMarkdown(target, part);}},
++            const scope={session:diagnostics?.hash(session.header.id)};
++            const trace=(event,fields)=>diagnostics?.trace(event,{...scope,...fields,...(fields.attempt===undefined?{}:{attempt:diagnostics?.hash(fields.attempt)})});
++            if(['turn/start','turn/end','assistant/message'].includes(event.type))trace('host-event',{seq:event.seq,turn:event.data?.turn});
++            policy.bind({ key: manager, requireIngress: true, deliveryReceipts:true,trace,sendText: async (text,meta) => {for(const part of pieces(text)){if(meta?.cancelled?.())return;await sender.sendMarkdown(target, part,{delivery:{...scope,...meta}});meta?.onDelivered?.();}},
 +                waitingForUser: () => manager.approvalChannel?.pending.has(record.sessionKey) || manager.questionChannel?.pending.has(record.sessionKey),
-+                ...(config.streaming && target.scope === 'c2c' && target.msgId ? { openStream: () => boundedStream(target) } : {}) });
++                ...(config.streaming && target.scope === 'c2c' && target.msgId ? { openStream: meta => boundedStream(target,{...scope,...meta}) } : {}) });
 +            policy.event(event);
 +            if (['assistant/chunk', 'assistant/message'].includes(event.type)) return;
 +        }
@@ -626,20 +670,34 @@ index 070f21e..a7b4e64 100644
 +    let shutdown;
 +    ctx.effect(() => async () => { await shutdown?.(); if (gatewayLeases.get(config.appId) === lease) gatewayLeases.delete(config.appId); });
      const manager = new SessionManager(ctx, agents, config, logger);
++    const deliveryRecorder=createDeliveryRecorder(config.deliveryDiagnostics,logger);
++    ctx.effect(()=>()=>deliveryRecorder?.close());
      // ── 初始化 QQ Bot SDK ──
      const userAgent = buildUserAgent();
-@@ -70,15 +143,22 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+     const bot = new QQBot({
+@@ -68,17 +182,38 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+     // 发送适配器：将 QQBot 实例适配为 QQBotSender（openStream 参数形态不同）。
+     // sendMarkdown 统一做被动回复限额管控：同一 msgId 超限/过期时降级主动推送。
      const replyLimiter = new ReplyLimiter({ limit: 4 });
++    const diagnostics=typeof deliveryRecorder==='undefined'?null:deliveryRecorder;
      const sender = {
-         sendMarkdown: (target, content, opts) => sendResolvedMarkdown(bot, resolveReplyTarget(target, replyLimiter, true), content, opts),
+-        sendMarkdown: (target, content, opts) => sendResolvedMarkdown(bot, resolveReplyTarget(target, replyLimiter, true), content, opts),
 -        openStream: (target) => bot.openStream({
-+        openStream: (target) => {
++        sendMarkdown: async (target, content, opts) => {
++            const resolved=resolveReplyTarget(target, replyLimiter, true),meta=opts?.delivery??{},fields={...meta,input:diagnostics?.hash(resolved.msgId??resolved.eventId),length:content.length,textHash:diagnostics?.hash(content),passive:!!(resolved.msgId||resolved.eventId)};
++            diagnostics?.trace('static-request',fields);
++            try{const result=await sendResolvedMarkdown(bot,resolved,content,opts);diagnostics?.trace('static-receipt',{...fields,receipt:diagnostics?.hash(result?.id),missingReceipt:!result?.id});return result;}
++            catch(error){diagnostics?.trace('static-failure',{...fields,httpStatus:error?.httpStatus,bizCode:error?.bizCode});throw error;}
++        },
++        openStream: (target,meta={}) => {
 +            const resolved=resolveReplyTarget(target, replyLimiter, false);
++            const fields={...meta,input:diagnostics?.hash(resolved.msgId),stream:diagnostics?.hash(randomUUID()),passive:!!resolved.msgId};
++            diagnostics?.trace('stream-open',fields);
 +            if(!resolved.msgId){
 +                let text='',cancelled=false;
-+                return {async update(value){text=value;},async complete(){if(!cancelled)await sendResolvedMarkdown(bot,resolved,text);},cancel(){cancelled=true;}};
++                return {async update(value){text=value;},async complete(){if(!cancelled){const result=await sendResolvedMarkdown(bot,resolved,text);diagnostics?.trace('fallback-receipt',{...fields,length:text.length,textHash:diagnostics?.hash(text),receipt:diagnostics?.hash(result?.id)});meta.onDelivered?.();}},cancel(){cancelled=true;diagnostics?.trace('stream-cancel',fields);}};
 +            }
-+            return bot.openStream({
++            const stream=bot.openStream({
              target: {
                  scope: target.scope,
                  targetId: target.targetId,
@@ -647,15 +705,21 @@ index 070f21e..a7b4e64 100644
 +                msgId: resolved.msgId,
              },
 -        }),
-+        });},
++        });
++            stream.observe?.(event=>{
++                diagnostics?.trace('stream-'+event.type,{...fields,index:event.index,msgSeq:event.msgSeq,state:event.state,retry:event.retry,associated:!!event.streamMsgId,association:diagnostics?.hash(event.streamMsgId),length:event.text?.length,textHash:diagnostics?.hash(event.text),receipt:diagnostics?.hash(event.receiptId),missingReceipt:event.type==='receipt'&&!event.receiptId,httpStatus:event.httpStatus,bizCode:event.bizCode});
++                if(event.type==='receipt')meta.onDelivered?.();
++            });
++            return stream;
++        },
      };
 -    const outboundHandler = createOutboundHandler(manager, sender, config, logger, toolsRegistry);
 +    // Optional Agent policy. No Character, Remote Ops or policy package dependency.
-+    const outboundHandler = createInteractionOutbound(ctx, manager, sender, config, logger, toolsRegistry);
++    const outboundHandler = createInteractionOutbound(ctx, manager, sender, config, logger, toolsRegistry,deliveryRecorder);
      ctx
          .on('session/event', outboundHandler);
      // ── 问答通道（ask_user_question → QQ 文本 + 按钮） ──
-@@ -89,6 +169,10 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+@@ -89,6 +224,10 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
      const approvalChannel = new ApprovalChannel(manager, sender, logger);
      manager.approvalChannel = approvalChannel;
      approvalChannel.install(ctx);
@@ -666,7 +730,7 @@ index 070f21e..a7b4e64 100644
      // ── 按钮点击回调（interaction）：统一分发到问答/审批通道 ──
      bot.on('interaction', async (_iCtx, event) => {
          // scope/targetId 推导对齐消息事件（inbound.ts）：按 scene 判定类型，群用 group_openid，私聊用 user_openid
-@@ -146,11 +230,12 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+@@ -146,11 +285,12 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
          bot.start().catch((err) => {
              logger.error(`Bot start failed: ${err instanceof Error ? err.message : String(err)}`);
          });
@@ -1189,7 +1253,7 @@ index 1006265..ded9c4b 100644
 \ No newline at end of file
 +//# sourceMappingURL=inbound.js.map
 diff --git a/dist/config.js b/dist/config.js
-index cc39029..e164985 100644
+index cc39029..0259b71 100644
 --- a/dist/config.js
 +++ b/dist/config.js
 @@ -22,6 +22,11 @@ export const ConfigSchema = Schema.object({
@@ -1204,7 +1268,15 @@ index cc39029..e164985 100644
      maxQueue: Schema.number().default(20).description('并发队列最大长度'),
      processingTimeoutMs: Schema.number().default(30 * 60 * 1000).description('处理超时(ms)，超时中断当前 LLM 调用'),
      askTimeoutMs: Schema.number().default(5 * 60 * 1000).description('待答问题超时(ms)，超时自动拒绝并提示'),
-@@ -68,4 +73,4 @@ export const ConfigSchema = Schema.object({
+@@ -34,6 +39,7 @@ export const ConfigSchema = Schema.object({
+     }).description('访问控制'),
+     showToolResults: Schema.boolean().default(false).description('是否展示工具调用成功结果（错误始终展示）'),
+     debug: Schema.boolean().default(false),
++    deliveryDiagnostics: Schema.boolean().default(false).description('本机限量投递关联日志；不保存正文、原始标识或凭据'),
+     media: Schema.object({
+         enabled: Schema.boolean().default(true).description('是否启用富媒体理解（图片/视频下载 + 工具分析）'),
+         maxMB: Schema.number().default(200).description('富媒体下载大小上限(MB)'),
+@@ -68,4 +74,4 @@ export const ConfigSchema = Schema.object({
          extraRoots: [],
      }).description('附件发送工具配置'),
  });

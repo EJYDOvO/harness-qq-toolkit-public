@@ -52,6 +52,12 @@ export class StreamSession {
     isCompleted = false;
     cancelled = false;
     retryWake = null;
+    observer;
+    // Versioned QQTK extension. Observation cannot change delivery or retries.
+    observe(observer) { this.observer=observer;return this; }
+    notify(type, req={}, extra={}) {
+        try { this.observer?.({type,index:req.index,msgSeq:req.msg_seq,state:req.input_state,streamMsgId:req.stream_msg_id,text:req.content_raw,...extra}); } catch { }
+    }
     constructor(api, opts) {
         this.api = api;
         this.opts = opts;
@@ -108,6 +114,7 @@ export class StreamSession {
     }
     /** Force-cancel without sending a DONE frame (caller must clean up). */
     cancel() {
+        this.notify('cancel');
         this.cancelled = true;
         this.retryWake?.();
         this.isCompleted = true;
@@ -184,13 +191,18 @@ export class StreamSession {
         for (let attempt = 0; attempt <= MAX_FLUSH_RETRIES; attempt++) {
             if (this.cancelled) return;
             try {
-                return await this.api.sendC2CStreamMessage(this.opts.creds, this.opts.openid, req);
+                this.notify('request',req,{retry:attempt});
+                const response=await this.api.sendC2CStreamMessage(this.opts.creds, this.opts.openid, req);
+                this.notify('receipt',req,{receiptId:response?.id,retry:attempt});
+                return response;
             }
             catch (err) {
+                this.notify('failure',req,{retry:attempt,httpStatus:err?.httpStatus,bizCode:err?.bizCode});
                 if (!this.isRateLimitError(err) || attempt >= MAX_FLUSH_RETRIES) {
                     throw err;
                 }
                 const delay = RATE_LIMIT_BASE_DELAY_MS * Math.pow(2, attempt);
+                this.notify('retry',req,{retry:attempt+1});
                 this.opts.logger?.debug?.(`[qqbot:stream] rate limited, retry ${attempt + 1}/${MAX_FLUSH_RETRIES} after ${delay}ms`);
                 await new Promise((resolve) => {
                     const timer = setTimeout(done, delay);

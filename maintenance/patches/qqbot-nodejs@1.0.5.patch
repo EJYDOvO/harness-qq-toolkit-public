@@ -1,17 +1,23 @@
 diff --git a/dist/streaming.js b/dist/streaming.js
-index 7986cdd..c5c5765 100644
+index 7986cdd..e9dcf97 100644
 --- a/dist/streaming.js
 +++ b/dist/streaming.js
-@@ -50,6 +50,8 @@ export class StreamSession {
+@@ -50,6 +50,14 @@ export class StreamSession {
      flushInProgress = false;
      flushPromise = null;
      isCompleted = false;
 +    cancelled = false;
 +    retryWake = null;
++    observer;
++    // Versioned QQTK extension. Observation cannot change delivery or retries.
++    observe(observer) { this.observer=observer;return this; }
++    notify(type, req={}, extra={}) {
++        try { this.observer?.({type,index:req.index,msgSeq:req.msg_seq,state:req.input_state,streamMsgId:req.stream_msg_id,text:req.content_raw,...extra}); } catch { }
++    }
      constructor(api, opts) {
          this.api = api;
          this.opts = opts;
-@@ -101,10 +103,13 @@ export class StreamSession {
+@@ -101,10 +109,14 @@ export class StreamSession {
          if (this.flushPromise) {
              await this.flushPromise.catch(() => { });
          }
@@ -20,22 +26,31 @@ index 7986cdd..c5c5765 100644
      }
      /** Force-cancel without sending a DONE frame (caller must clean up). */
      cancel() {
++        this.notify('cancel');
 +        this.cancelled = true;
 +        this.retryWake?.();
          this.isCompleted = true;
          if (this.pendingTimer) {
              clearTimeout(this.pendingTimer);
-@@ -177,6 +182,7 @@ export class StreamSession {
+@@ -177,16 +189,28 @@ export class StreamSession {
       */
      async sendWithRetry(req) {
          for (let attempt = 0; attempt <= MAX_FLUSH_RETRIES; attempt++) {
 +            if (this.cancelled) return;
              try {
-                 return await this.api.sendC2CStreamMessage(this.opts.creds, this.opts.openid, req);
+-                return await this.api.sendC2CStreamMessage(this.opts.creds, this.opts.openid, req);
++                this.notify('request',req,{retry:attempt});
++                const response=await this.api.sendC2CStreamMessage(this.opts.creds, this.opts.openid, req);
++                this.notify('receipt',req,{receiptId:response?.id,retry:attempt});
++                return response;
              }
-@@ -186,7 +192,13 @@ export class StreamSession {
+             catch (err) {
++                this.notify('failure',req,{retry:attempt,httpStatus:err?.httpStatus,bizCode:err?.bizCode});
+                 if (!this.isRateLimitError(err) || attempt >= MAX_FLUSH_RETRIES) {
+                     throw err;
                  }
                  const delay = RATE_LIMIT_BASE_DELAY_MS * Math.pow(2, attempt);
++                this.notify('retry',req,{retry:attempt+1});
                  this.opts.logger?.debug?.(`[qqbot:stream] rate limited, retry ${attempt + 1}/${MAX_FLUSH_RETRIES} after ${delay}ms`);
 -                await new Promise((r) => setTimeout(r, delay));
 +                await new Promise((resolve) => {
@@ -48,7 +63,7 @@ index 7986cdd..c5c5765 100644
                  // Advance index for the retry to avoid stale index conflict
                  req.index = this.index++;
              }
-@@ -198,6 +210,7 @@ export class StreamSession {
+@@ -198,10 +222,11 @@ export class StreamSession {
          const msg = err instanceof Error ? err.message : String(err);
          if (msg.includes("rate limit"))
              return true;
@@ -56,6 +71,12 @@ index 7986cdd..c5c5765 100644
          const code = err?.code ?? err?.err_code;
          if (code === 50002 || code === 429)
              return true;
+         return false;
+     }
+ }
+-//# sourceMappingURL=streaming.js.map
+\ No newline at end of file
++//# sourceMappingURL=streaming.js.map
 diff --git a/dist/protocol/api/api-client.js b/dist/protocol/api/api-client.js
 index 69336fd..b05d322 100644
 --- a/dist/protocol/api/api-client.js

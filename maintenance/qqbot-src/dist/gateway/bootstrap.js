@@ -1,4 +1,8 @@
 import { QQBot } from '@tencent-connect/qqbot-nodejs';
+import { createHmac, randomBytes, randomUUID } from 'node:crypto';
+import * as diagnosticFs from 'node:fs/promises';
+import { resolve as diagnosticPath } from 'node:path';
+import { homedir as diagnosticHome } from 'node:os';
 import { SessionManager } from "../session/index.js";
 import { handleInbound, createOutboundHandler } from "../transport/index.js";
 import { ReplyLimiter } from "../transport/reply-limiter.js";
@@ -14,6 +18,38 @@ import { ensureVisionInputModal, registerDescribeImageTool } from "../media/visi
 import { registerSendFileTool } from "../media/send-file-tool.js";
 // Shared across duplicate module copies in the same Host process.
 const gatewayLeases = globalThis[Symbol.for('dsh.qqGateway.leases.v1')] ??= new Map();
+// Opt-in bounded local diagnostics. HMAC keys live only in this Gateway instance;
+// neither source text, raw identifiers, errors nor credentials enter this file.
+export function createDeliveryRecorder(enabled, logger, directory) {
+    if(!enabled)return null;
+    const home=process.env.DSH_HOME?.trim();
+    const dir=directory??(home?diagnosticPath(home,'qqbot','diagnostics'):diagnosticPath(diagnosticHome(),'.dsh-qqbot','diagnostics'));
+    const file=diagnosticPath(dir,'delivery.jsonl'),key=randomBytes(32),boot=randomUUID();
+    let pending=[],timer,chain=Promise.resolve(),closed=false,warned=false,writing=false;
+    const hash=value=>value===undefined?undefined:createHmac('sha256',key).update(String(value)).digest('hex').slice(0,24);
+    function flush(){
+        clearTimeout(timer);timer=undefined;if(writing)return chain.then(flush);if(!pending.length)return chain;
+        const batch=pending;pending=[];
+        writing=true;
+        chain=chain.then(async()=>{
+            await diagnosticFs.mkdir(dir,{recursive:true,mode:0o700});
+            const size=await diagnosticFs.stat(file).then(s=>s.size,e=>{if(e.code==='ENOENT')return 0;throw e;});
+            if(size>=1024*1024){await diagnosticFs.rm(file+'.1',{force:true});await diagnosticFs.rename(file,file+'.1');}
+            await diagnosticFs.appendFile(file,batch.join(''),{mode:0o600});
+        }).catch(()=>{if(!warned){warned=true;logger?.warn?.('QQ delivery diagnostics unavailable; messaging continues without file diagnostics');}}).finally(()=>{writing=false;});
+        return chain;
+    }
+    const trace=(event,fields={})=>{
+        if(closed||pending.length>=512||!/^[-a-z]+$/.test(event))return;
+        const row={time:Date.now(),boot,event};
+        for(const k of ['turn','reply','bubble','seq','length','index','msgSeq','state','retry','httpStatus','bizCode'])if(Number.isFinite(fields[k]))row[k]=fields[k];
+        for(const k of ['session','input','stream','receipt','association','textHash','attempt'])if(typeof fields[k]==='string'&&/^[a-f0-9]{24}$/.test(fields[k]))row[k]=fields[k];
+        for(const k of ['passive','associated','missingReceipt'])if(typeof fields[k]==='boolean')row[k]=fields[k];
+        pending.push(JSON.stringify(row)+'\n');
+        if(!timer){timer=setTimeout(flush,100);timer.unref?.();}
+    };
+    return {hash,trace,flush,async close(){closed=true;await flush();}};
+}
 /**
  * interaction 统一分发器：按 button_data 的顶层 `t` 判别字段，路由到对应
  * channel（question / approval）。QQ 只有一个 interaction 入口，集中路由
@@ -33,7 +69,7 @@ function dispatchInteraction(event, manager) {
     return false;
 }
 // Reusable transport wiring, separately testable without creating a QQ gateway.
-export function createInteractionOutbound(ctx, manager, sender, config, logger, toolsRegistry) {
+export function createInteractionOutbound(ctx, manager, sender, config, logger, toolsRegistry, diagnostics) {
     const policyFor = record => { try { return record && ctx.get('agentPresets')?.serviceFor?.(record.agent, 'interactionPolicy')?.get(record.agent); } catch { logger.warn?.('Interaction scope temporarily unavailable; withholding output');return null; } };
     manager.registerInteractionInput=(record,message)=>{
         const policy=policyFor(record);
@@ -45,14 +81,14 @@ export function createInteractionOutbound(ctx, manager, sender, config, logger, 
         while(text.length){let end=Math.min(limit,text.length);if(end<text.length&&/[\uD800-\uDBFF]/u.test(text[end-1]))end--;parts.push(text.slice(0,end));text=text.slice(end);}
         return parts;
     }
-    function boundedStream(target) {
+    function boundedStream(target,meta) {
         let stream, latest='', cancelled=false;
         return {
             async update(text) {
                 if(cancelled)return;
                 latest=text;
                 const first=pieces(text)[0];if(first===undefined)return;
-                stream??=sender.openStream(target);
+                stream??=sender.openStream(target,meta);
                 await stream.update(first);
             },
             async complete(){
@@ -60,7 +96,7 @@ export function createInteractionOutbound(ctx, manager, sender, config, logger, 
                 const parts=pieces(latest);
                 for(let i=0;i<parts.length;i++){
                     if(cancelled)return;
-                    if(i>0){stream=sender.openStream(target);await stream.update(parts[i]);}
+                    if(i>0){stream=sender.openStream(target,meta);await stream.update(parts[i]);}
                     if(cancelled)return;
                     await stream?.complete();
                 }
@@ -88,9 +124,12 @@ export function createInteractionOutbound(ctx, manager, sender, config, logger, 
             }
             if(record.interactionSuppressed)return;
             const target = { ...record.replyTarget };
-            policy.bind({ key: manager, requireIngress: true, sendText: async (text,meta) => {for(const part of pieces(text)){if(meta?.cancelled?.())return;await sender.sendMarkdown(target, part);}},
+            const scope={session:diagnostics?.hash(session.header.id)};
+            const trace=(event,fields)=>diagnostics?.trace(event,{...scope,...fields,...(fields.attempt===undefined?{}:{attempt:diagnostics?.hash(fields.attempt)})});
+            if(['turn/start','turn/end','assistant/message'].includes(event.type))trace('host-event',{seq:event.seq,turn:event.data?.turn});
+            policy.bind({ key: manager, requireIngress: true, deliveryReceipts:true,trace,sendText: async (text,meta) => {for(const part of pieces(text)){if(meta?.cancelled?.())return;await sender.sendMarkdown(target, part,{delivery:{...scope,...meta}});meta?.onDelivered?.();}},
                 waitingForUser: () => manager.approvalChannel?.pending.has(record.sessionKey) || manager.questionChannel?.pending.has(record.sessionKey),
-                ...(config.streaming && target.scope === 'c2c' && target.msgId ? { openStream: () => boundedStream(target) } : {}) });
+                ...(config.streaming && target.scope === 'c2c' && target.msgId ? { openStream: meta => boundedStream(target,{...scope,...meta}) } : {}) });
             policy.event(event);
             if (['assistant/chunk', 'assistant/message'].includes(event.type)) return;
         }
@@ -105,6 +144,8 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
     let shutdown;
     ctx.effect(() => async () => { await shutdown?.(); if (gatewayLeases.get(config.appId) === lease) gatewayLeases.delete(config.appId); });
     const manager = new SessionManager(ctx, agents, config, logger);
+    const deliveryRecorder=createDeliveryRecorder(config.deliveryDiagnostics,logger);
+    ctx.effect(()=>()=>deliveryRecorder?.close());
     // ── 初始化 QQ Bot SDK ──
     const userAgent = buildUserAgent();
     const bot = new QQBot({
@@ -141,24 +182,38 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
     // 发送适配器：将 QQBot 实例适配为 QQBotSender（openStream 参数形态不同）。
     // sendMarkdown 统一做被动回复限额管控：同一 msgId 超限/过期时降级主动推送。
     const replyLimiter = new ReplyLimiter({ limit: 4 });
+    const diagnostics=typeof deliveryRecorder==='undefined'?null:deliveryRecorder;
     const sender = {
-        sendMarkdown: (target, content, opts) => sendResolvedMarkdown(bot, resolveReplyTarget(target, replyLimiter, true), content, opts),
-        openStream: (target) => {
+        sendMarkdown: async (target, content, opts) => {
+            const resolved=resolveReplyTarget(target, replyLimiter, true),meta=opts?.delivery??{},fields={...meta,input:diagnostics?.hash(resolved.msgId??resolved.eventId),length:content.length,textHash:diagnostics?.hash(content),passive:!!(resolved.msgId||resolved.eventId)};
+            diagnostics?.trace('static-request',fields);
+            try{const result=await sendResolvedMarkdown(bot,resolved,content,opts);diagnostics?.trace('static-receipt',{...fields,receipt:diagnostics?.hash(result?.id),missingReceipt:!result?.id});return result;}
+            catch(error){diagnostics?.trace('static-failure',{...fields,httpStatus:error?.httpStatus,bizCode:error?.bizCode});throw error;}
+        },
+        openStream: (target,meta={}) => {
             const resolved=resolveReplyTarget(target, replyLimiter, false);
+            const fields={...meta,input:diagnostics?.hash(resolved.msgId),stream:diagnostics?.hash(randomUUID()),passive:!!resolved.msgId};
+            diagnostics?.trace('stream-open',fields);
             if(!resolved.msgId){
                 let text='',cancelled=false;
-                return {async update(value){text=value;},async complete(){if(!cancelled)await sendResolvedMarkdown(bot,resolved,text);},cancel(){cancelled=true;}};
+                return {async update(value){text=value;},async complete(){if(!cancelled){const result=await sendResolvedMarkdown(bot,resolved,text);diagnostics?.trace('fallback-receipt',{...fields,length:text.length,textHash:diagnostics?.hash(text),receipt:diagnostics?.hash(result?.id)});meta.onDelivered?.();}},cancel(){cancelled=true;diagnostics?.trace('stream-cancel',fields);}};
             }
-            return bot.openStream({
+            const stream=bot.openStream({
             target: {
                 scope: target.scope,
                 targetId: target.targetId,
                 msgId: resolved.msgId,
             },
-        });},
+        });
+            stream.observe?.(event=>{
+                diagnostics?.trace('stream-'+event.type,{...fields,index:event.index,msgSeq:event.msgSeq,state:event.state,retry:event.retry,associated:!!event.streamMsgId,association:diagnostics?.hash(event.streamMsgId),length:event.text?.length,textHash:diagnostics?.hash(event.text),receipt:diagnostics?.hash(event.receiptId),missingReceipt:event.type==='receipt'&&!event.receiptId,httpStatus:event.httpStatus,bizCode:event.bizCode});
+                if(event.type==='receipt')meta.onDelivered?.();
+            });
+            return stream;
+        },
     };
     // Optional Agent policy. No Character, Remote Ops or policy package dependency.
-    const outboundHandler = createInteractionOutbound(ctx, manager, sender, config, logger, toolsRegistry);
+    const outboundHandler = createInteractionOutbound(ctx, manager, sender, config, logger, toolsRegistry,deliveryRecorder);
     ctx
         .on('session/event', outboundHandler);
     // ── 问答通道（ask_user_question → QQ 文本 + 按钮） ──
