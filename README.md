@@ -2,7 +2,7 @@
 
 为 DeepSeek Harness 提供 **QQ 接入兼容补丁、可选 Remote Ops 插件和维护工具**。普通 DSH Agent 可以独立使用 QQ 接入，不需要 Character Agent、角色 Preset 或记忆插件。
 
-**当前源码配套 Character test.22 / Manager test.2：** 恢复只接受原生同 Session 的缺失错误；关闭等待旧句柄并显式报告失败。实例部署状态另行记录。 新增独立 [Conversation Manager](plugin-sources/dsh-conversation-manager/README.md) `0.1.0-test.1`。最新 QQ 补丁原生依赖该服务，必须成套安装；下面的 test.14～test.20 是历史部署记录。路由由 Host 显式配置 `stateFile`；上线前审查旧提醒、任务及通知账本，禁止用空文件静默替代旧路由。
+**当前源码配套 Character test.22 / Manager test.2：** 恢复只接受原生同 Session 的缺失错误；关闭等待旧句柄并显式报告失败。已配套 Character test.22 在现有 rc.3 实例授权部署，单一 QQ Gateway 健康；手机验收仍待完成。 新增独立 [Conversation Manager](plugin-sources/dsh-conversation-manager/README.md) `0.1.0-test.1`。最新 QQ 补丁原生依赖该服务，必须成套安装；下面的 test.14～test.20 是历史部署记录。路由由 Host 显式配置 `stateFile`；上线前审查旧提醒、任务及通知账本，禁止用空文件静默替代旧路由。
 
 源码提供默认关闭的 [QQ 主 Session 生命周期](docs/GENERIC-INTEGRATION.md#可选主-session-生命周期)：真实 Host 重启或 12 小时无用户输入后，下次安全交互创建空白根 Session，不 Fork 聊天。繁忙、审批和已有提醒有保护，启动预热不算用户输入。test.13 首次部署并启用，test.14 保留；真实 QQ 收件与手机验收仍待完成。
 
