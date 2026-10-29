@@ -65,7 +65,7 @@ QQ 0.5.2 的上游审批代码仍读取旧的 `session.events`，本体当前使
 
 维护源码在 `maintenance/qqbot-src`，对应上游原文件及 SHA-256 清单在 `maintenance/qqbot-upstream-0.5.2`。编辑维护源码后运行 `node maintenance/build-qqbot-patch.cjs` 生成 `maintenance/patches/dsh-qqbot@0.5.2.patch`；Stage 会用 `--check` 核对可重建性。profile 的 `patchedDependencies` 和锁文件负责自动重装。旧 `qqbot-approval` 目录仅为首版兼容修复参考，不再作为新补丁来源。
 
-升级 QQ 时不能只改包版本：检查新版是否已经合入修复，更新或删除补丁，并重跑 `node --test maintenance/approval.test.mjs maintenance/qq-boundaries.test.mjs maintenance/maintenance.test.cjs`（默认针对候选 profile，实际部署复测设置环境变量 `QQBOT_TEST_PROFILE`）。脚本对未经审查的 QQ 版本直接报错，避免静默丢补丁。`autoInstallPeers: false` 保持由桌面本体提供核心组件，不在 profile 装第二份核心。现有 `plugin-sources/dsh-qqbot-0.5.0` 仅作为历史源码参考。
+升级 QQ 时不能只改包版本：检查新版是否已经合入修复，更新或删除补丁，并重跑 `node --test maintenance/approval.test.mjs maintenance/approval-timeout.test.mjs maintenance/qq-boundaries.test.mjs maintenance/maintenance.test.cjs`（默认针对候选 profile，实际部署复测设置环境变量 `QQBOT_TEST_PROFILE`）。脚本对未经审查的 QQ 版本直接报错，避免静默丢补丁。`autoInstallPeers: false` 保持由桌面本体提供核心组件，不在 profile 装第二份核心。现有 `plugin-sources/dsh-qqbot-0.5.0` 仅作为历史源码参考。
 
 ## 权限管理
 
