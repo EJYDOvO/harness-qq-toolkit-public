@@ -10,7 +10,7 @@
 
 本次增加 [Interaction 可选适配](docs/INTERACTION.md)，Remote Ops 为 **1.1.1-test.1**。它不强制安装 Interaction；没有该插件时沿用原 QQ 流程。配套 Character 实例已部署，原生 Session 恢复和单 Gateway 检查通过；手机验收单独记录。仓库旧恢复包不包含这些新增改动。
 
-当前配套 Interaction **0.1.0-test.5**：支持默认 8 秒无自然回复发送确认提示（5.5 秒起由 Agent 侧插件经原生模型生成 Persona 风格短句，QQTK 只负责发送）、长结果语义分泡与只观察的 SDK 回执钩子。QQ 配置 `deliveryDiagnostics:true` 可开启限量脱敏投递关联日志，默认关闭；不需要开启 debug，不保存私聊正文或原始身份。QQ 补丁与 Agent 插件须同步更新；重复完整气泡仍待真实复现，详见 [Interaction 契约](docs/INTERACTION.md)。源码已配套 Interaction **0.1.0-test.6**（未部署）：回复按输入 ID 选择 QQ 回复目标、Worker 续轮投递、运行期新消息交给 Interaction 的 intervene 处理（入站不再等待整轮结束），并补充回退失败与抑制来源诊断。
+当前配套 Interaction **0.1.0-test.5**：支持默认 8 秒无自然回复发送确认提示（5.5 秒起由 Agent 侧插件经原生模型生成 Persona 风格短句，QQTK 只负责发送）、长结果语义分泡与只观察的 SDK 回执钩子。QQ 配置 `deliveryDiagnostics:true` 可开启限量脱敏投递关联日志，默认关闭；不需要开启 debug，不保存私聊正文或原始身份。QQ 补丁与 Agent 插件须同步更新；重复完整气泡仍待真实复现，详见 [Interaction 契约](docs/INTERACTION.md)。已配套并部署 Interaction **0.1.0-test.6**：回复按输入 ID 选择 QQ 回复目标、Worker 续轮投递、运行期新消息交给 Interaction 的 intervene 处理（入站不再等待整轮结束），并补充回退失败与抑制来源诊断。
 
 后续[Interaction 隔离审计](docs/AUDIT-INTERACTION-test10.md)的复现问题已进行[修复及隔离复测](docs/INTERACTION-AUDIT-FIXES.md)。36/36 自动测试及 10/10 SDK 边界测试通过；新增 qqbot-nodejs 1.0.5 补丁，须与 QQ Bot 补丁配套。已随 Character test.11 部署，新宿主及 QQ ready 检查通过；实机投递、完整 HMR 与生产回滚演练尚未验收。
 
