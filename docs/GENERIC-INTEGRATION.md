@@ -1,4 +1,6 @@
-# QQTK 通用安装与依赖（2026-10-19）
+# QQTK 通用安装与依赖
+
+当前源码为 Conversation Manager 抽离候选，**未部署**，仅 rc.3 隔离验证。旧部署记录不代表最新源码已经上线。路由接口、安装与恢复前置见 [独立插件说明](../plugin-sources/dsh-conversation-manager/README.md)。
 
 QQTK 继续是独立插件与维护组件集合，不迁入 Character 仓库、不合并单体。Character 通过固定版本的 QQTK 接口和补丁使用它。
 
@@ -6,13 +8,13 @@ QQTK 继续是独立插件与维护组件集合，不迁入 Character 仓库、�
 
 | 功能 | 旧前提 | 当前前提 |
 |---|---|---|
-| QQ 接入/Session/Sender/审批/问答 | 基础 QQ 强依赖 qqRemoteOps | DSH Agent/原生 Preset + 已审查 QQ 0.5.2 补丁 |
+| QQ 接入/Session/Sender/审批/问答 | 基础 QQ 强依赖 qqRemoteOps | 原生 Agent/Preset + Conversation Manager + QQ 0.5.2 配套补丁 |
 | `/ops` | 安装目录中私人维护脚本 | 独立插件，显式 Owner/stateDirectory；可选 qqMaintenance 服务 |
 | 旧 Windows 部署/恢复/守护 | 固定部署约定 | 保留在显式 root 后端，未改成跨平台工具 |
 | Character QQ | QQTK + Character 集成 | 不变；通用 QQ 不加载 Character |
-| QQ 会话偏好 | 所有 Profile 使用用户目录 | 有 DSH_HOME 时使用 DSH_HOME/qqbot；无配置保留旧路径 |
+| 会话偏好 | QQ 私有路径推导 | Manager 显式绝对 stateFile；默认项目隔离 |
 
-普通项目只需安装 `@tencent-connect/dsh-qqbot@0.5.2`，不需要本仓库 Remote Ops、本仓库旧项目记忆，或任何 Character 包。
+普通项目安装 QQ Bot 和独立 `dsh-conversation-manager`，不需要 Remote Ops、旧项目记忆或任何 Character 包。两份补丁须配套：
 
 Profile 保留原生 base/web-app Bundle，`autoInstallPeers: false`，不要重复安装本体的服务包。将 `maintenance/patches/dsh-qqbot@0.5.2.patch` 放到 Profile 的 patches，配置：
 
@@ -23,11 +25,18 @@ nodeLinker: hoisted
 autoInstallPeers: false
 patchedDependencies:
   '@tencent-connect/dsh-qqbot@0.5.2': patches/dsh-qqbot@0.5.2.patch
+  '@tencent-connect/qqbot-nodejs@1.0.5': patches/qqbot-nodejs@1.0.5.patch
+overrides:
+  '@tencent-connect/qqbot-nodejs': 1.0.5
 ```
 
 ```yaml
 # cordis.patch.yml；占位符必须换成本机安全配置
 - insert:
+    - id: conversation-manager
+      name: dsh-conversation-manager
+      config:
+        stateFile: '<ABSOLUTE_PROJECT_DATA>/conversations.json'
     - id: ordinary-qq
       name: '@tencent-connect/dsh-qqbot'
       config:
@@ -44,11 +53,11 @@ patchedDependencies:
 
 包管理器正常安装并应用补丁；不手改 DSH app.asar 或安装后的 node_modules 文件。每个项目设置独立的绝对 DSH_HOME。不要同时启用 QQ 官方 Bundle 和另一个手动 QQ 条目。
 
-需要 `/ops` 时，另行安装 `plugin-packages/dsh-remote-ops-local-1.1.0.tgz`（或审查源码后 pack）。按 [独立模式与维护后端](../plugin-sources/dsh-remote-ops/README.md) 在 QQ 前加载。没有维护后端时基本任务观察可用，部署/重启等明确拒绝；不会猜测其他安装目录。
+需要 `/ops` 时，另行安装 已审查并固定哈希的 `dsh-remote-ops-local` 包（或审查源码后 pack）。按 [独立模式与维护后端](../plugin-sources/dsh-remote-ops/README.md) 在 QQ 前加载。没有维护后端时基本任务观察可用，部署/重启等明确拒绝；不会猜测其他安装目录。
 
 ## 单例、权限与生命周期
 
-- 基础 QQ 的注入声明只依赖 agents，未安装 Remote Ops 时审批/问答仍注册。
+- 基础 QQ 注入 agents/conversationManager；未安装 Remote Ops 时审批/问答仍注册。停用 Manager 会使依赖它的 QQ 停用，不另开旧 Session Manager。
 - 进程共享 appId 租约拒绝重复 Gateway，卸载等待停止后释放；只构造一套 Sender、问答与审批通道。
 - 多进程使用同一凭据需外部单活管理；本机维护锁不能代表跨机器分布式锁。
 - 无效 Preset 不再退回其他 Agent 组合；已有 Session 继续按其原 Preset 恢复，缺失时拒绝。
@@ -91,7 +100,7 @@ sessionLifecycle:
 
 当前补丁的 `manager.isCurrentSession(record)` 检查真实 record 对象、manager 路由与 Agent 注册表；集成层必须在异步 admission 后重查，不能凭 Session ID/QQ 身份参数授权。QQTK 不决定具体 Identity 策略，普通 Agent 无须安装 Character。当前 rc.2 切模型使用原生 `snapshotEvents/buildForkSeed` 构建精确前缀，避免旧 `.events` API 和额外的临时活跃 fork；新根持久化成功后通过 `PrefsStore.commitSession` 一次提交模型偏好及路由。磁盘写入/外部修改/关闭失败时撤销候选，不发布新路由。自动空白轮换仍不 Fork。
 
-生命周期状态仍在 `$DSH_HOME/qqbot/model-prefs.json`；无 DSH_HOME 保留旧路径，不自动迁移。备份需同时保留偏好、原生 Session/Schedule，以及集成方身份/通知状态。停用开关保留已有最新路由，不重置历史或数据库。宿主崩溃后未完成的副作用无法自动证明结束，可能保持延后，需显式处理原任务，不能删除记录强迫轮换。
+生命周期状态在 Manager 的显式 `stateFile`。旧版 `$DSH_HOME/qqbot/model-prefs.json` 不再隐式读取；离线审查后可选用原文件，或完整复制到新路径。备份同时保留原生 Session/Schedule 和 Identity/通知状态。停用开关保留最新路由；未完成副作用仍会阻塞轮换，不能删除记录强迫重置。
 
 验证：`node --test maintenance/session-lifecycle.test.mjs`；配套 Character `scripts/run-lifecycle.ps1` 在两个真实 rc.2 Host 进程中验证空白根、Memory 连续性、停机逾期、原提醒冷恢复和独立任务。模型/Sender 为合成替身，不启动 QQBot、不证明实机收件；已随 Character test.14 在 Windows 实例部署，保留 test.13 生命周期配置；真实 QQ 收件与手机审批仍待验收。
 
