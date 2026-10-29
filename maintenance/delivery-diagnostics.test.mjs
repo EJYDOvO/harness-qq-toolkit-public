@@ -36,3 +36,30 @@ test('diagnostics label status versus assistant receipts by enum only',async t=>
  const rows=(await fs.readFile(resolve(dir,'delivery.jsonl'),'utf8')).trim().split('\n').map(JSON.parse);
  assert.deepEqual(rows.map(r=>[r.kind,r.dynamic]),[['status',true],['assistant',undefined],[undefined,undefined]]);
 });
+test('diagnostics record suppressed sources as a closed enum',async t=>{
+ await fs.mkdir('tmp',{recursive:true});const dir=await fs.mkdtemp(resolve('tmp','qq-delivery-source-'));t.after(()=>fs.rm(dir,{recursive:true,force:true}));
+ const recorder=create(true,{},dir);
+ for(const source of ['subagent-settled','schedule','web','private free text',42])recorder.trace('suppressed',{source});await recorder.close();
+ const rows=(await fs.readFile(resolve(dir,'delivery.jsonl'),'utf8')).trim().split('\n').map(JSON.parse);
+ assert.deepEqual(rows.map(r=>r.source),['subagent-settled','schedule','web','other',undefined]);
+});
+test('a failed proactive stream fallback is traced and still rejects',async()=>{
+ const begin=source.indexOf('    const sender = {'),stop=source.indexOf('    // Optional Agent policy.',begin);assert(begin>0&&stop>begin);
+ const traces=[],diagnostics={hash:v=>v===undefined?undefined:'a'.repeat(24),trace:(e,f)=>traces.push([e,f])};
+ const failure=Object.assign(new Error('rejected'),{httpStatus:403,bizCode:22009});
+ const sender=vm.runInNewContext('(function(){'+source.slice(begin,stop)+';return sender;})()',{
+  diagnostics,replyLimiter:{},randomUUID,resolveReplyTarget:t=>({...t,msgId:undefined}),
+  sendResolvedMarkdown:async()=>{throw failure;},bot:{},
+ });
+ const stream=sender.openStream({scope:'c2c',targetId:'owner'},{kind:'assistant',bubble:2});
+ await stream.update('完整正文');await assert.rejects(stream.complete(),/rejected/);
+ const row=traces.find(([e])=>e==='fallback-failure');assert(row);assert.equal(row[1].httpStatus,403);assert.equal(row[1].bizCode,22009);assert.equal(row[1].length,4);
+ assert(!traces.some(([e])=>e==='fallback-receipt'));
+});
+test('interjection decisions are recorded as closed enums only',async t=>{
+ await fs.mkdir('tmp',{recursive:true});const dir=await fs.mkdtemp(resolve('tmp','qq-delivery-intervene-'));t.after(()=>fs.rm(dir,{recursive:true,force:true}));
+ const recorder=create(true,{},dir);
+ recorder.trace('intervene',{decision:'priority',phase:'text',why:'judge'});recorder.trace('intervene',{decision:'free text',phase:'secret',why:'用户原话'});await recorder.close();
+ const rows=(await fs.readFile(resolve(dir,'delivery.jsonl'),'utf8')).trim().split('\n').map(JSON.parse);
+ assert.deepEqual(rows.map(r=>[r.decision,r.phase,r.why]),[['priority','text','judge'],[undefined,undefined,undefined]]);
+});

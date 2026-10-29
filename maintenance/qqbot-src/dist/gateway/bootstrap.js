@@ -47,6 +47,8 @@ export function createDeliveryRecorder(enabled, logger, directory) {
         for(const k of ['passive','associated','missingReceipt','dynamic'])if(typeof fields[k]==='boolean')row[k]=fields[k];
         // Separates status receipts from natural-reply receipts; never text.
         if(['assistant','status','tool-or-error'].includes(fields.kind))row.kind=fields.kind;
+        for(const [k,values] of [['decision',['revise','priority','supplement','append','dropped']],['phase',['text','tool','waiting-user']],['why',['judge','timeout','error','invalid','explicit','none']]])if(values.includes(fields[k]))row[k]=fields[k];
+        if(typeof fields.source==='string')row.source=['subagent-settled','schedule','web'].includes(fields.source)?fields.source:'other';
         pending.push(JSON.stringify(row)+'\n');
         if(!timer){timer=setTimeout(flush,100);timer.unref?.();}
     };
@@ -73,9 +75,17 @@ function dispatchInteraction(event, manager) {
 // Reusable transport wiring, separately testable without creating a QQ gateway.
 export function createInteractionOutbound(ctx, manager, sender, config, logger, toolsRegistry, diagnostics) {
     const policyFor = record => { try { return record && ctx.get('agentPresets')?.serviceFor?.(record.agent, 'interactionPolicy')?.get(record.agent); } catch { logger.warn?.('Interaction scope temporarily unavailable; withholding output');return null; } };
+    // Reply targets stay on the QQ side: Interaction only names the native input id.
+    const rememberTarget=(record,message)=>{
+        if(typeof message?.id!=='string'||!record.replyTarget)return;
+        const targets=record.interactionTargets??=new Map();targets.delete(message.id);targets.set(message.id,{...record.replyTarget});
+        while(targets.size>100)targets.delete(targets.keys().next().value);
+    };
+    const targetFor=(record,meta,fallback)=>{const own=typeof meta?.input==='string'?record.interactionTargets?.get(meta.input):undefined;return own?{...own}:fallback;};
+    manager.interactionPolicy=record=>policyFor(record)??undefined;
     manager.registerInteractionInput=(record,message)=>{
         const policy=policyFor(record);
-        if(policy){record.interactionSuppressed=false;policy.admitInput?.(message);}
+        if(policy){record.interactionSuppressed=false;rememberTarget(record,message);policy.admitInput?.(message);}
     };
     const limit = Math.max(100, Math.min(4500, config.textChunkLimit ?? 4500));
     function pieces(text) {
@@ -118,20 +128,25 @@ export function createInteractionOutbound(ctx, manager, sender, config, logger, 
         const policy = policyFor(record);
         if(policy===null)return;
         if (policy) {
+            const scope={session:diagnostics?.hash(session.header.id)};
+            const trace=(event,fields)=>diagnostics?.trace(event,{...scope,...fields,...(fields.attempt===undefined?{}:{attempt:diagnostics?.hash(fields.attempt)})});
             if(event.type==='user/message'){
-                const source=event.data?.message?.source??event.data?.source;
+                const message=event.data?.message??event.data,source=message?.source;
                 // Native projections are context within the admitted turn, not
                 // another input channel. They never clear existing suppression.
-                if(source?.kind&&!['user','runtime-context','skill-catalog','time-context','agent-instructions'].includes(source.kind)){record.interactionSuppressed=true;policy.stopOutput();}
+                // Other sources are background unless the policy recognizes them
+                // (a Worker settling for an admitted reply).
+                if(source?.kind&&!['user','runtime-context','skill-catalog','time-context','agent-instructions'].includes(source.kind)){
+                    if(policy.admitsSource?.(message))record.interactionSuppressed=false;
+                    else{record.interactionSuppressed=true;policy.stopOutput();trace('suppressed',{source:source.kind});}
+                }
             }
             if(record.interactionSuppressed)return;
             const target = { ...record.replyTarget };
-            const scope={session:diagnostics?.hash(session.header.id)};
-            const trace=(event,fields)=>diagnostics?.trace(event,{...scope,...fields,...(fields.attempt===undefined?{}:{attempt:diagnostics?.hash(fields.attempt)})});
             if(['turn/start','turn/end','assistant/message'].includes(event.type))trace('host-event',{seq:event.seq,turn:event.data?.turn});
-            policy.bind({ key: manager, requireIngress: true, deliveryReceipts:true,trace,sendText: async (text,meta) => {for(const part of pieces(text)){if(meta?.cancelled?.())return;await sender.sendMarkdown(target, part,{delivery:{...scope,...meta}});meta?.onDelivered?.();}},
+            policy.bind({ key: manager, requireIngress: true, deliveryReceipts:true,trace,sendText: async (text,meta) => {const to=targetFor(record,meta,target);for(const part of pieces(text)){if(meta?.cancelled?.())return;await sender.sendMarkdown(to, part,{delivery:{...scope,...meta}});meta?.onDelivered?.();}},
                 waitingForUser: () => manager.approvalChannel?.pending.has(record.sessionKey) || manager.questionChannel?.pending.has(record.sessionKey),
-                ...(config.streaming && target.scope === 'c2c' && target.msgId ? { openStream: meta => boundedStream(target,{...scope,...meta}) } : {}) });
+                ...(config.streaming && target.scope === 'c2c' && target.msgId ? { openStream: meta => boundedStream(targetFor(record,meta,target),{...scope,...meta}) } : {}) });
             policy.event(event);
             if (['assistant/chunk', 'assistant/message'].includes(event.type)) return;
         }
@@ -198,7 +213,7 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
             diagnostics?.trace('stream-open',fields);
             if(!resolved.msgId){
                 let text='',cancelled=false;
-                return {async update(value){text=value;},async complete(){if(!cancelled){const result=await sendResolvedMarkdown(bot,resolved,text);diagnostics?.trace('fallback-receipt',{...fields,length:text.length,textHash:diagnostics?.hash(text),receipt:diagnostics?.hash(result?.id)});meta.onDelivered?.();}},cancel(){cancelled=true;diagnostics?.trace('stream-cancel',fields);}};
+                return {async update(value){text=value;},async complete(){if(!cancelled){let result;try{result=await sendResolvedMarkdown(bot,resolved,text);}catch(error){diagnostics?.trace('fallback-failure',{...fields,length:text.length,httpStatus:error?.httpStatus,bizCode:error?.bizCode});throw error;}diagnostics?.trace('fallback-receipt',{...fields,length:text.length,textHash:diagnostics?.hash(text),receipt:diagnostics?.hash(result?.id)});meta.onDelivered?.();}},cancel(){cancelled=true;diagnostics?.trace('stream-cancel',fields);}};
             }
             const stream=bot.openStream({
             target: {

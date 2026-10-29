@@ -44,11 +44,30 @@ export async function handleInbound(ctx, manager, config, logger) {
         source: { kind: 'user' },
     });
     manager.registerInteractionInput?.(record,message);
-    record.agent.followup(message);
-    logger.info(`→ followup sent: key=${scope}:${peerId}`);
+    // With Interaction, input that arrives mid-run reaches the Agent now: the
+    // policy chooses native steer/followup/cancel, and its single send queue
+    // keeps QQ output serial, so the concurrency guard need not wait for idle.
+    const policy=manager.interactionPolicy?.(record),interactive=typeof policy?.intervene==='function';
+    if(interactive&&record.agent.status==='running'){
+        policy.intervene(message);
+        logger.info(`→ interaction input: key=${scope}:${peerId}`);
+    }else{
+        record.agent.followup(message);
+        logger.info(`→ followup sent: key=${scope}:${peerId}`);
+    }
     // 群消息回复后清空历史缓存（避免下次 @ 时重复组包）
     if (scope === 'group') {
         clearGroupHistory(config.appId, msg.groupOpenid ?? msg.senderId);
+    }
+    if(interactive){
+        // The typing middleware stops refreshing when this chain returns; keep one
+        // refresh per Session alive until the Agent is idle again.
+        if(scope==='c2c'&&!record.typingKeepAlive&&typeof bot?.sendTyping==='function'){
+            const timer=setInterval(()=>{bot.sendTyping(replyTarget,60).catch(()=>{});},50_000);
+            record.typingKeepAlive=timer;
+            record.agent.whenIdle().catch(()=>{}).finally(()=>{clearInterval(timer);if(record.typingKeepAlive===timer)record.typingKeepAlive=undefined;});
+        }
+        return;
     }
     // 阻塞等待本轮 turn 收敛，避免后续消息在 turn 运行期间被 followup 打断
     try {
