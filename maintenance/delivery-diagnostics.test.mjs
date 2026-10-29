@@ -29,3 +29,10 @@ test('diagnostic write errors are contained and do not expose exceptions',async 
  const bad=resolve(dir,'file');await fs.writeFile(bad,'fixture');const warnings=[];
  const recorder=create(true,{warn:s=>warnings.push(s)},bad);recorder.trace('stream-request',{});await recorder.close();assert.equal(warnings.length,1);assert(!warnings[0].includes(dir));
 });
+test('diagnostics label status versus assistant receipts by enum only',async t=>{
+ await fs.mkdir('tmp',{recursive:true});const dir=await fs.mkdtemp(resolve('tmp','qq-delivery-kind-'));t.after(()=>fs.rm(dir,{recursive:true,force:true}));
+ const recorder=create(true,{},dir);
+ recorder.trace('static-receipt',{kind:'status',dynamic:true,bubble:1});recorder.trace('stream-receipt',{kind:'assistant',bubble:2});recorder.trace('static-receipt',{kind:'synthetic free text',dynamic:'yes'});await recorder.close();
+ const rows=(await fs.readFile(resolve(dir,'delivery.jsonl'),'utf8')).trim().split('\n').map(JSON.parse);
+ assert.deepEqual(rows.map(r=>[r.kind,r.dynamic]),[['status',true],['assistant',undefined],[undefined,undefined]]);
+});

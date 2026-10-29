@@ -44,7 +44,9 @@ export function createDeliveryRecorder(enabled, logger, directory) {
         const row={time:Date.now(),boot,event};
         for(const k of ['turn','reply','bubble','seq','length','index','msgSeq','state','retry','httpStatus','bizCode'])if(Number.isFinite(fields[k]))row[k]=fields[k];
         for(const k of ['session','input','stream','receipt','association','textHash','attempt'])if(typeof fields[k]==='string'&&/^[a-f0-9]{24}$/.test(fields[k]))row[k]=fields[k];
-        for(const k of ['passive','associated','missingReceipt'])if(typeof fields[k]==='boolean')row[k]=fields[k];
+        for(const k of ['passive','associated','missingReceipt','dynamic'])if(typeof fields[k]==='boolean')row[k]=fields[k];
+        // Separates status receipts from natural-reply receipts; never text.
+        if(['assistant','status','tool-or-error'].includes(fields.kind))row.kind=fields.kind;
         pending.push(JSON.stringify(row)+'\n');
         if(!timer){timer=setTimeout(flush,100);timer.unref?.();}
     };

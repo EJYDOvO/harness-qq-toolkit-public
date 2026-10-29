@@ -537,7 +537,7 @@ index c4998d0..33b0125 100644
 \ No newline at end of file
 +//# sourceMappingURL=index.js.map
 diff --git a/dist/gateway/bootstrap.js b/dist/gateway/bootstrap.js
-index 070f21e..07dad93 100644
+index 070f21e..9262b1e 100644
 --- a/dist/gateway/bootstrap.js
 +++ b/dist/gateway/bootstrap.js
 @@ -1,4 +1,8 @@
@@ -549,7 +549,7 @@ index 070f21e..07dad93 100644
  import { SessionManager } from "../session/index.js";
  import { handleInbound, createOutboundHandler } from "../transport/index.js";
  import { ReplyLimiter } from "../transport/reply-limiter.js";
-@@ -12,6 +16,40 @@ import { setupMiddlewares } from "./middleware-setup.js";
+@@ -12,6 +16,42 @@ import { setupMiddlewares } from "./middleware-setup.js";
  import { startMediaCleanup } from "../media/media-cleaner.js";
  import { ensureVisionInputModal, registerDescribeImageTool } from "../media/vision-tool.js";
  import { registerSendFileTool } from "../media/send-file-tool.js";
@@ -581,7 +581,9 @@ index 070f21e..07dad93 100644
 +        const row={time:Date.now(),boot,event};
 +        for(const k of ['turn','reply','bubble','seq','length','index','msgSeq','state','retry','httpStatus','bizCode'])if(Number.isFinite(fields[k]))row[k]=fields[k];
 +        for(const k of ['session','input','stream','receipt','association','textHash','attempt'])if(typeof fields[k]==='string'&&/^[a-f0-9]{24}$/.test(fields[k]))row[k]=fields[k];
-+        for(const k of ['passive','associated','missingReceipt'])if(typeof fields[k]==='boolean')row[k]=fields[k];
++        for(const k of ['passive','associated','missingReceipt','dynamic'])if(typeof fields[k]==='boolean')row[k]=fields[k];
++        // Separates status receipts from natural-reply receipts; never text.
++        if(['assistant','status','tool-or-error'].includes(fields.kind))row.kind=fields.kind;
 +        pending.push(JSON.stringify(row)+'\n');
 +        if(!timer){timer=setTimeout(flush,100);timer.unref?.();}
 +    };
@@ -590,7 +592,7 @@ index 070f21e..07dad93 100644
  /**
   * interaction 统一分发器：按 button_data 的顶层 `t` 判别字段，路由到对应
   * channel（question / approval）。QQ 只有一个 interaction 入口，集中路由
-@@ -30,8 +68,84 @@ function dispatchInteraction(event, manager) {
+@@ -30,8 +70,84 @@ function dispatchInteraction(event, manager) {
          return manager.approvalChannel?.handleInteraction(event) ?? false;
      return false;
  }
@@ -675,7 +677,7 @@ index 070f21e..07dad93 100644
      // ── 初始化 QQ Bot SDK ──
      const userAgent = buildUserAgent();
      const bot = new QQBot({
-@@ -68,17 +182,38 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+@@ -68,17 +184,38 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
      // 发送适配器：将 QQBot 实例适配为 QQBotSender（openStream 参数形态不同）。
      // sendMarkdown 统一做被动回复限额管控：同一 msgId 超限/过期时降级主动推送。
      const replyLimiter = new ReplyLimiter({ limit: 4 });
@@ -719,7 +721,7 @@ index 070f21e..07dad93 100644
      ctx
          .on('session/event', outboundHandler);
      // ── 问答通道（ask_user_question → QQ 文本 + 按钮） ──
-@@ -89,6 +224,10 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+@@ -89,6 +226,10 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
      const approvalChannel = new ApprovalChannel(manager, sender, logger);
      manager.approvalChannel = approvalChannel;
      approvalChannel.install(ctx);
@@ -730,7 +732,7 @@ index 070f21e..07dad93 100644
      // ── 按钮点击回调（interaction）：统一分发到问答/审批通道 ──
      bot.on('interaction', async (_iCtx, event) => {
          // scope/targetId 推导对齐消息事件（inbound.ts）：按 scene 判定类型，群用 group_openid，私聊用 user_openid
-@@ -146,11 +285,12 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+@@ -146,11 +287,12 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
          bot.start().catch((err) => {
              logger.error(`Bot start failed: ${err instanceof Error ? err.message : String(err)}`);
          });
