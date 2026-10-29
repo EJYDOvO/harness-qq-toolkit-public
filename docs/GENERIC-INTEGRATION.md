@@ -1,6 +1,6 @@
 # QQTK 通用安装与依赖
 
-当前源码已完成 Conversation Manager 抽离，并随 Character test.21 在现有 rc.3 实例授权部署。普通 QQ 新装、NapCat 与手机验收仍待独立完成；历史版本记录不证明这些组合。路由接口、安装与恢复前置见 [独立插件说明](../plugin-sources/dsh-conversation-manager/README.md)。
+当前源码为 Manager test.2，修复恢复错误分类和关闭生命周期；抽离基线 test.1 已随 Character test.21 授权部署，新版部署见仓库根 README。普通 QQ 新装、NapCat 与手机验收仍待独立完成；历史版本记录不证明这些组合。路由接口、安装与恢复前置见 [独立插件说明](../plugin-sources/dsh-conversation-manager/README.md)。
 
 QQTK 继续是独立插件与维护组件集合，不迁入 Character 仓库、不合并单体。Character 通过固定版本的 QQTK 接口和补丁使用它。
 

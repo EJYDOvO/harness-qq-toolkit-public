@@ -2,7 +2,7 @@
 
 独立、平台无关的 Host 插件。维护 Conversation → 原生 Session 的唯一当前路由、模型/Preset 偏好、并发、恢复和可选空白轮换。QQ、Identity、Memory、Remote Ops 均不是本插件依赖。
 
-开发版本 `0.1.0-test.1`；已在 DSH `0.2.1-rc.3` 隔离 Host 验证，并随 Character test.21 在现有 Windows 实例授权部署；其他平台和手机收件未验收。使用原生 `agents.create/resume`、`sessions.flush`、`sessionPersistence.open`、`agentPresets.resolve/mount`、Schedule；不实现第二套运行时、调度器或数据库。
+当前源码 `0.1.0-test.2`，修复 test.1 的恢复异常分类和资源关闭问题；实例版本以仓库根 README 为准。验证基线为 DSH `0.2.1-rc.3`。使用原生 `agents.create/resume`、`sessions.flush`、`sessionPersistence.open`、`agentPresets.resolve/mount`、Schedule；不实现第二套运行时、调度器或数据库。
 
 ## 安装与装配
 
@@ -60,7 +60,9 @@ ctx.effect(() => () => manager.disposeAll());
 
 轮换创建无 seed/parent 的根；正在执行、Inbox、审批/问答或未完成持久 Turn 阻塞轮换。原生提醒保持原 Session。没有可信 `preserveScheduledSession(oldId)` 桥接时，存在提醒即延后，不能为方便轮换直接返回 true。Identity/通知层负责历史根权限和稳定 Conversation Outbox。
 
-恢复只在原生明确报告不存在时新建；损坏、权限、Preset 和 I/O 错误直接上抛。新 Session flush 与路由提交成功后才发布记录；偏好写失败撤回内存变化。模型切换失败不取消旧根或回退其他 Preset。
+恢复先读取持久 Session，只有该次 open/load 抛出原生 `SessionPersistenceNotFoundError` 实例且 sessionId 匹配时才允许新建。普通 ENOENT、同名伪造错误、其他 Session 的缺失，以及读取/关闭/原生 resume/挂载中的错误均上抛；Preset 查询也不吞异常。自定义后端必须遵守原生缺失错误契约。新 Session flush 与路由提交成功后才发布记录；偏好写失败撤回内存变化，不回退其他 Preset。
+
+每个 record/Agent 生命周期的同步 `release` 回调只调用一次，模型切换后重新计入新生命周期。原生 handle 的异步回收统一登记：关闭等待先前回收，重新准入也等待同 Session 的旧句柄释放；并发关闭复用同一个 Promise。某项清理抛错仍执行其余清理，最后报告聚合错误。关闭失败不释放当前服务内的 namespace 租约，不能将其当作可安全重开的成功卸载；不提供失败句柄的静默重试。
 
 ## 从旧 QQTK 升级与回滚
 

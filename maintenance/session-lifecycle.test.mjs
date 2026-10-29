@@ -8,22 +8,82 @@ import os from 'node:os';
 import vm from 'node:vm';
 import {randomUUID,createHash} from 'node:crypto';
 const source=file=>fs.readFileSync(file==='model/prefs-store.js'?new URL('../plugin-sources/dsh-conversation-manager/preferences.mjs',import.meta.url):file==='session/session-manager.js'?new URL('../plugin-sources/dsh-conversation-manager/manager.mjs',import.meta.url):new URL('./qqbot-src/dist/'+file,import.meta.url),'utf8').replace('export class ConversationManager','export class SessionManager').replace(/^import .*;\r?\n/gm,'').replace(/export class /g,'class ')+'\n';
+class SessionPersistenceNotFoundError extends Error {constructor(id){super('absent');this.name='SessionPersistenceNotFoundError';this.sessionId=id;}}
 function factory(home,clock,durable=new Map()){
  const sandbox={...fs,resolve:path.resolve,isAbsolute:path.isAbsolute,dirname:path.dirname,homedir:()=>home,process:{pid:process.pid,env:{DSH_HOME:home}},structuredClone};
  const Prefs=vm.runInNewContext(source('model/prefs-store.js')+';PrefsStore;',sandbox);
  const live=new Map(),options=[],disposed=[];let creates=0;
  function handle(id,meta={agentPreset:'fixture'}){const agent={id,status:'idle',session:{header:{id,...meta},events:durable.get(id)?.events??[],snapshotEvents(){return this.events;}},inbox:{hasPending:false},cancel(){this.cancelled=true;}};live.set(id,agent);return {agent,async dispose(){disposed.push(id);if(live.get(id)===agent)live.delete(id);}};}
- const agents={get:id=>live.get(id),async create(input){creates++;options.push(input);return handle(input.sessionId,input.meta);},async resume({resumeSessionId}){if(!durable.has(resumeSessionId))throw Object.assign(Error('absent'),{name:'SessionPersistenceNotFoundError'});return handle(resumeSessionId);}};
+ const agents={get:id=>live.get(id),async create(input){creates++;options.push(input);return handle(input.sessionId,input.meta);},async resume({resumeSessionId}){if(!durable.has(resumeSessionId))throw new SessionPersistenceNotFoundError(resumeSessionId);return handle(resumeSessionId);}};
  class ModelResolver{constructor(_ctx,config){this.prefs=new Prefs(undefined,path.join(home,"qqbot","model-prefs.json"));this.config=config;}getEffectiveRoute(k){return this.prefs.getOverride(k)??{provider:'fixture-provider',model:'fixture-model'};}getResumeRoute(k){return this.getEffectiveRoute(k);}getPreset(k){return this.prefs.getPreset(k);}getSessionId(k){return this.prefs.getSessionId(k);}setSessionId(k,v){this.prefs.setSessionId(k,v);}}
  class Clock extends Date{static now(){return clock.now;}}
  const timers=new Set(),IdleEvictor=vm.runInNewContext(source('session/idle-evictor.js')+';IdleEvictor;',{Date:Clock,setInterval:fn=>{timers.add(fn);return fn;},clearInterval:t=>timers.delete(t)});
- const Manager=vm.runInNewContext(source('session/session-manager.js')+';SessionManager;',{ModelResolver,IdleEvictor,SessionId:x=>x,buildForkSeed:(rows,boundary)=>structuredClone(rows.slice(0,boundary+1)),createHash,randomUUID,Date:Clock,structuredClone,process:{cwd:()=>home}});
- const events=new Map();let reminders=[];const ctx={on(n,fn){events.set(n,fn);return()=>events.delete(n);},get(name){if(name==='agentPresets')return {async resolve(id){if(id==='broken')throw Error('broken preset');return {id:id??'fixture'};},async mount(){}};if(name==='sessionPersistence')return {async open(id,access){assert.equal(access,'read');if(!durable.has(id))throw Object.assign(Error('absent'),{name:'SessionPersistenceNotFoundError'});return {header:durable.get(id).meta,read:async()=>({events:durable.get(id).events}),close:async()=>{}};}};if(name==='schedule')return {async list(){return reminders;}};if(name==='sessions')return {async flush(session){durable.set(session.header.id,{meta:{agentPreset:session.header.agentPreset},events:structuredClone(session.events)});return true;}};}};
+ const Manager=vm.runInNewContext(source('session/session-manager.js')+';SessionManager;',{ModelResolver,IdleEvictor,SessionPersistenceNotFoundError,SessionId:x=>x,buildForkSeed:(rows,boundary)=>structuredClone(rows.slice(0,boundary+1)),createHash,randomUUID,Date:Clock,structuredClone,process:{cwd:()=>home}});
+ const events=new Map();let reminders=[];const ctx={on(n,fn){events.set(n,fn);return()=>events.delete(n);},get(name){if(name==='agentPresets')return {async resolve(id){if(id==='broken')throw Error('broken preset');return {id:id??'fixture'};},async mount(){}};if(name==='sessionPersistence')return {async open(id,access){assert.equal(access,'read');if(!durable.has(id))throw new SessionPersistenceNotFoundError(id);return {header:durable.get(id).meta,read:async()=>({events:durable.get(id).events}),close:async()=>{}};}};if(name==='schedule')return {async list(){return reminders;}};if(name==='sessions')return {async flush(session){durable.set(session.header.id,{meta:{agentPreset:session.header.agentPreset},events:structuredClone(session.events)});return true;}};}};
  const config={appId:'fixture-app',preset:'fixture',cwd:home,sessionIdleTimeout:1,sessionLifecycle:{enabled:true,freshOnHostRestart:true,inactivityMs:43200000}};let manager;config.adapter={key:(scope,peer)=>'qqbot:'+config.appId+':'+scope+':'+peer,lifecycleScope:scope=>scope==='c2c',acceptActivity:(scope,peer,sender,id)=>peer===sender,isUserInput:t=>!!t?.msgId,inputId:t=>t?.msgId,waitingForUser:r=>!!(manager.questionChannel?.pending.has(r.sessionKey)||manager.approvalChannel?.pending.has(r.sessionKey))};manager=new Manager(ctx,agents,config,{info(){},warn(){},debug(){}});
  const get=id=>manager.getOrCreate('c2c','owner','owner',{scope:'c2c',targetId:'owner',msgId:id});
  return {manager,get,config,events,live,durable,options,disposed,creates:()=>creates,setReminders:rows=>reminders=rows};
 }
+function stored(f){f.durable.set(f.manager.currentSessionId(f.manager.sessionKey('c2c','owner')),{meta:{agentPreset:'fixture'},events:[]});}
 const fixture=()=>{const home=fs.mkdtempSync(path.join(os.tmpdir(),'qq-lifecycle-')),clock={now:Date.now()},f=factory(home,clock);return {...f,home,clock};};
+test('unrelated ENOENT and resume setup failures cannot create a replacement Session',async()=>{
+ for(const code of ['ENOENT','EACCES']){const f=fixture();f.config.sessionLifecycle.enabled=false;stored(f);f.manager.agents.resume=async()=>{throw Object.assign(Error('fixture dependency missing'),{code});};
+  try{await assert.rejects(f.get('restore'),/dependency missing/);assert.equal(f.creates(),0);assert.equal(f.manager.size,0);}finally{await f.manager.disposeAll();}
+ }
+});
+test('persisted Preset lookup propagates read and close errors instead of choosing a new Preset',async()=>{
+ for(const stage of ['open','read','close']){const f=fixture(),get=f.manager.ctx.get;f.config.sessionLifecycle.enabled=false;
+  const error=Object.assign(Error('fixture persistence '+stage),{code:'ENOENT'});
+  f.manager.ctx.get=n=>n==='sessionPersistence'?{async open(){if(stage==='open')throw error;return {header:{agentPreset:'original'},async read(){if(stage==='read')throw error;return {events:[]};},async close(){if(stage==='close')throw error;}};}}:get(n);
+  try{await assert.rejects(()=>f.manager.resolvePersistedPreset('fixture-session'),/fixture persistence/);await assert.rejects(f.get('restore'),/fixture persistence/);assert.equal(f.creates(),0);}finally{await f.manager.disposeAll();}
+ }
+});
+test('only the native missing-Session type for the requested identity is accepted at open',async()=>{
+ for(const error of [Object.assign(Error('spoofed missing'),{name:'SessionPersistenceNotFoundError'}),new SessionPersistenceNotFoundError('another-session')]){
+  const f=fixture(),get=f.manager.ctx.get;f.config.sessionLifecycle.enabled=false;f.manager.ctx.get=n=>n==='sessionPersistence'?{async open(){throw error;}}:get(n);
+  try{await assert.rejects(f.get('missing'),e=>e===error);assert.equal(f.creates(),0);}finally{await f.manager.disposeAll();}
+ }
+ const f=fixture(),get=f.manager.ctx.get;f.config.sessionLifecycle.enabled=false;
+ f.manager.ctx.get=n=>n==='sessionPersistence'?{async open(id){return {header:{agentPreset:'fixture'},async read(){throw new SessionPersistenceNotFoundError(id);},async close(){}};}}:get(n);
+ try{await assert.rejects(f.get('read-missing'),/absent/);assert.equal(f.creates(),0);}finally{await f.manager.disposeAll();}
+});
+test('legacy load returning no document is not treated as proof of Session absence',async()=>{
+ const f=fixture(),get=f.manager.ctx.get;f.config.sessionLifecycle.enabled=false;
+ f.manager.ctx.get=n=>n==='sessionPersistence'?{async load(){return undefined;}}:get(n);
+ try{await assert.rejects(f.get('invalid-load'),/Invalid persisted Session/);assert.equal(f.creates(),0);}finally{await f.manager.disposeAll();}
+});
+test('cold inactivity checks reject storage ENOENT instead of rotating over an unreadable root',async()=>{
+ const f=fixture(),old=await f.get('first');await f.manager.disposeAll();const next=factory(f.home,f.clock,f.durable),get=next.manager.ctx.get;
+ next.manager.ctx.get=n=>n==='sessionPersistence'?{async open(){throw Object.assign(Error('fixture storage unavailable'),{code:'ENOENT'});}}:get(n);
+ try{await assert.rejects(next.get('next-boot'),/storage unavailable/);assert.equal(next.creates(),0);assert.equal(next.manager.currentSessionId(old.sessionKey),old.sessionId);}finally{await next.manager.disposeAll();}
+});
+test('model-switch retirement and subsequent unload release each Agent lifetime once',async()=>{
+ const f=fixture();await f.get('first');let releases=0;f.config.adapter.release=()=>releases++;
+ await f.manager.setModelOverride('c2c','owner',{provider:'p',model:'m'});await f.manager.disposeAll();assert.equal(releases,2);assert.equal(f.disposed.length,2);
+});
+test('a new admission waits for an evicted Session handle before trying cold resume',async()=>{
+ const f=fixture(),old=await f.get('first'),dispose=old.handle.dispose;let release;
+ old.handle.dispose=()=>new Promise(r=>release=async()=>{await dispose();r();});old.lastActivity=0;f.manager.evictor.check();
+ let settled=false;const getting=f.get('next').then(r=>{settled=true;return r;});await new Promise(r=>setImmediate(r));assert.equal(settled,false);await release();const record=await getting;assert.notEqual(record.agent,old.agent);assert.equal(record.sessionId,old.sessionId);await f.manager.disposeAll();
+});
+test('failed candidate disposal is not called twice by the rotation catch path',async()=>{
+ const f=fixture(),old=await f.get('first'),create=f.manager.agents.create;let disposals=0;f.clock.now+=43200001;
+ f.manager.agents.create=async input=>{const h=await create(input);old.agent.status='running';h.dispose=async()=>{disposals++;f.live.delete(h.agent.id);throw Error('fixture candidate disposal');};return h;};
+ await assert.rejects(f.get('blocked'),/candidate disposal/);assert.equal(disposals,1);assert.equal(f.manager.currentSessionId(old.sessionKey),old.sessionId);old.agent.status='idle';await assert.rejects(f.manager.disposeAll(),/cleanup/);assert.equal(disposals,1);
+});
+test('unload releases each record once even for concurrent direct disposeAll calls',async()=>{
+ const f=fixture(),record=await f.get('first');let released=0;f.config.adapter.release=()=>released++;
+ await Promise.all([f.manager.disposeAll(),f.manager.disposeAll()]);assert.equal(released,1);assert.equal(f.disposed.filter(id=>id===record.sessionId).length,1);
+});
+test('unload waits for an evicted handle which is still closing',async()=>{
+ const f=fixture(),record=await f.get('first'),original=record.handle.dispose;let release,settled=false;
+ record.handle.dispose=()=>new Promise(r=>release=async()=>{await original();r();});record.lastActivity=0;f.manager.evictor.check();
+ const closing=f.manager.disposeAll().then(()=>settled=true);try{await new Promise(r=>setImmediate(r));assert.equal(settled,false,'Closing must drain earlier evictions');}finally{await release();await closing;}
+});
+test('an Adapter release exception cannot skip Agent/handle and timer cleanup',async()=>{
+ const f=fixture();await f.get('first');f.config.adapter.release=()=>{throw Error('fixture release failure');};
+ await assert.rejects(()=>f.manager.disposeAll(),/release|cleanup/);assert.equal(f.live.size,0);assert.equal(f.events.size,0);assert.equal(f.manager.evictor.timer,null);
+});
 test('current-session contract rejects spoofed records, superseded routes, replaced Agents and disposal',async()=>{
  const f=fixture(),old=await f.get('first');assert(f.manager.isCurrentSession(old));assert.equal(f.manager.isCurrentSession({...old}),false);
  f.clock.now+=43200001;const next=await f.get('rotate');assert.notEqual(next.sessionId,old.sessionId);assert.equal(f.manager.isCurrentSession(old),false);assert(f.manager.isCurrentSession(next));
@@ -115,7 +175,7 @@ test('Remote Ops startup restore cannot rotate, refresh user inactivity or consu
 });
 test('restore I/O and corrupt history never become create; failed fresh persistence never publishes a record',async()=>{
  for(const name of ['SessionPersistenceCorruptionError','Error']){
-  const f=fixture();f.config.sessionLifecycle.enabled=false;f.manager.agents.resume=async()=>{throw Object.assign(Error('fixture read failure'),{name});};
+  const f=fixture();f.config.sessionLifecycle.enabled=false;stored(f);f.manager.agents.resume=async()=>{throw Object.assign(Error('fixture read failure'),{name});};
   await assert.rejects(f.get('read-failure'),/read failure/);assert.equal(f.creates(),0);assert.equal(f.manager.size,0);await f.manager.disposeAll();
  }
  const f=fixture();f.config.sessionLifecycle.enabled=false;const get=f.manager.ctx.get;

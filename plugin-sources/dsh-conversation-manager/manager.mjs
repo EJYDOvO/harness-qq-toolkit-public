@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { SessionId, buildForkSeed } from '@deepseek-ai/dsh-session';
+import { SessionPersistenceNotFoundError } from '@deepseek-ai/dsh-session-persistence';
 import { ModelResolver } from "./model-resolver.mjs";
 import { IdleEvictor } from "./idle-evictor.mjs";
 // Stable through plugin reloads, different after an actual Host process restart.
@@ -23,6 +24,24 @@ export class ConversationManager {
     disposers = [];
     lifecycleLocks = new Map();
     closed = false;
+    closing;
+    releasedRecords = new WeakSet();
+    closingHandles = new Map();
+    cleanupErrors = [];
+    releaseRecord(record){
+        if(this.releasedRecords.has(record))return;
+        this.releasedRecords.add(record);
+        try{this.adapter.release?.(record);}catch(error){this.cleanupErrors.push(error);}
+    }
+    disposeHandle(handle){
+        if(this.closingHandles.has(handle))return this.closingHandles.get(handle);
+        const closing=Promise.resolve().then(()=>handle.dispose()).then(()=>{this.closingHandles.delete(handle);},error=>{this.cleanupErrors.push(error);throw error;});
+        this.closingHandles.set(handle,closing);return closing;
+    }
+    async drainSessionClosures(id){
+        await Promise.all([...this.closingHandles].filter(([h])=>h.agent.id===id).map(([,p])=>p));
+        if(this.closed)throw Error('Conversation manager disposed');
+    }
     constructor(ctx, agents, config, logger) {
         this.ctx = ctx;
         this.adapter = config.adapter;
@@ -34,14 +53,14 @@ export class ConversationManager {
         this.evictor = new IdleEvictor(this.sessions, config.sessionIdleTimeout, (key, record) => {
             if(this.protectedSession(record))return;
             this.logger.info(`evicting idle session: key=${key}`);
-            this.adapter.release?.(record);
+            this.releaseRecord(record);
             this.sessions.delete(key);
-            void record.handle.dispose().catch(() => { });
+            void this.disposeHandle(record.handle).catch(() => { });
             // 回收会话时统一清理其待答问题/待批审批，避免 pending 悬挂泄漏
             this.adapter.cancelPending?.(record);
         });
         this.registerScopePromptInjection();
-        this.disposers.push(ctx.on('agent/disposed',({agent})=>{const record=this.findByAgent(agent);if(record){this.adapter.release?.(record);this.sessions.delete(record.sessionKey);}}));
+        this.disposers.push(ctx.on('agent/disposed',({agent})=>{const record=this.findByAgent(agent);if(record){this.releaseRecord(record);this.sessions.delete(record.sessionKey);}}));
     }
     /**
      * 通过 system-prompt/assemble waterfall 注入群聊/私聊额外 system prompt。
@@ -92,25 +111,10 @@ export class ConversationManager {
     }
     /**
      * 从 session 持久化 header 读 session 当初的 preset（started 锁定语义）。
-     * 读不到（服务缺失 / session 不存在 / 未记录 agentPreset）返回 undefined。
+     * 只有原生持久化层确认该 Session 不存在才允许新建；其他异常必须上抛。
      */
     async resolvePersistedPreset(sessionId) {
-        let persistence;
-        try {
-            persistence = this.ctx.get('sessionPersistence');
-        }
-        catch {
-            return undefined;
-        }
-        if (!persistence)
-            return undefined;
-        try {
-            const { meta } = await this.readPersistedSession(sessionId);
-            return meta?.agentPreset;
-        }
-        catch {
-            return undefined;
-        }
+        return (await this.readPersistedSession(sessionId))?.meta?.agentPreset;
     }
     // ── 模型相关（委托给 ModelResolver） ──
     getEffectiveModel(scope, peerId) {
@@ -207,7 +211,7 @@ export class ConversationManager {
      * fork + 重建会话（保留历史，换 model）
      *
      * options.route 缺省时沿用当前生效值。preset 沿用当前生效 preset（getEffectivePresetByKey）。
-     * fork 不可用或失败时降级为 dispose（下次消息重建）。
+     * fork 不可用或失败时拒绝，保留原路由。
      */
     async rebuildSession(record, options) {
         const key = record.sessionKey;
@@ -242,15 +246,16 @@ export class ConversationManager {
             if(!await sessionsService.flush(created.agent.session))throw new Error('Model fork persistence did not acknowledge the Session');
             if(this.closed||this.sessions.get(key)!==record)throw new Error('Conversation route changed during model fork');
             this.modelResolver.prefs.commitSession(key,childId,effectiveRoute);
-        } catch(error) { await created.dispose().catch(()=>{}); throw error; }
+        } catch(error) { await this.disposeHandle(created).catch(()=>{}); throw error; }
         const oldHandle = record.handle;
-        this.adapter.release?.(record);
+        this.releaseRecord(record);
         record.sessionId = childId;
         record.agent = created.agent;
         record.handle = created;
         record.agentPreset = composed.agentPreset;
         record.lastActivity = Date.now();
-        void oldHandle.dispose().catch(() => { });
+        this.releasedRecords.delete(record); // the reused record now owns a new Agent lifetime
+        void this.disposeHandle(oldHandle).catch(() => { });
         this.logger.info(`session rebuilt via fork: key=${key} preset=${composed.agentPreset ?? 'none'} sessionId=${childId}`);
     }
     async clearModelOverride(scope, peerId) {
@@ -337,10 +342,13 @@ export class ConversationManager {
         const persistence=this.ctx.get('sessionPersistence');
         if(!persistence)throw Error('Session persistence unavailable');
         if(typeof persistence.open!=='function'){
-            if(typeof persistence.load==='function')return persistence.load(id);
+            if(typeof persistence.load==='function'){
+                try{const stored=await persistence.load(id);if(!stored?.meta||!Array.isArray(stored.events))throw Error('Invalid persisted Session document');return stored;}catch(error){if(error instanceof SessionPersistenceNotFoundError&&error.sessionId===id)return undefined;throw error;}
+            }
             throw Error('Unsupported Session persistence API');
         }
-        const handle=await persistence.open(id,'read');
+        let handle;
+        try{handle=await persistence.open(id,'read');}catch(error){if(error instanceof SessionPersistenceNotFoundError&&error.sessionId===id)return undefined;throw error;}
         try{return {meta:handle.header,events:(await handle.read()).events};}finally{await handle.close();}
     }
     protectedSession(record) {
@@ -367,12 +375,7 @@ export class ConversationManager {
     async unfinishedPersisted(sessionId){
         const persistence=this.ctx.get('sessionPersistence');
         if(!persistence)throw Error('Conversation lifecycle requires Session persistence');
-        let loaded;
-        try{loaded=await this.readPersistedSession(sessionId);}catch(error){
-            // Only proven absence permits a fresh session. Corruption/I/O is not absence.
-            if(error?.code==='ENOENT'||error?.name==='SessionPersistenceNotFoundError')return false;
-            throw error;
-        }
+        const loaded=await this.readPersistedSession(sessionId);if(!loaded)return false;
         let open=false;const pending={'next-turn':[], 'next-step':[]};
         for(const event of loaded.events??[]){
             if(event.type==='turn/start')open=true;if(event.type==='turn/end')open=false;
@@ -395,17 +398,17 @@ export class ConversationManager {
         const handle=await this.agents.create({sessionId:id,meta:{cwd:this.config.cwd||process.cwd(),agentPreset:composed.agentPreset},...(route?{agentOptions:route}:{}),setup:composed.setup});
         try{
             if(this.closed)throw Error('Conversation manager closed during rotation');
-            if(protectedOld()){await handle.dispose();return null;}
+            if(protectedOld()){await this.disposeHandle(handle);return null;}
             const sessions=this.ctx.get('sessions');if(!sessions||!await sessions.flush(handle.agent.session))throw Error('Fresh Conversation Session was not durably stored');
             if(this.closed)throw Error('Conversation manager closed during rotation');
-            if(protectedOld()){await handle.dispose();return null;}
+            if(protectedOld()){await this.disposeHandle(handle);return null;}
             const next={...this.modelResolver.prefs.getLifecycle(key),bootId:hostBootId,due:null,blocker:null,generation:(state.generation??0)+1,previousSessionId:previous};
             this.modelResolver.prefs.commitLifecycle(key,next,id);
             const record={sessionKey:key,sessionId:id,agent:handle.agent,handle,replyTarget,scope,peerId,senderId,lastActivity:Date.now(),agentPreset:composed.agentPreset};
             this.sessions.set(key,record);
-            if(old){this.adapter.release?.(old);await old.handle.dispose();}
+            if(old){this.releaseRecord(old);await this.disposeHandle(old.handle);}
             return record;
-        }catch(error){if(this.sessions.get(key)?.sessionId!==id)await handle.dispose().catch(()=>{});throw error;}
+        }catch(error){if(this.sessions.get(key)?.sessionId!==id)await this.disposeHandle(handle).catch(()=>{});throw error;}
     }
     sessionKey(scope, peerId) {
         return this.adapter.key(scope,peerId);
@@ -434,6 +437,7 @@ export class ConversationManager {
     /** 获取或恢复或创建会话（get → resume → create） */
     async getOrCreate(scope, peerId, senderId, replyTarget) {
         return this.inConversation(this.sessionKey(scope,peerId),async()=>{
+            await this.drainSessionClosures(this.currentSessionId(this.sessionKey(scope,peerId)));
             // Remote Ops restores the owner route at Gateway startup without a
             // message id. Restoration must neither count as user activity nor
             // consume a deferred rotation; only actual admitted input may do that.
@@ -469,10 +473,11 @@ export class ConversationManager {
         else {
             // preset 只解析一次：resume/create 共用同一组合，避免重复 resolve/mount 目录。
             // 优先 session 当初的 preset（started 锁定语义），无则用当前 effective preset。
-            const presetId = (await this.resolvePersistedPreset(sessionId)) ?? this.getEffectivePresetByKey(key);
+            const persisted=await this.readPersistedSession(sessionId);
+            const presetId = persisted?.meta?.agentPreset ?? this.getEffectivePresetByKey(key);
             const composed = await this.composePreset(presetId);
             agentPreset = composed.agentPreset;
-            try {
+            if(persisted) {
                 const resumeRoute = this.modelResolver.getResumeRoute(key);
                 const resumed = await this.agents.resume({
                     resumeSessionId: sessionId,
@@ -483,8 +488,7 @@ export class ConversationManager {
                 handle = resumed;
                 this.logger.info(`resumed session: key=${key} preset=${agentPreset ?? 'none'} route=${resumeRoute ? `${resumeRoute.provider}/${resumeRoute.model}` : 'session-own'}`);
             }
-            catch (error) {
-                if(error?.name!=='SessionPersistenceNotFoundError'&&error?.code!=='ENOENT')throw error;
+            else {
                 const created = await this.agents.create({
                     sessionId,
                     meta: {
@@ -497,7 +501,7 @@ export class ConversationManager {
                 agent = created.agent;
                 handle = created;
                 try{if(!await this.ctx.get('sessions')?.flush(agent.session))throw Error('Created Conversation Session was not durably stored');}
-                catch(error){await handle.dispose().catch(()=>{});throw error;}
+                catch(error){await this.disposeHandle(handle).catch(()=>{});throw error;}
                 this.logger.info(`created new session: key=${key} preset=${agentPreset ?? 'none'}`);
             }
         }
@@ -513,7 +517,7 @@ export class ConversationManager {
             lastActivity: Date.now(),
             agentPreset,
         };
-        if(this.closed){await record.handle.dispose();throw Error('Conversation manager closed during restoration');}
+        if(this.closed){await this.disposeHandle(record.handle);throw Error('Conversation manager closed during restoration');}
         this.sessions.set(key, record);
         return record;
     }
@@ -540,10 +544,10 @@ export class ConversationManager {
         this.modelResolver.setSessionId(key, randomUUID());
         if (!record)
             return;
-        this.adapter.release?.(record);
+        this.releaseRecord(record);
         this.sessions.delete(key);
         record.agent.cancel({ kind: 'user' });
-        await record.handle.dispose().catch(() => { });
+        await this.disposeHandle(record.handle).catch(() => { });
         this.logger.info(`session removed: key=${key}`);
     }
     /**
@@ -600,20 +604,23 @@ export class ConversationManager {
             return { ok: false, reason: 'failed', message };
         }
     }
-    async disposeAll() {
+    disposeAll(){return this.closing??=this.closeAll();}
+    async closeAll() {
         this.closed=true;
-        for(const dispose of this.disposers.splice(0))if(typeof dispose==='function')dispose();
+        for(const dispose of this.disposers.splice(0))if(typeof dispose==='function')try{dispose();}catch(error){this.cleanupErrors.push(error);}
         this.evictor.dispose();
-        for(const record of this.sessions.values())this.adapter.release?.(record);
+        for(const record of this.sessions.values())this.releaseRecord(record);
         await Promise.allSettled([...this.lifecycleLocks.values()]);
         const records = [...this.sessions.values()];
         this.sessions.clear();
         for (const record of records) {
-            this.adapter.release?.(record);
-            record.agent.cancel({ kind: 'user' });
+            this.releaseRecord(record);
+            try{record.agent.cancel({ kind: 'user' });}catch(error){this.cleanupErrors.push(error);}
+            void this.disposeHandle(record.handle).catch(()=>{});
         }
-        await Promise.allSettled(records.map((r) => r.handle.dispose()));
+        await Promise.allSettled([...this.closingHandles.values()]);
         this.logger.info(`all sessions disposed (count=${records.length})`);
+        if(this.cleanupErrors.length)throw new AggregateError([...new Set(this.cleanupErrors)],'Conversation cleanup failed');
     }
     records(){return this.sessions.values();}
     ownershipState(key){if(this.closed)throw Error('Conversation manager disposed');if(this.modelResolver.prefs.loadError)throw Error("Conversation state unreadable");const state=this.modelResolver.prefs.getLifecycle(key);return Object.freeze({sessionId:this.currentSessionId(key),previousSessionId:state?.previousSessionId,generation:state?.generation??0,blocker:state?.blocker??null});}

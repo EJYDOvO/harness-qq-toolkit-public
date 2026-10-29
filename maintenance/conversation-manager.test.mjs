@@ -17,7 +17,7 @@ test('all ordinary preference mutations propagate write failure and retain memor
 });
 test('one Host service owns shared durable preferences and exclusive platform namespaces',async t=>{
  const stateFile=temporary(t),source=fs.readFileSync(new URL('../plugin-sources/dsh-conversation-manager/index.mjs',import.meta.url),'utf8').replace(/^import .*;\r?\n/gm,'').replace('export {ConversationManager};','').replaceAll('export ','');
- class Manager{constructor(ctx,agents,config){this.config=config;}async disposeAll(){}}
+ class Manager{constructor(ctx,agents,config){this.config=config;}async disposeAll(){if(this.config.fail)throw Error('fixture handle cleanup failed');}}
  const apply=vm.runInNewContext(source+';apply;',{ConversationManager:Manager,PrefsStore});let service,cleanup;
  apply({agents:{},logger:{},provide:(_n,s)=>service=s,effect:f=>cleanup=f()},{stateFile});
  const options=ns=>({adapter:{key:(scope,peer)=>ns+':'+JSON.stringify([scope,peer])}});
@@ -28,5 +28,7 @@ test('one Host service owns shared durable preferences and exclusive platform na
  const a=qq.config.adapter.key('direct','same'),b=other.config.adapter.key('direct','same');assert.notEqual(a,b);
  qq.config.preferences.setSessionId(a,'qq-session');other.config.preferences.setSessionId(b,'other-session');
  const reopened=new PrefsStore(undefined,stateFile);assert.equal(reopened.getSessionId(a),'qq-session');assert.equal(reopened.getSessionId(b),'other-session');
- await qq.disposeAll();service.openAdapter('qq',options('qq'));await cleanup();assert.throws(()=>service.openAdapter('third',options('third')),/unavailable/);
+ await qq.disposeAll();service.openAdapter('qq',options('qq'));
+ const failed=service.openAdapter('failure',{...options('failure'),fail:true});await assert.rejects(failed.disposeAll(),/cleanup failed/);assert.throws(()=>service.openAdapter('failure',options('failure')),/unavailable/);
+ await assert.rejects(cleanup(),/cleanup/);assert.throws(()=>service.openAdapter('third',options('third')),/unavailable/);
 });

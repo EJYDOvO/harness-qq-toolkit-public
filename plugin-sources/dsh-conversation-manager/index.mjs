@@ -14,9 +14,9 @@ export function apply(ctx,config){
    const adapter={...options.adapter,key(scope,peer){const value=key(scope,peer);if(typeof value!=='string'||!value.startsWith(namespace+':'))throw Error('Conversation key escaped adapter namespace');return value;}};
    const manager=new ConversationManager(options.context??ctx,ctx.agents,{...options,adapter,preferences},ctx.logger);
    const dispose=manager.disposeAll.bind(manager);let closing;
-   manager.disposeAll=()=>closing??=dispose().finally(()=>{if(adapters.get(namespace)===manager)adapters.delete(namespace);});
+   manager.disposeAll=()=>closing??=dispose().then(()=>{if(adapters.get(namespace)===manager)adapters.delete(namespace);});
    adapters.set(namespace,manager);return manager;
   },
  }));
- ctx.effect(()=>async()=>{closed=true;await Promise.allSettled([...adapters.values()].map(m=>m.disposeAll()));adapters.clear();});
+ ctx.effect(()=>async()=>{closed=true;const results=await Promise.allSettled([...adapters.values()].map(m=>m.disposeAll()));adapters.clear();const errors=results.filter(r=>r.status==='rejected').map(r=>r.reason);if(errors.length)throw new AggregateError(errors,'Conversation service cleanup failed');});
 }
