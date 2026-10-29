@@ -161,6 +161,7 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
     let shutdown;
     ctx.effect(() => async () => { await shutdown?.(); if (gatewayLeases.get(config.appId) === lease) gatewayLeases.delete(config.appId); });
     const manager = new SessionManager(ctx, agents, config, logger);
+    ctx.effect(()=>()=>manager.disposeAll()); // also release the adapter if SDK setup fails
     const deliveryRecorder=createDeliveryRecorder(config.deliveryDiagnostics,logger);
     ctx.effect(()=>()=>deliveryRecorder?.close());
     // ── 初始化 QQ Bot SDK ──

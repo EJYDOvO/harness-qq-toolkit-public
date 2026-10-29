@@ -1,0 +1,21 @@
+{
+  "name": "dsh-conversation-manager",
+  "version": "0.1.0-test.1",
+  "type": "module",
+  "main": "index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./manager": "./manager.mjs",
+    "./preferences": "./preferences.mjs"
+  },
+  "files": [
+    "*.mjs",
+    "LICENSE",
+    "README.md"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=24",
+    "dsh": ">=0.2.1-rc.3"
+  }
+}

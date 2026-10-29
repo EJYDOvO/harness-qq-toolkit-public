@@ -7,27 +7,27 @@ import path from 'node:path';
 import os from 'node:os';
 import vm from 'node:vm';
 import {randomUUID,createHash} from 'node:crypto';
-const source=file=>fs.readFileSync(new URL('./qqbot-src/dist/'+file,import.meta.url),'utf8').replace(/^import .*;\r?\n/gm,'').replace(/export class /g,'class ')+'\n';
+const source=file=>fs.readFileSync(file==='model/prefs-store.js'?new URL('../plugin-sources/dsh-conversation-manager/preferences.mjs',import.meta.url):file==='session/session-manager.js'?new URL('../plugin-sources/dsh-conversation-manager/manager.mjs',import.meta.url):new URL('./qqbot-src/dist/'+file,import.meta.url),'utf8').replace('export class ConversationManager','export class SessionManager').replace(/^import .*;\r?\n/gm,'').replace(/export class /g,'class ')+'\n';
 function factory(home,clock,durable=new Map()){
- const sandbox={...fs,resolve:path.resolve,dirname:path.dirname,homedir:()=>home,process:{pid:process.pid,env:{DSH_HOME:home}},structuredClone};
+ const sandbox={...fs,resolve:path.resolve,isAbsolute:path.isAbsolute,dirname:path.dirname,homedir:()=>home,process:{pid:process.pid,env:{DSH_HOME:home}},structuredClone};
  const Prefs=vm.runInNewContext(source('model/prefs-store.js')+';PrefsStore;',sandbox);
  const live=new Map(),options=[],disposed=[];let creates=0;
  function handle(id,meta={agentPreset:'fixture'}){const agent={id,status:'idle',session:{header:{id,...meta},events:durable.get(id)?.events??[],snapshotEvents(){return this.events;}},inbox:{hasPending:false},cancel(){this.cancelled=true;}};live.set(id,agent);return {agent,async dispose(){disposed.push(id);if(live.get(id)===agent)live.delete(id);}};}
  const agents={get:id=>live.get(id),async create(input){creates++;options.push(input);return handle(input.sessionId,input.meta);},async resume({resumeSessionId}){if(!durable.has(resumeSessionId))throw Object.assign(Error('absent'),{name:'SessionPersistenceNotFoundError'});return handle(resumeSessionId);}};
- class ModelResolver{constructor(_ctx,config){this.prefs=new Prefs();this.config=config;}getEffectiveRoute(k){return this.prefs.getOverride(k)??{provider:'fixture-provider',model:'fixture-model'};}getResumeRoute(k){return this.getEffectiveRoute(k);}getPreset(k){return this.prefs.getPreset(k);}getSessionId(k){return this.prefs.getSessionId(k);}setSessionId(k,v){this.prefs.setSessionId(k,v);}}
+ class ModelResolver{constructor(_ctx,config){this.prefs=new Prefs(undefined,path.join(home,"qqbot","model-prefs.json"));this.config=config;}getEffectiveRoute(k){return this.prefs.getOverride(k)??{provider:'fixture-provider',model:'fixture-model'};}getResumeRoute(k){return this.getEffectiveRoute(k);}getPreset(k){return this.prefs.getPreset(k);}getSessionId(k){return this.prefs.getSessionId(k);}setSessionId(k,v){this.prefs.setSessionId(k,v);}}
  class Clock extends Date{static now(){return clock.now;}}
  const timers=new Set(),IdleEvictor=vm.runInNewContext(source('session/idle-evictor.js')+';IdleEvictor;',{Date:Clock,setInterval:fn=>{timers.add(fn);return fn;},clearInterval:t=>timers.delete(t)});
  const Manager=vm.runInNewContext(source('session/session-manager.js')+';SessionManager;',{ModelResolver,IdleEvictor,SessionId:x=>x,buildForkSeed:(rows,boundary)=>structuredClone(rows.slice(0,boundary+1)),createHash,randomUUID,Date:Clock,structuredClone,process:{cwd:()=>home}});
- let reminders=[];const ctx={on(){},get(name){if(name==='agentPresets')return {async resolve(id){if(id==='broken')throw Error('broken preset');return {id:id??'fixture'};},async mount(){}};if(name==='sessionPersistence')return {async open(id,access){assert.equal(access,'read');if(!durable.has(id))throw Object.assign(Error('absent'),{name:'SessionPersistenceNotFoundError'});return {header:durable.get(id).meta,read:async()=>({events:durable.get(id).events}),close:async()=>{}};}};if(name==='schedule')return {async list(){return reminders;}};if(name==='sessions')return {async flush(session){durable.set(session.header.id,{meta:{agentPreset:session.header.agentPreset},events:structuredClone(session.events)});return true;}};}};
- const config={appId:'fixture-app',preset:'fixture',cwd:home,sessionIdleTimeout:1,sessionLifecycle:{enabled:true,freshOnHostRestart:true,inactivityMs:43200000}},manager=new Manager(ctx,agents,config,{info(){},warn(){},debug(){}});
+ const events=new Map();let reminders=[];const ctx={on(n,fn){events.set(n,fn);return()=>events.delete(n);},get(name){if(name==='agentPresets')return {async resolve(id){if(id==='broken')throw Error('broken preset');return {id:id??'fixture'};},async mount(){}};if(name==='sessionPersistence')return {async open(id,access){assert.equal(access,'read');if(!durable.has(id))throw Object.assign(Error('absent'),{name:'SessionPersistenceNotFoundError'});return {header:durable.get(id).meta,read:async()=>({events:durable.get(id).events}),close:async()=>{}};}};if(name==='schedule')return {async list(){return reminders;}};if(name==='sessions')return {async flush(session){durable.set(session.header.id,{meta:{agentPreset:session.header.agentPreset},events:structuredClone(session.events)});return true;}};}};
+ const config={appId:'fixture-app',preset:'fixture',cwd:home,sessionIdleTimeout:1,sessionLifecycle:{enabled:true,freshOnHostRestart:true,inactivityMs:43200000}};let manager;config.adapter={key:(scope,peer)=>'qqbot:'+config.appId+':'+scope+':'+peer,lifecycleScope:scope=>scope==='c2c',acceptActivity:(scope,peer,sender,id)=>peer===sender,isUserInput:t=>!!t?.msgId,inputId:t=>t?.msgId,waitingForUser:r=>!!(manager.questionChannel?.pending.has(r.sessionKey)||manager.approvalChannel?.pending.has(r.sessionKey))};manager=new Manager(ctx,agents,config,{info(){},warn(){},debug(){}});
  const get=id=>manager.getOrCreate('c2c','owner','owner',{scope:'c2c',targetId:'owner',msgId:id});
- return {manager,get,config,live,durable,options,disposed,creates:()=>creates,setReminders:rows=>reminders=rows};
+ return {manager,get,config,events,live,durable,options,disposed,creates:()=>creates,setReminders:rows=>reminders=rows};
 }
 const fixture=()=>{const home=fs.mkdtempSync(path.join(os.tmpdir(),'qq-lifecycle-')),clock={now:Date.now()},f=factory(home,clock);return {...f,home,clock};};
 test('current-session contract rejects spoofed records, superseded routes, replaced Agents and disposal',async()=>{
  const f=fixture(),old=await f.get('first');assert(f.manager.isCurrentSession(old));assert.equal(f.manager.isCurrentSession({...old}),false);
  f.clock.now+=43200001;const next=await f.get('rotate');assert.notEqual(next.sessionId,old.sessionId);assert.equal(f.manager.isCurrentSession(old),false);assert(f.manager.isCurrentSession(next));
- f.live.set(next.sessionId,{...next.agent});assert.equal(f.manager.isCurrentSession(next),false);f.live.set(next.sessionId,next.agent);await f.manager.disposeAll();assert.equal(f.manager.isCurrentSession(next),false);
+ f.live.set(next.sessionId,{...next.agent});assert.equal(f.manager.isCurrentSession(next),false);f.live.set(next.sessionId,next.agent);await f.manager.disposeAll();assert.equal(f.manager.isCurrentSession(next),false);assert.throws(()=>f.manager.ownershipState(next.sessionKey),/disposed/);
 });
 test('model switch publishes Session and preference atomically; failure preserves the old main and disposes the unbound candidate',async()=>{
  const f=fixture(),old=await f.get('first'),id=old.sessionId,key=old.sessionKey,prefs=f.manager.modelResolver.prefs,original=prefs.persist.bind(prefs);
@@ -35,6 +35,12 @@ test('model switch publishes Session and preference atomically; failure preserve
  assert.equal(f.manager.currentSessionId(key),id);assert.equal(prefs.getOverride(key),undefined);assert(f.manager.isCurrentSession(old));assert(!f.disposed.includes(id));assert.equal(f.disposed.length,1);
  prefs.persist=original;await f.manager.setModelOverride('c2c','owner',{provider:'selected',model:'next'});assert.notEqual(old.sessionId,id);assert(f.manager.isCurrentSession(old));assert(f.disposed.includes(id));
  const disk=JSON.parse(fs.readFileSync(prefs.prefsPath));assert.equal(disk.sessionIds[key],old.sessionId);assert.equal(disk.overrides[key].model,'next');await f.manager.disposeAll();
+});
+test('model switch respects the started Preset and refuses unfinished interaction',async()=>{
+ const f=fixture(),record=await f.get('first');record.agent.status='running';
+ await assert.rejects(()=>f.manager.setModelOverride('c2c','owner',{provider:'p',model:'m'}),/unfinished/);assert(!record.agent.cancelled);assert.equal(f.disposed.length,0);
+ record.agent.status='idle';f.manager.modelResolver.prefs.setPreset(record.sessionKey,'broken');
+ await f.manager.setModelOverride('c2c','owner',{provider:'p',model:'m'});assert.equal(record.agentPreset,'fixture');assert.equal(f.manager.modelResolver.prefs.getPreset(record.sessionKey),'broken');await f.manager.disposeAll();
 });
 test('opt-in restart rotation creates a blank root, preserves model/preset preferences and survives HMR in one process',async()=>{
  const f=fixture(),first=await f.get('first'),key=first.sessionKey,prefs=f.manager.modelResolver.prefs;
@@ -106,4 +112,35 @@ test('Remote Ops startup restore cannot rotate, refresh user inactivity or consu
  first.agent.status='running';await next.get('busy-real-input');first.agent.status='idle';const pending=JSON.stringify(next.manager.modelResolver.prefs.getLifecycle(old.sessionKey));
  assert.equal((await restore()).sessionId,first.sessionId);assert.equal(JSON.stringify(next.manager.modelResolver.prefs.getLifecycle(old.sessionKey)),pending);
  assert.notEqual((await next.get('next-real-input')).sessionId,first.sessionId);await next.manager.disposeAll();
+});
+test('restore I/O and corrupt history never become create; failed fresh persistence never publishes a record',async()=>{
+ for(const name of ['SessionPersistenceCorruptionError','Error']){
+  const f=fixture();f.config.sessionLifecycle.enabled=false;f.manager.agents.resume=async()=>{throw Object.assign(Error('fixture read failure'),{name});};
+  await assert.rejects(f.get('read-failure'),/read failure/);assert.equal(f.creates(),0);assert.equal(f.manager.size,0);await f.manager.disposeAll();
+ }
+ const f=fixture();f.config.sessionLifecycle.enabled=false;const get=f.manager.ctx.get;
+ f.manager.ctx.get=n=>n==='sessions'?{flush:async()=>false}:get(n);
+ await assert.rejects(f.get('flush-failure'),/durably stored/);assert.equal(f.manager.size,0);assert.equal(f.disposed.length,1);await f.manager.disposeAll();
+});
+test('adapter resources release on model change, rotation, reset, eviction, external disposal and unload',async()=>{
+ for(const action of ['model','rotation','reset','eviction','external','unload']){
+  const f=fixture(),record=await f.get('first');let releases=0;record.typingKeepAlive=true;
+  f.config.adapter.release=r=>{if(r.typingKeepAlive){r.typingKeepAlive=false;releases++;}};
+  if(action==='model')await f.manager.setModelOverride('c2c','owner',{provider:'p',model:'m'});
+  if(action==='rotation'){f.clock.now+=43200001;await f.get('next');}
+  if(action==='reset')await f.manager.remove('c2c','owner');
+  if(action==='eviction'){record.lastActivity=0;f.manager.evictor.check();}
+  if(action==='external'){f.events.get('agent/disposed')({agent:record.agent});assert.equal(f.manager.size,0);}
+  if(action==='unload')await f.manager.disposeAll();
+  assert.equal(releases,1,action);await f.manager.disposeAll();assert.equal(f.events.size,0);
+ }
+});
+test('clearing a model preference preserves current ownership and disposal clears typing before a blocked flush',async()=>{
+ const f=fixture(),old=await f.get('first'),key=old.sessionKey;
+ f.manager.modelResolver.clearOverride=k=>f.manager.modelResolver.prefs.clearOverride(k);
+ f.manager.modelResolver.prefs.setOverride(key,{provider:'p',model:'m'});await f.manager.clearModelOverride('c2c','owner');assert.equal(f.manager.currentSessionId(key),old.sessionId);assert(f.manager.isCurrentSession(old));
+ f.clock.now+=43200001;const get=f.manager.ctx.get;let release,started;const entered=new Promise(r=>started=r);
+ f.manager.ctx.get=n=>n==='sessions'?{async flush(){started();await new Promise(r=>release=r);return true;}}:get(n);
+ old.typingKeepAlive=true;f.config.adapter.release=r=>r.typingKeepAlive=false;
+ const pending=f.get('next');await entered;const closing=f.manager.disposeAll();assert.equal(old.typingKeepAlive,false);release();await assert.rejects(pending,/closed during rotation/);await closing;
 });

@@ -60,10 +60,12 @@ export async function handleInbound(ctx, manager, config, logger) {
         clearGroupHistory(config.appId, msg.groupOpenid ?? msg.senderId);
     }
     if(interactive){
+        record.typingTarget={...replyTarget};
         // The typing middleware stops refreshing when this chain returns; keep one
         // refresh per Session alive until the Agent is idle again.
         if(scope==='c2c'&&!record.typingKeepAlive&&typeof bot?.sendTyping==='function'){
-            const timer=setInterval(()=>{bot.sendTyping(replyTarget,60).catch(()=>{});},50_000);
+            const timer=setInterval(()=>{bot.sendTyping(record.typingTarget??replyTarget,60).catch(()=>{});},50_000);
+            timer.unref?.();
             record.typingKeepAlive=timer;
             record.agent.whenIdle().catch(()=>{}).finally(()=>{clearInterval(timer);if(record.typingKeepAlive===timer)record.typingKeepAlive=undefined;});
         }

@@ -1,17 +1,18 @@
 import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import path from 'node:path';
 import {apply} from '../plugin-sources/dsh-remote-ops/index.js';
-import {PrefsStore} from './qqbot-src/dist/model/prefs-store.js';
+import {PrefsStore} from '../plugin-sources/dsh-conversation-manager/preferences.mjs';
 
-test('explicit DSH homes isolate QQ preferences for the same application and peer',t=>{
+test('explicit Host state paths isolate preferences for the same application and peer',t=>{
  const old=process.env.DSH_HOME,root=fs.mkdtempSync(path.resolve('tmp/qq-home-isolation-'));t.after(()=>{if(old===undefined)delete process.env.DSH_HOME;else process.env.DSH_HOME=old;});
- process.env.DSH_HOME=path.join(root,'a');const a=new PrefsStore(()=>{});a.setPreset('same-app-owner','project-a');
- process.env.DSH_HOME=path.join(root,'b');const b=new PrefsStore(()=>{});assert.equal(b.getPreset('same-app-owner'),undefined);
- process.env.DSH_HOME=path.join(root,'a');assert.equal(new PrefsStore(()=>{}).getPreset('same-app-owner'),'project-a');
+ const fileA=path.join(root,'a','conversations.json'),fileB=path.join(root,'b','conversations.json');
+ const a=new PrefsStore(()=>{},fileA);a.setPreset('same-app-owner','project-a');
+ const b=new PrefsStore(()=>{},fileB);assert.equal(b.getPreset('same-app-owner'),undefined);
+ assert.equal(new PrefsStore(()=>{},fileA).getPreset('same-app-owner'),'project-a');
 });
 
 test('QQ bridge declares real service names supported by bundled Cordis',()=>{
  const source=fs.readFileSync(new URL('./qqbot-src/dist/index.js',import.meta.url),'utf8');
- assert.match(source,/export const inject = \['agents'\]/);
+ assert.match(source,/export const inject = \['agents', 'conversationManager'\]/);
  assert.doesNotMatch(source,/inject\s*=\s*\{\s*required:/);
 });
 
