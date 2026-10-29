@@ -2,7 +2,7 @@
 
 独立、平台无关的 Host 插件。维护 Conversation → 原生 Session 的唯一当前路由、模型/Preset 偏好、并发、恢复和可选空白轮换。QQ、Identity、Memory、Remote Ops 均不是本插件依赖。
 
-开发版本 `0.1.0-test.1`；本轮只在 DSH `0.2.1-rc.3` 隔离 Host 验证，未部署。使用原生 `agents.create/resume`、`sessions.flush`、`sessionPersistence.open`、`agentPresets.resolve/mount`、Schedule；不实现第二套运行时、调度器或数据库。
+开发版本 `0.1.0-test.1`；已在 DSH `0.2.1-rc.3` 隔离 Host 验证，并随 Character test.21 在现有 Windows 实例授权部署；其他平台和手机收件未验收。使用原生 `agents.create/resume`、`sessions.flush`、`sessionPersistence.open`、`agentPresets.resolve/mount`、Schedule；不实现第二套运行时、调度器或数据库。
 
 ## 安装与装配
 
@@ -68,9 +68,9 @@ ctx.effect(() => () => manager.disposeAll());
 
 上线前先停机一致备份并清点旧偏好、原生 Sessions/Schedule/storageDomain、Memory、Identity binding/coordination 和通知账本。可显式选择原偏好文件，或将其完整复制到新 `stateFile`；保留原件，不合并两个写入器，不删除旧根或重建有提醒的路由。损坏/归属不明的记录需要人工审查，不自动授权。
 
-Character 候选准备要求已验证的独立包 pin/哈希、有效状态文件，以及首次切换的 `--conversation-state-reviewed`；缺失时阻断。此轮未读取或迁移生产偏好，没有执行切换。
+Character 候选准备要求已验证的独立包 pin/哈希、有效状态文件，以及首次切换的 `--conversation-state-reviewed`；缺失时阻断。本机首次切换已在授权后完成一致性备份、旧路由/提醒审查与精确复制；其他实例仍须独立执行门禁。部署证据只留本机。
 
-回滚必须成套恢复 QQ 补丁、Character Identity/Core 和 Profile/锁文件。保留切换后新增 Session、Memory、任务/通知记录及当前路由；若新路由已有变化，不可直接用旧 prefs 快照覆盖。需先离线核对，再决定将当前 JSON 保留在旧路径或暂停入口。此轮未做生产迁移/回滚演练。
+回滚必须成套恢复 QQ 补丁、Character Identity/Core 和 Profile/锁文件。保留切换后新增 Session、Memory、任务/通知记录及当前路由；若新路由已有变化，不可直接用旧 prefs 快照覆盖。需先离线核对，再决定将当前 JSON 保留在旧路径或暂停入口。本轮精确复制了旧路由文件，未做 Memory Schema 迁移或生产故障注入/回滚演练。
 
 ## 来源与验证边界
 

@@ -1,6 +1,6 @@
 # QQTK 通用安装与依赖
 
-当前源码为 Conversation Manager 抽离候选，**未部署**，仅 rc.3 隔离验证。旧部署记录不代表最新源码已经上线。路由接口、安装与恢复前置见 [独立插件说明](../plugin-sources/dsh-conversation-manager/README.md)。
+当前源码已完成 Conversation Manager 抽离，并随 Character test.21 在现有 rc.3 实例授权部署。普通 QQ 新装、NapCat 与手机验收仍待独立完成；历史版本记录不证明这些组合。路由接口、安装与恢复前置见 [独立插件说明](../plugin-sources/dsh-conversation-manager/README.md)。
 
 QQTK 继续是独立插件与维护组件集合，不迁入 Character 仓库、不合并单体。Character 通过固定版本的 QQTK 接口和补丁使用它。
 
@@ -79,7 +79,7 @@ overrides:
 原 templates/profile 是旧安装快照；新项目优先使用本文件的最小装配，不直接复制旧绝对路径/可选插件清单。更新配置与状态目录时先备份；不要删除通知账本来“重试”不确定投递。
 # Interaction 可选接入
 
-开发候选可对接 Agent 层 Interaction 服务，详见 [接口与验证边界](INTERACTION.md)。QQ 基础接入仍不依赖它，不增加 Gateway、数据库或额外模型。安装包、在 Preset 中声明并隔离服务、应用 QQ 补丁和部署是不同步骤；部署状态见 README；是否实际启用由各实例配置决定。
+QQ 可对接 Agent 层 Interaction 服务，详见 [接口与验证边界](INTERACTION.md)。QQ 基础接入仍不依赖它，不增加 Gateway、数据库或额外模型。安装包、在 Preset 中声明并隔离服务、应用 QQ 补丁和部署是不同步骤；部署状态见 README；是否实际启用由各实例配置决定。
 
 ## 可选主 Session 生命周期
 
