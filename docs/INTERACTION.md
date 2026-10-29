@@ -28,6 +28,7 @@ gateway/bootstrap.js 用原生 agentPresets.serviceFor 获取当前 Agent 的策
 - 由于入站链路提前结束，SDK typing 中间件不再续期；桥接层改为每个会话一个 50 秒间隔的 typing 保活，Agent 空闲即停止。
 - 未安装 Interaction 或旧版 policy 没有 `intervene` 时，保留原有“等待整轮结束”的串行行为。显式“更正：”中间件保持在合并之前。
 - 诊断新增 `intervene` 事件的枚举字段：decision（revise/priority/supplement/append/dropped）、phase（text/tool/waiting-user）、why（judge/timeout/error/invalid/explicit/none），不记录消息内容。
+- Interaction test.8 配套：`why` 增加 superseded；新增 `draft`（ready/late/failed/rejected/none，等待提示用了动态句还是固定文案及原因）和数字字段 `elapsedMs`（起草或判断耗时）。仍只记录枚举和数字，不含文本。
 
 ## 可选脱敏诊断
 

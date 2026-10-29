@@ -63,3 +63,12 @@ test('interjection decisions are recorded as closed enums only',async t=>{
  const rows=(await fs.readFile(resolve(dir,'delivery.jsonl'),'utf8')).trim().split('\n').map(JSON.parse);
  assert.deepEqual(rows.map(r=>[r.decision,r.phase,r.why]),[['priority','text','judge'],[undefined,undefined,undefined]]);
 });
+test('hang-on draft outcome, superseded judgement and elapsed time are closed enums or numbers',async t=>{
+ await fs.mkdir('tmp',{recursive:true});const dir=await fs.mkdtemp(resolve('tmp','qq-delivery-draft-'));t.after(()=>fs.rm(dir,{recursive:true,force:true}));
+ const recorder=create(true,{},dir);
+ recorder.trace('hang-on-draft',{draft:'ready',elapsedMs:1834});recorder.trace('hang-on',{draft:'late',dynamic:false});
+ recorder.trace('intervene',{decision:'revise',phase:'text',why:'superseded',elapsedMs:912});
+ recorder.trace('hang-on-draft',{draft:'嗯，稍等',elapsedMs:'1834'});await recorder.close();
+ const rows=(await fs.readFile(resolve(dir,'delivery.jsonl'),'utf8')).trim().split('\n').map(JSON.parse);
+ assert.deepEqual(rows.map(r=>[r.event,r.draft,r.elapsedMs,r.why]),[['hang-on-draft','ready',1834,undefined],['hang-on','late',undefined,undefined],['intervene',undefined,912,'superseded'],['hang-on-draft',undefined,undefined,undefined]]);
+});

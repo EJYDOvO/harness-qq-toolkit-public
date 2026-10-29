@@ -42,12 +42,12 @@ export function createDeliveryRecorder(enabled, logger, directory) {
     const trace=(event,fields={})=>{
         if(closed||pending.length>=512||!/^[-a-z]+$/.test(event))return;
         const row={time:Date.now(),boot,event};
-        for(const k of ['turn','reply','bubble','seq','length','index','msgSeq','state','retry','httpStatus','bizCode'])if(Number.isFinite(fields[k]))row[k]=fields[k];
+        for(const k of ['turn','reply','bubble','seq','length','index','msgSeq','state','retry','httpStatus','bizCode','elapsedMs'])if(Number.isFinite(fields[k]))row[k]=fields[k];
         for(const k of ['session','input','stream','receipt','association','textHash','attempt'])if(typeof fields[k]==='string'&&/^[a-f0-9]{24}$/.test(fields[k]))row[k]=fields[k];
         for(const k of ['passive','associated','missingReceipt','dynamic'])if(typeof fields[k]==='boolean')row[k]=fields[k];
         // Separates status receipts from natural-reply receipts; never text.
         if(['assistant','status','tool-or-error'].includes(fields.kind))row.kind=fields.kind;
-        for(const [k,values] of [['decision',['revise','priority','supplement','append','dropped']],['phase',['text','tool','waiting-user']],['why',['judge','timeout','error','invalid','explicit','none']]])if(values.includes(fields[k]))row[k]=fields[k];
+        for(const [k,values] of [['decision',['revise','priority','supplement','append','dropped']],['phase',['text','tool','waiting-user']],['why',['judge','timeout','error','invalid','explicit','none','superseded']],['draft',['ready','late','failed','rejected','none']]])if(values.includes(fields[k]))row[k]=fields[k];
         if(typeof fields.source==='string')row.source=['subagent-settled','schedule','web'].includes(fields.source)?fields.source:'other';
         pending.push(JSON.stringify(row)+'\n');
         if(!timer){timer=setTimeout(flush,100);timer.unref?.();}
