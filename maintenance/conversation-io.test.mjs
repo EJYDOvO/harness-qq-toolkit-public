@@ -177,14 +177,48 @@ test('admission: refused peers, failing checks, Owner-only wrappers and forged e
  await h.manager.disposeAll();
 });
 
+test('access revoked while the Session is obtained: no native input, a clear refusal, and the same dedup as an up-front refusal',async t=>{
+ // The real Manager lock holds getOrCreate; the platform revokes access meanwhile.
+ const h=host(t),seen=[],p=platform(createAgentIO(),h.manager,{onInput:(_r,m)=>seen.push(m.id)});
+ await h.manager.getOrCreate('dm','u1','u1',{peer:'u1'});const record=current(h.manager,'dm','u1');
+ const gate=deferred(),held=h.manager.inConversation('chat-a:acct:'+JSON.stringify(['dm','u1']),()=>gate.promise);
+ const before=inputs,pending=p.receive('u1','revoke','撤权中');await tick();
+ p.access.delete('u1');gate.resolve();await held;
+ assert.deepEqual({...await pending},{status:'rejected',reason:'unauthorized'});
+ assert.equal(inputs,before,'no native UserMessage was created');assert.deepEqual(seen,[]);assert.deepEqual(texts(record),[]);
+ assert.equal((await p.receive('u1','revoke','撤权中')).status,'duplicate','settled like a refusal before the lookup');
+ // A controllable getOrCreate: the (new) Session resolves only after the revocation.
+ const k=host(t),entry=Object.create(k.manager),lookup=deferred();
+ entry.getOrCreate=async(...a)=>{const r=await k.manager.getOrCreate(...a);await lookup.promise;return r;};
+ const q=platform(createAgentIO(),entry),racing=q.conversation.handoff({platform:'chat-a',accountId:'acct',conversation:{type:'direct',id:'u2'},sender:{id:'u2'},message:{id:'n',text:'新会话'}},{replyTarget:{peer:'u2',input:'n'},content:'新会话'});
+ await tick();q.access.delete('u2');lookup.resolve();
+ assert.deepEqual({...await racing},{status:'rejected',reason:'unauthorized'});assert.equal(inputs,before);
+ const fresh=current(k.manager,'dm','u2');assert.deepEqual(texts(fresh),[],'the Session exists, but holds no input');
+ // A correction submitted after the revocation is refused the same way.
+ assert.deepEqual({...q.conversation.submit(fresh,'更正')},{status:'rejected',reason:'unauthorized'});assert.equal(inputs,before);
+ q.access.add('u2');assert.equal((await q.receive('u2','again','恢复后')).status,'accepted');assert.deepEqual(texts(fresh),['恢复后']);
+ await h.manager.disposeAll();await k.manager.disposeAll();
+});
+
 test('the adapter check runs after the shared route and its reason stays a code',async t=>{
  const h=host(t),io=createAgentIO(),sent=[];let verdict={ok:true};
  const conversation=createConversations(io,{createInput:nativeInput,interactionPolicy:()=>undefined})({platform:'chat-c',adapter:'c',accountId:'acct',manager:h.manager,scopes:{direct:'dm'},admits:()=>true});
- conversation.registerAdapter({split:t=>[t],check:(record,to)=>{assert.equal(record.peerId,to.conversation.id);return verdict;},async send(route,text){sent.push(text);return {};}});
+ conversation.registerAdapter({split:t=>[t],check:(record,to)=>{assert.equal(record.peerId,to.conversation.id);return typeof verdict==='function'?verdict():verdict;},async send(route,text){sent.push(text);return {};}});
  const record=await h.manager.getOrCreate('dm','u1','u1',{peer:'u1'});const send=()=>io.sendMessage({target:conversation.target(record),origin:{sessionId:record.sessionId},message:{text:'x'}});
  assert.equal((await send()).status,'sent');
  for(const [value,reason] of [[{ok:false,reason:'no-reply-target'},'no-reply-target'],[{ok:false,reason:'Free text with spaces'},'invalid-target'],[{ok:false},'invalid-target']]){verdict=value;assert.equal((await send()).reason,reason);}
- assert.equal(sent.length,1);
+ // Only an explicit {ok:true} sends: no answer, a malformed one or an exception is refused before the Sender.
+ for(const value of [undefined,null,{},true,1,'ok',{ok:'true'},{ok:1},{reason:'no-reply-target'},Promise.resolve({ok:true})]){
+  verdict=value;const r=await send();assert.equal(r.status,'not-sent',String(value));assert.equal(r.stage,'before-platform');assert.equal(r.reason,value?.reason??'invalid-target');
+ }
+ verdict=()=>{throw Error('reply target unreadable');};assert.equal((await send()).reason,'adapter-error');
+ assert.equal(sent.length,1,'the Sender saw only the first, approved message');
+ // Before every part: a check that stops answering mid-reply keeps the rest unsent.
+ const multiIO=createAgentIO(),parts=[];let calls=0;
+ const multi=createConversations(multiIO,{createInput:nativeInput,interactionPolicy:()=>undefined})({platform:'chat-d',adapter:'d',accountId:'acct',manager:h.manager,scopes:{direct:'dm'},admits:()=>true});
+ multi.registerAdapter({split:t=>t.split('|'),check:()=>++calls===1?{ok:true}:undefined,async send(_route,text){parts.push(text);return {};}});
+ const r=await multiIO.sendMessage({target:multi.target(record),origin:{sessionId:record.sessionId},message:{text:'一|二|三'}});
+ assert.equal(r.status,'partial');assert.equal(r.reason,'invalid-target');assert.deepEqual(parts,['一']);
  assert.throws(()=>conversation.registerAdapter({split:t=>[t],send(){}}),/already registered/);
  await h.manager.disposeAll();
 });
@@ -199,7 +233,7 @@ test('duplicate deliveries through the wiring create one input, also concurrentl
  await h.manager.disposeAll();
 });
 
-test('Interaction: input during a run is an intervention, an idle Agent gets a followup, revisions need a policy, a failed lookup falls back',async t=>{
+test('Interaction: input during a run is an intervention, an idle Agent gets a followup, revisions need a policy, a failed lookup withholds',async t=>{
  const h=host(t),calls=[],seen=[];let policy;
  const p=platform(createAgentIO(),h.manager,{policy:agent=>{if(policy==='throw')throw Error('scope unavailable');assert.equal(typeof agent.followup,'function');return policy;},onInput:(record,message,pol)=>seen.push([message.id,!!pol])});
  policy={intervene:m=>calls.push(['intervene',m.content[0].text]),admitInput:m=>calls.push(['admit',m.id]),revise:m=>calls.push(['revise',m.content[0].text])};
@@ -214,8 +248,20 @@ test('Interaction: input during a run is an intervention, an idle Agent gets a f
  policy=undefined;record.agent.status='running';
  assert.deepEqual({...p.conversation.submit(record,'更正',{revise:true})},{status:'not-delivered',reason:'no-interaction'});
  assert.equal(p.conversation.submit(record,'无策略').mode,'followup');
- policy='throw';assert.equal(p.conversation.policy(record),null,'a failed lookup is reported as such');
- const fallback=p.conversation.submit(record,'查不到策略');assert.equal(fallback.mode,'followup');assert.equal(fallback.interactive,false);assert.deepEqual(seen.at(-1),[fallback.message.id,false]);
+  policy='throw';assert.equal(p.conversation.policy(record),null,'a failed lookup is reported as such');
+ // A failed lookup is not "no Interaction": no native input, no followup, a recognisable failure.
+ const before=inputs,seenBefore=seen.length,textsBefore=texts(record),callsBefore=calls.length;
+ for(const status of ['running','idle']){
+  record.agent.status=status;
+  assert.deepEqual({...p.conversation.submit(record,'查不到策略')},{status:'not-delivered',reason:'interaction-unavailable'});
+  assert.deepEqual({...p.conversation.submit(record,'更正',{revise:true})},{status:'not-delivered',reason:'interaction-unavailable'});
+ }
+ assert.deepEqual({...await p.receive('u1','lookup','查不到策略')},{status:'failed',stage:'before-handoff',reason:'interaction-unavailable'});
+ assert.equal(inputs,before,'no native UserMessage was created');assert.equal(seen.length,seenBefore);assert.deepEqual(texts(record),textsBefore);
+ assert.equal(calls.length,callsBefore,'the policy admitted nothing new');
+ // Nothing was handed over, so the platform's re-delivery of the same message is processed once the lookup works.
+ policy=undefined;assert.equal((await p.receive('u1','lookup','查不到策略')).status,'accepted');assert.deepEqual(texts(record),[...textsBefore,'查不到策略']);
+ assert.equal((await p.receive('u1','lookup','查不到策略')).status,'duplicate');
  // A record that is no longer current is never written to.
  await h.manager.remove('dm','u1');assert.equal(p.conversation.submit(record,'迟到').reason,'session-changed');
  await h.manager.disposeAll();

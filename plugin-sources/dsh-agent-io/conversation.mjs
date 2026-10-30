@@ -34,8 +34,8 @@ export function createConversations(io,host){
   let inbound,release,closed=false;
 
   const allowed=(scope,peer)=>{try{return admits(scope,peer)===true;}catch{return false;}};
-  // undefined: no Interaction for this Agent. null: the lookup failed, which the
-  // caller treats as "withhold" rather than "no policy".
+  // undefined: no Interaction for this Agent. null: the lookup failed; callers
+  // withhold (no input, no Interaction output) rather than act as "no policy".
   function policy(record){
    if(!record?.agent)return undefined;
    try{return host.interactionPolicy(record.agent)??undefined;}catch{return null;}
@@ -51,10 +51,16 @@ export function createConversations(io,host){
 
   // Native input for a current record. Interaction, when enabled for the Agent,
   // receives input during a run (and explicit revisions); otherwise followup.
+  // Ownership and admission are read here, after every await of the caller, so
+  // access revoked while a Session was obtained creates no input.
   function submit(record,content,{revise=false}={}){
    if(!current(record))return {status:'not-delivered',reason:'session-changed'};
+   if(!types.has(record.scope)||!allowed(record.scope,record.peerId))return {status:'rejected',reason:'unauthorized'};
    if(typeof content!=='string'||!content)return {status:'rejected',reason:'empty-message'};
    const p=policy(record),interactive=!!p&&typeof p.intervene==='function';
+   // A failed lookup is not a plain Agent: no input is created, and the I/O lets
+   // the platform re-deliver the message.
+   if(p===null)return {status:'not-delivered',reason:'interaction-unavailable'};
    if(revise&&typeof p?.revise!=='function')return {status:'not-delivered',reason:'no-interaction'};
    const message=host.createInput({content:[{type:'text',text:content}],source:{kind:'user'}});
    onInput?.(record,message,p||undefined);
@@ -87,9 +93,10 @@ export function createConversations(io,host){
    let record;
    try{record=await manager.getOrCreate(scope,peer,standard.sender.id,replyTarget);}
    catch(error){return {status:'not-delivered',reason:'session-unavailable',error};}
-   // getOrCreate re-checks after each of its awaits, but disposal or rotation can
-   // still land before this continuation runs: never hand input to a Session that
-   // is no longer current, nor to a record of another Conversation.
+   // getOrCreate re-checks after each of its awaits, but disposal, rotation or a
+   // revocation can still land before this continuation runs: never hand input to
+   // a Session that is no longer current, nor to a record of another Conversation;
+   // submit() re-reads admission.
    if(record?.scope!==scope||record.peerId!==peer)return {status:'not-delivered',reason:'session-changed'};
    return submit(record,body);
   }
@@ -124,7 +131,9 @@ export function createConversations(io,host){
   /**
    * The account's outbound adapter. The route check above runs first; the
    * adapter's own check(record, target) adds protocol conditions (e.g. a usable
-   * reply target). send(route, text, info) receives route.record.
+   * reply target); only an explicit {ok:true} lets a part go out, anything else
+   * (no answer, a malformed one, an exception) refuses it before send.
+   * send(route, text, info) receives route.record.
    */
   function registerAdapter(parts){
    if(closed)throw Error('Conversation closed');
@@ -134,7 +143,10 @@ export function createConversations(io,host){
     platform,accountId,split:parts?.split,send:parts?.send,classify:parts?.classify,
     resolve(to,origin){
      const r=route(to,origin);if(!r.ok)return r;
-     if(check){const c=check(r.record,to);if(c&&c.ok!==true)return {ok:false,reason:typeof c.reason==='string'&&CODE.test(c.reason)?c.reason:'invalid-target'};}
+     if(check){
+      let c;try{c=check(r.record,to);}catch{return {ok:false,reason:'adapter-error'};}
+      if(c?.ok!==true)return {ok:false,reason:typeof c?.reason==='string'&&CODE.test(c.reason)?c.reason:'invalid-target'};
+     }
      return {ok:true,route:{record:r.record}};
     },
    });

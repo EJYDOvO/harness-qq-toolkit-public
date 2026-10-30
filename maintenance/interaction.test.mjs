@@ -53,7 +53,7 @@ test('native Host context does not stop QQ output, and cannot clear background s
 function middleware(enabled=true){
  const source=fs.readFileSync(new URL('middleware-setup.js',base),'utf8').replace(/^import .*;\r?\n/gm,'').replace('export function setupMiddlewares','function setupMiddlewares');
  const chain=[],events=[],agent={status:'running'},policy={revise:m=>events.push(['revise',m]),stopOutput:()=>events.push(['stop-output'])};
- const record={agent},manager={getOrCreate:async()=>record,getSessionRecord:()=>record,isCurrentSession:r=>r===record};
+ const record={agent,scope:'c2c',peerId:'owner'},manager={getOrCreate:async()=>record,getSessionRecord:()=>record,isCurrentSession:r=>r===record};
  // enabled==='throw': a reloading policy service that cannot resolve this Agent.
  const conversation=wiring(createAgentIO(),manager,()=>{if(enabled==='throw')throw Error('Agent outside Interaction scope');return enabled?policy:undefined;});
  const sandbox={buildCommandList:()=>[{name:'stop',handler:()=>events.push(['native-stop'])}],
