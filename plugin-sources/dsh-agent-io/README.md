@@ -1,8 +1,8 @@
 # DSH Agent I/O（Unified Agent I/O）
 
-独立、平台无关的 Host 插件，提供统一聊天出站接口 `sendMessage()`。当前源码 `0.1.0-test.2` 是架构路线的 **Iteration 01：普通文本出站**（见 Character 仓库 `docs/architecture-planning/IMPLEMENTATION_ROADMAP.md` 3.1）。**未部署**；实例版本以仓库根 README 为准。验证基线为 DSH `0.2.1-rc.3`、Node 24。
+独立、平台无关的 Host 插件，提供统一聊天出站接口 `sendMessage()` 与入站通道 `openInbound()`。当前源码 `0.1.0-test.3`：架构路线的 **Iteration 01：普通文本出站**（已合并）与 **Iteration 02：普通聊天入站**（本分支，见 Character 仓库 `docs/architecture-planning/IMPLEMENTATION_ROADMAP.md`）。**未部署**；实例版本以仓库根 README 为准。验证基线为 DSH `0.2.1-rc.3`、Node 24。
 
-它只做逻辑消息的交接与发送语义：校验、同 Conversation 串行、取消与分片间复核、同一逻辑消息去重、诚实的结果。平台协议（回复目标、限额、分片、API 错误）由各平台 Adapter 负责；Session 与路由仍由原生 DSH 和 [Conversation Manager](../dsh-conversation-manager/README.md) 负责。不依赖 QQ SDK、Character 或 Interaction；不注册模型工具、RPC 或路由；不持久化任何状态。
+它只做逻辑消息的交接语义：出站的校验、同 Conversation 串行、取消与分片间复核、同一逻辑消息去重、诚实的结果；入站的标准消息交接、按平台消息范围去重与交接结果。平台协议（回复目标、限额、分片、API 错误、事件解析与标准化）由各平台 Adapter 负责；准入与权限仍属 Host；Session 与路由仍由原生 DSH 和 [Conversation Manager](../dsh-conversation-manager/README.md) 负责。不依赖 QQ SDK、Character 或 Interaction；不注册模型工具、RPC 或路由；不持久化任何状态。
 
 ## 安装与装配
 
@@ -23,7 +23,7 @@
 
 ## 接口
 
-`ctx.get('agentIO')` 返回冻结对象 `{ sendMessage, registerAdapter }`。仅供可信 Host 代码调用，**不是模型可调用的工具**。
+`ctx.get('agentIO')` 返回冻结对象 `{ sendMessage, registerAdapter, openInbound }`。仅供可信 Host 代码调用，**不是模型可调用的工具**。
 
 ### sendMessage(request) → Promise\<SendResult\>
 
@@ -67,6 +67,35 @@ const release = io.registerAdapter({
 });
 ```
 
+### openInbound(channel) → { receive(message), close() }
+
+平台 Adapter 为每个 `(platform, accountId)` 打开**一个**入站通道（重复打开抛错；`close()` 后可由重载的 Adapter 重新打开）。通道对象就是提交入站消息的能力：只有打开它的 Adapter 持有，平台、Adapter 与账号由通道固定，**不取自消息**（消息里带 `platform`/`accountId` 会被拒绝）。`deliver` 是该 Adapter 的可信会话入口（Host 准入 → Conversation Manager → 原生 Agent 输入）。
+
+```js
+const inbound = ctx.get('agentIO').openInbound({
+  platform: 'qq-official', adapter: 'qq-official-gateway', accountId: '<APP_ID>',
+  // 返回 {status:'accepted'} | {status:'rejected', reason} | {status:'not-delivered', reason}
+  deliver: async standard => { /* Host 准入、Conversation Manager、followup/intervene */ },
+});
+ctx.effect(() => inbound.close);
+const result = await inbound.receive({
+  conversation: { type: 'direct', id: '<PEER>' },   // group 时为群 ID，发送者另见 sender
+  message: { id: '<PLATFORM_MESSAGE_ID>', text: '你好' },  // 本轮只有 id/text；attachments、replyTo 返回 unsupported
+  sender: { id: '<SENDER>', displayName: '可选' },
+  timestamp: '<平台时间，可选>',
+  platformData: { /* 只交回本 Adapter 的 deliver，不会自动成为模型可见内容 */ },
+});
+```
+
+`deliver` 收到冻结的标准消息 `{platform, adapter, accountId, conversation, message, sender, timestamp, platformData}`。结果（不表示 Agent 已处理完）：
+
+| status | 含义 |
+| --- | --- |
+| `accepted` | 已交给会话入口并创建原生输入（followup 或运行中的 Interaction intervene） |
+| `duplicate` | 同一平台消息正在处理或已处理过，本次未交接 |
+| `rejected` | 未创建任何 Agent 输入：校验失败、未授权、通道已关闭、空消息等（`reason`） |
+| `failed` | 会话入口失败。`stage: 'before-handoff'` 证明未创建输入（如 Session 恢复失败），平台重投可再处理；`stage: 'unknown'` 可能已创建输入，**不重放** |
+
 ## 语义与边界
 
 - **顺序**：同一 `(platform, accountId, conversation)` 严格按提交顺序发送；不同 Conversation 或不同账号互不阻塞，并发有界。
@@ -75,7 +104,9 @@ const release = io.registerAdapter({
 - **去重**：`id` 在 `(platform, accountId)` 内有效，表示“一条逻辑消息”，应由可信事件派生（QQ 用 `原生 Session ID + 事件 seq + 类别`），不得随机生成；I/O 自身也不生成 id，未提供即不去重。同一 id 且 Conversation 与正文相同＝**同一消息的重试**（重复事件、settlement、第二个内部调用方），只交接一次，在途时也一样，返回首次结果并标 `duplicate`；同一 id 但正文或 Conversation 不同＝**冲突**，返回 `not-sent/id-conflict`，绝不冒用首次的成功结果。正文相同但 id 不同＝**另一条合法消息**，照常发送。已入队的 id 无论结果如何都记住（取消、失效、拒绝也不会被同 id 重新发出）；校验失败与 `queue-full` 不入队、不记住。
 - **去重记录的边界**：仅在进程内存中、有界（默认最近 1024 条，`rememberResults`）。淘汰只针对已结束的 id，排队或在途的 id 不会被淘汰；已被淘汰的旧 id 或进程重启后，同一 id 会被视为新消息。**不提供持久 exactly-once 保证。**
 - **不保证 exactly-once**：网络结果可能未知；未知不重试，失败不会记为成功。
-- **诊断**：只在 debug 日志输出平台、状态、原因代码、分片数与耗时；不写正文、ID、目标或凭据。
+- **入站去重**：键为 `(platform, accountId, conversation.type, conversation.id, message.id)`，不同平台、账号或 Conversation 的同名 ID 互不影响；并发重复在首个到达时即登记，后到者直接 `duplicate`。`accepted`、`rejected` 与 `failed/unknown` 都记住；只有 `failed/before-handoff` 被释放以便平台重投。缺少平台消息 ID 时不去重，**绝不以正文哈希合并消息**。记录仅在进程内存，默认 24 小时（`inboundWindowMs`）、最多 4096 条（`rememberInbound`），处理中的条目不淘汰；超期、淘汰或进程重启后同一平台消息可能再次交接，**不提供持久 exactly-once**。
+- **入站信任**：I/O 只检查形状与范围，不授予 Owner、Memory 或工具权限；用户文本、显示名和 platformData 都不是授权依据。准入由平台中间件与会话入口（Host、Conversation Manager 及其包装，例如 Character Identity 的 Owner-only 检查）决定。
+- **诊断**：只在 debug 日志输出事件类别、平台、状态、原因代码、分片数与耗时；不写正文、ID、目标或凭据。
 - **不经本插件的发送**：Interaction 气泡与 SDK 流、审批/问答、Remote Ops 通知，以及 Character Identity 的历史提醒/通知 Outbox（各自的独立授权规则不变）仍走 Gateway Sender；上述普通文本的当前 Session 检查不适用于它们。
 
 ## QQ Official Adapter
@@ -90,14 +121,22 @@ const release = io.registerAdapter({
 
 QQ 插件现在原生 `inject` `agentIO`；未安装本插件时 Gateway 拒绝启动，不退回旧的直接发送路径。
 
+## QQ Official 入站
+
+QQ Gateway 启动时为该应用打开入站通道。SDK 中间件链保持原样并先于 I/O 执行：自回声/5 秒去重、白名单/群聊禁用（accessPolicy）、群聊 @ 门控、内容清洗、限流、`/stop` 等斜杠命令、待答问题截获、显式更正、并发合并、输入状态、引用解析、附件下载与 envelope 组装；Character Identity 的 Owner 准入中间件也在其后、I/O 之前。只有走到 `bot.on('message')` 的普通聊天消息才进入 I/O：
+
+1. Adapter 标准化（`normalizeQQMessage`）：C2C 的 Conversation 为发送者；群为群 openid，发送者另记；消息 ID 为 QQ `msg_id`；原始 SDK 上下文只放 platformData。
+2. I/O 去重并交给会话入口 `deliverInbound`：按同一访问配置再次准入（C2C 只能是发送者本人，禁用的群范围不开放），用原有分层逻辑组装模型可见正文（引用、附件、语音、群历史），经 Conversation Manager `getOrCreate`（保留 Session 创建/恢复/轮换与 Character 包装）得到当前 Session，创建原生 `UserMessage`；Interaction 启用且 Agent 运行中时走 `intervene()`，否则 `followup()`，未启用 Interaction 时仍等待本轮结束。
+3. 原 `handleInbound` 不再直接创建 Agent 输入；Session 获取失败时仍发送原有的固定兜底提示（结果为 `failed/before-handoff`）。
+
 ## 测试
 
 ```bash
 npm test
 ```
 
-（在 QQTK 根目录；包括 `maintenance/agent-io.test.mjs` 的核心语义与 `maintenance/qq-agent-io.test.mjs` 对已审补丁源码的 QQ 集成。）设置 `QQBOT_TEST_PROFILE=<验证 Profile>` 可额外用已安装的 Markdown 分片器跑一项分片测试。所有测试使用 Fake Adapter / 模拟 QQ Bot，不连接 QQ。
+（在 QQTK 根目录；包括 `maintenance/agent-io.test.mjs` 的核心语义、`maintenance/qq-agent-io.test.mjs` 的 QQ 出站集成与 `maintenance/qq-inbound.test.mjs` 的 QQ 入站集成。）设置 `QQBOT_TEST_PROFILE=<验证 Profile>` 可额外用已安装的 Markdown 分片器与 SDK 中间件（访问控制、@ 门控、斜杠命令、合并）跑相应测试，否则这些项跳过。所有测试使用 Fake Adapter / 模拟 QQ Bot，不连接 QQ。
 
 ## 本轮未覆盖
 
-入站消息与可信身份交接、入站去重（Iteration 02）；Conversation Manager 的统一接线（03）；Interaction 的 `sendText`/`openStream`、渐进分泡与 SDK Stream（04，现仍走 Gateway Sender）；附件、引用、Commands（05）；审批/问答展示（06，仍走 Gateway Sender）；通知/提醒与其历史授权规则（07，Character Identity Outbox 未改）；QQ Personal 及其他平台；持久发送状态与崩溃恢复；真实 QQ 手机收件验收。
+入站的附件/引用标准字段（现仍经 platformData 由 QQ 原逻辑组装）；被 SDK 合并的非首条消息 ID 不进入 I/O 去重；Character Identity 入站证据中间件与命令、问答、显式更正仍在 I/O 之前，各自沿用 SDK 5 秒去重；Conversation Manager 的统一接线（03）；Interaction 的 `sendText`/`openStream`、渐进分泡与 SDK Stream（04，现仍走 Gateway Sender）；附件、引用、Commands（05）；审批/问答展示（06，仍走 Gateway Sender）；通知/提醒与其历史授权规则（07，Character Identity Outbox 未改）；QQ Personal 及其他平台；持久发送状态与崩溃恢复；真实 QQ 手机收件验收。
