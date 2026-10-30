@@ -1568,7 +1568,7 @@ index 36a81a2..4970410 100644
              continue;
          if (limiter.checkLimit(c.id).allowed) {
 diff --git a/dist/transport/inbound.js b/dist/transport/inbound.js
-index 1006265..5094190 100644
+index 1006265..f0ae330 100644
 --- a/dist/transport/inbound.js
 +++ b/dist/transport/inbound.js
 @@ -1,30 +1,86 @@
@@ -1666,16 +1666,21 @@ index 1006265..5094190 100644
      }
      catch (err) {
          logger.error(`ERROR creating session: ${err instanceof Error ? err.message : String(err)}`);
-@@ -35,7 +91,7 @@ export async function handleInbound(ctx, manager, config, logger) {
+@@ -35,27 +91,50 @@ export async function handleInbound(ctx, manager, config, logger) {
          catch (sendErr) {
              logger.error(`fallback reply failed: ${sendErr instanceof Error ? sendErr.message : String(sendErr)}`);
          }
 -        return;
 +        return { status: 'not-delivered', reason: 'session-unavailable' };
      }
++    // getOrCreate re-checks after each of its awaits, but disposal or rotation can
++    // still land before this continuation runs: never hand input to a Session
++    // that is no longer current (no input created, a re-delivery may proceed).
++    if (manager.isCurrentSession?.(record) !== true)
++        return { status: 'not-delivered', reason: 'session-changed' };
      // ── 构建 UserMessage → followup ──
      const content = [{ type: 'text', text: agentBody }];
-@@ -43,19 +99,37 @@ export async function handleInbound(ctx, manager, config, logger) {
+     const message = createUserMessage({
          content,
          source: { kind: 'user' },
      });
@@ -1722,7 +1727,7 @@ index 1006265..5094190 100644
  }
  // ══════════════════════════════════════════════════════════════
  // Body Assembly（5 层组装）
-@@ -285,4 +359,4 @@ const SENDER_SHORT_ID_LEN = 8;
+@@ -285,4 +364,4 @@ const SENDER_SHORT_ID_LEN = 8;
  function shortSenderId(senderId) {
      return senderId.slice(0, SENDER_SHORT_ID_LEN);
  }

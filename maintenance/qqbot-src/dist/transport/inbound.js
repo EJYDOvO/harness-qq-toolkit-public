@@ -93,6 +93,11 @@ export async function deliverInbound(standard, manager, config, logger) {
         }
         return { status: 'not-delivered', reason: 'session-unavailable' };
     }
+    // getOrCreate re-checks after each of its awaits, but disposal or rotation can
+    // still land before this continuation runs: never hand input to a Session
+    // that is no longer current (no input created, a re-delivery may proceed).
+    if (manager.isCurrentSession?.(record) !== true)
+        return { status: 'not-delivered', reason: 'session-changed' };
     // ── 构建 UserMessage → followup ──
     const content = [{ type: 'text', text: agentBody }];
     const message = createUserMessage({

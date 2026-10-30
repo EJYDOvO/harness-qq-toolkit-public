@@ -111,7 +111,7 @@ function inbound(policy,status='running'){
  const events=[],timers=[];let idle;const whenIdle=new Promise(r=>idle=r);
  const agent={status,followup:m=>events.push(['followup',m.source.kind]),whenIdle:()=>{events.push(['wait']);return whenIdle;}};
  const record={agent,replyTarget:{scope:'c2c',targetId:'owner',msgId:'m1'}};
- const manager={getOrCreate:async()=>record,registerInteractionInput:(_r,m)=>events.push(['register',m.source.kind]),interactionPolicy:()=>policy};
+ const manager={getOrCreate:async()=>record,isCurrentSession:r=>r===record,registerInteractionInput:(_r,m)=>events.push(['register',m.source.kind]),interactionPolicy:()=>policy};
  const {handleInbound:handle,deliverInbound}=vm.runInNewContext('(function(){'+source+';return {handleInbound,deliverInbound};})()',{
   accessAllows:()=>true,createUserMessage:m=>({id:'native-'+events.length,...m}),classifyContentType:()=>'file',isVoiceContentType:()=>false,clearGroupHistory(){},
   setInterval:(fn,ms)=>{timers.push({fn,ms});return timers.length;},clearInterval:id=>{timers[id-1].cleared=true;},

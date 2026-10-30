@@ -8,6 +8,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';
+import os from 'node:os';
+import {randomUUID,createHash} from 'node:crypto';
 import {fileURLToPath,pathToFileURL} from 'node:url';
 import {createAgentIO} from '../plugin-sources/dsh-agent-io/io.mjs';
 
@@ -35,7 +37,8 @@ function manager(){
   async getOrCreate(scope,peer,sender,target){m.calls.push({scope,peer,sender,target});if(m.fail)throw m.fail;
    const key=scope+':'+peer;let r=records.get(key);if(!r||m.rotate){m.rotate=false;r={sessionKey:key,sessionId:'s'+(records.size+1)+'-'+m.calls.length,agent:agent('a-'+m.calls.length),scope,peerId:peer,replyTarget:target};records.set(key,r);history.push(r);}
    r.replyTarget=target;return r;},
-  registerInteractionInput:(r,msg)=>m.registered.push(msg.id),interactionPolicy:()=>m.policy,records};
+  registerInteractionInput:(r,msg)=>m.registered.push(msg.id),interactionPolicy:()=>m.policy,records,
+  isCurrentSession:r=>records.get(r.scope+':'+r.peerId)===r};
  return m;
 }
 const owner={c2cMode:'allowlist',c2cAllow:['owner'],groupMode:'disabled',groupAllow:[]};
@@ -54,7 +57,7 @@ function gateway({io=createAgentIO(),appId='app-a',access=owner,commands=[]}={})
  };
  // Full SDK middleware chain, then the message handler (bot.on('message')).
  const push=async options=>{const ctx=event(options);let i=0;const next=async()=>{if(ctx.stopped)return;const mw=chain[i++];return mw?mw(ctx,next):final(ctx);};await next();return ctx;};
- const direct=options=>final(event(options)); // a re-delivery past the SDK's 5 s filter window
+ const direct=options=>final(event(options)); // a re-delivery the SDK filter no longer remembers (another Gateway, or after it purged the id)
  return {io,mgr,channel,logs,replies,push,direct,event,config,logger};
 }
 const all=g=>g.mgr.history.flatMap(r=>r.agent.received);
@@ -67,7 +70,7 @@ test('ordinary QQ text reaches the right Agent through the Unified I/O channel a
  assert.deepEqual(g.mgr.registered,['native-'+inputs],'trusted Interaction input registration is unchanged');
  assert(!g.logs.some(([,m])=>m.includes('今天怎么样')||m.includes('owner')),'no chat text or raw identity in logs');
 });
-test('the same messageId pushed again creates one input, also past the SDK filter window',async()=>{
+test('the same messageId pushed again creates one input, also once the SDK filter has forgotten it',async()=>{
  const g=gateway();await g.direct({id:'dup'});await g.direct({id:'dup'});
  assert.equal(all(g).length,1);assert(g.logs.some(([l,m])=>l==='debug'&&/duplicate inbound/.test(m)));
  await g.direct({id:'other',content:'你好'});assert.equal(all(g).length,2,'equal text with another id is another message');
@@ -140,4 +143,66 @@ test('the replaced path: the message handler never creates Agent input itself, a
  assert(!/body="|peerId=\$\{|key=\$\{scope\}:\$\{peerId\}/.test(source),'no chat text or raw peer id in the Processing/followup logs');
  const core=fs.readFileSync(new URL('../plugin-sources/dsh-agent-io/io.mjs',import.meta.url),'utf8');
  assert.deepEqual(core.match(/^import .*$/gm),["import {createHash} from 'node:crypto';"]);
+});
+
+// ── Serialization and lifecycle races (deterministic: controlled promises) ──
+const deferred=()=>{let resolve;const promise=new Promise(r=>{resolve=r;});return {promise,resolve};};
+const blocking=(inputs,gate,fail)=>{let n=0;return {calls:()=>n,async getOrCreate(scope,peer){n++;if(n===1){await gate.promise;if(fail)throw Error('fixture restore failed');}
+ const r={sessionKey:scope+':'+peer,sessionId:'s',scope,peerId:peer,agent:{status:'idle',followup:m=>inputs.push(m),whenIdle:()=>Promise.resolve()}};this.current=r;return r;},isCurrentSession(r){return r===this.current;}};};
+test('the SDK merge guard serializes one Conversation: a duplicate behind a failed handoff is delivered once, behind an accepted one it is suppressed',needsSdk,async()=>{
+ for(const fail of [true,false]){
+  const inputs=[],gate=deferred(),mgr=blocking(inputs,gate,fail),g=gateway(),config={appId:'app-a',access:owner},logger={info(){},debug(){},warn(){},error(){}};
+  const channel=createAgentIO().openInbound({platform:QQ_OFFICIAL,adapter:'qq-official-gateway',accountId:'app-a',deliver:s=>inbound.deliverInbound(s,mgr,config,logger)});
+  // The SDK filter has forgotten the id (another Gateway, or after its purge); the merge guard still runs.
+  const guard=sdk.concurrencyGuard({strategy:'merge',maxQueue:10});
+  const push=id=>{const ctx=g.event({id});return guard(ctx,()=>inbound.handleInbound(ctx,mgr,config,logger,channel));};
+  const first=push('same');await tick();const second=push('same');await tick();
+  assert.equal(mgr.calls(),1,'the duplicate waits in the guard, not inside the I/O');
+  gate.resolve();await Promise.all([first,second]);
+  assert.equal(inputs.length,1,'exactly one native input');
+  assert.equal(mgr.calls(),fail?2:1,fail?'the released id was handed over again':'the settled id was suppressed');
+ }
+});
+
+// The real Conversation Manager (fake Agents) behind the trusted entry.
+const cmSource=file=>fs.readFileSync(new URL('../plugin-sources/dsh-conversation-manager/'+file,import.meta.url),'utf8').replace(/^import .*;\r?\n/gm,'').replace(/export class /g,'class ')+'\n';
+class SessionPersistenceNotFoundError extends Error{constructor(id){super('absent');this.name='SessionPersistenceNotFoundError';this.sessionId=id;}}
+function conversationManager(t,order){
+ const home=fs.mkdtempSync(path.join(os.tmpdir(),'qq-inbound-'));t.after(()=>fs.rmSync(home,{recursive:true,force:true}));
+ const durable=new Set(),live=new Map();
+ const PrefsStore=vm.runInNewContext(cmSource('preferences.mjs')+';PrefsStore;',{...fs,resolve:path.resolve,isAbsolute:path.isAbsolute,dirname:path.dirname,homedir:()=>home,process:{pid:process.pid,env:{DSH_HOME:home}},structuredClone});
+ const handle=id=>{const a={id,status:'idle',session:{header:{id,agentPreset:'fixture'},events:[]},inbox:{hasPending:false},cancel(){order.push('cancel');},followup(){order.push('followup');},whenIdle:()=>Promise.resolve()};live.set(id,a);return {agent:a,async dispose(){order.push('dispose');live.delete(id);}};};
+ const agents={get:id=>live.get(id),async create({sessionId}){return handle(sessionId);},async resume({resumeSessionId}){if(!durable.has(resumeSessionId))throw new SessionPersistenceNotFoundError(resumeSessionId);return handle(resumeSessionId);}};
+ class ModelResolver{constructor(){this.prefs=new PrefsStore(undefined,path.join(home,'prefs.json'));}getEffectiveRoute(){return undefined;}getResumeRoute(){return undefined;}getPreset(k){return this.prefs.getPreset(k);}getSessionId(k){return this.prefs.getSessionId(k);}setSessionId(k,v){this.prefs.setSessionId(k,v);}}
+ const IdleEvictor=vm.runInNewContext(cmSource('idle-evictor.mjs')+';IdleEvictor;',{Date,setInterval:()=>0,clearInterval(){}});
+ const Manager=vm.runInNewContext(cmSource('manager.mjs')+';ConversationManager;',{ModelResolver,IdleEvictor,SessionPersistenceNotFoundError,SessionId:x=>x,buildForkSeed:r=>r,createHash,randomUUID,Date,structuredClone,process:{cwd:()=>home}});
+ const ctx={on:()=>()=>{},get(name){if(name==='agentPresets')return {async resolve(id){return {id:id??'fixture'};},async mount(){}};if(name==='sessionPersistence')return {async open(id){throw new SessionPersistenceNotFoundError(id);}};if(name==='sessions')return {async flush(s){durable.add(s.header.id);return true;}};}};
+ const config={appId:'app-a',cwd:home,sessionIdleTimeout:1,sessionLifecycle:{enabled:false},access:owner,adapter:{key:(scope,peer)=>'qqbot:app-a:'+scope+':'+peer,lifecycleScope:()=>false,acceptActivity:()=>true,isUserInput:t=>!!t?.msgId,inputId:t=>t?.msgId}};
+ return {manager:new Manager(ctx,agents,config,{info(){},warn(){},debug(){},error(){}}),config};
+}
+const quiet={info(){},debug(){},warn(){},error(){}};
+const standardFor=(g,id)=>{const s=inbound.normalizeQQMessage(g.event({id}));s.platformData.hold={};return s;};
+test('Gateway disposal while an input waits for its Conversation: no input on the closing Session, the id is released',async t=>{
+ for(const where of ['inside','behind']){
+  const order=[],{manager,config}=conversationManager(t,order),g=gateway();
+  await manager.getOrCreate('c2c','owner','owner',{scope:'c2c',targetId:'owner',msgId:'warm'});
+  const gate=deferred();let held;
+  if(where==='inside'){const drain=manager.drainSessionClosures.bind(manager);manager.drainSessionClosures=async(...a)=>{await gate.promise;return drain(...a);};}
+  else held=manager.inConversation('qqbot:app-a:c2c:owner',()=>gate.promise); // a command, rotation or compaction
+  const channel=createAgentIO().openInbound({platform:QQ_OFFICIAL,adapter:'qq-official-gateway',accountId:'app-a',deliver:s=>inbound.deliverInbound(s,manager,config,quiet)});
+  const first=channel.receive(standardFor(g,'race'));await tick();
+  channel.close();const closing=manager.disposeAll();await tick();gate.resolve();await held;
+  assert.deepEqual({...await first},{status:'failed',stage:'before-handoff',reason:'session-unavailable'},where);await closing;
+  assert(!order.includes('followup'),where+': no native input');
+ }
+});
+test('disposal between the Session lookup and the handoff: the entry re-checks the current Session instead of using a disposed one',async t=>{
+ const order=[],{manager,config}=conversationManager(t,order),g=gateway();
+ await manager.getOrCreate('c2c','owner','owner',{scope:'c2c',targetId:'owner',msgId:'warm'});
+ let closing;const entry=Object.create(manager);entry.getOrCreate=async(...a)=>{const r=await manager.getOrCreate(...a);closing=manager.disposeAll();return r;};
+ const io=createAgentIO(),channel=io.openInbound({platform:QQ_OFFICIAL,adapter:'qq-official-gateway',accountId:'app-a',deliver:s=>inbound.deliverInbound(s,entry,config,quiet)});
+ const result=await channel.receive(standardFor(g,'window'));await closing;
+ assert.deepEqual({...result},{status:'failed',stage:'before-handoff',reason:'session-changed'});
+ assert.deepEqual(order,['cancel','dispose'],'the disposed Agent received no input');
+ assert.equal((await channel.receive(standardFor(g,'window'))).status,'failed','the id was released: a re-delivery is handled again');
 });
