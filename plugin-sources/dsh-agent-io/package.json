@@ -1,6 +1,6 @@
 {
   "name": "dsh-agent-io",
-  "version": "0.1.0-test.2",
+  "version": "0.1.0-test.3",
   "type": "module",
   "main": "index.mjs",
   "exports": {

@@ -1,6 +1,7 @@
 // Execute the actual bridge/middleware bodies with fake SDK transports. These
 // tests prove adapter wiring, not QQ network delivery or SDK internals.
 import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import vm from 'node:vm';
+import {createAgentIO} from '../plugin-sources/dsh-agent-io/io.mjs';
 const base=new URL('./qqbot-src/dist/gateway/',import.meta.url);
 function outbound(policy,streaming=true,diagnostics){
  const source=fs.readFileSync(new URL('bootstrap.js',base),'utf8').replaceAll('\r\n','\n');
@@ -106,17 +107,20 @@ test('QQ bridge sends each reply to the target of its own input id',async()=>{
  for(let i=0;i<120;i++)f.manager.registerInteractionInput(f.record,{id:'bulk-'+i});assert.equal(f.record.interactionTargets.size,100);assert(!f.record.interactionTargets.has('input-1'));
 });
 function inbound(policy,status='running'){
- const source=fs.readFileSync(new URL('../transport/inbound.js',base),'utf8').replace(/^import .*;\r?\n/gm,'').replace('export async function handleInbound','async function handleInbound');
+ const source=fs.readFileSync(new URL('../transport/inbound.js',base),'utf8').replace(/^import .*;\r?\n/gm,'').replace(/^export (?=(?:async )?function)/gm,'');
  const events=[],timers=[];let idle;const whenIdle=new Promise(r=>idle=r);
  const agent={status,followup:m=>events.push(['followup',m.source.kind]),whenIdle:()=>{events.push(['wait']);return whenIdle;}};
  const record={agent,replyTarget:{scope:'c2c',targetId:'owner',msgId:'m1'}};
- const manager={getOrCreate:async()=>record,registerInteractionInput:(_r,m)=>events.push(['register',m.source.kind]),interactionPolicy:()=>policy};
- const handle=vm.runInNewContext('(function(){'+source+';return handleInbound;})()',{
-  createUserMessage:m=>({id:'native-'+events.length,...m}),classifyContentType:()=>'file',isVoiceContentType:()=>false,clearGroupHistory(){},
+ const manager={getOrCreate:async()=>record,isCurrentSession:r=>r===record,registerInteractionInput:(_r,m)=>events.push(['register',m.source.kind]),interactionPolicy:()=>policy};
+ const {handleInbound:handle,deliverInbound}=vm.runInNewContext('(function(){'+source+';return {handleInbound,deliverInbound};})()',{
+  accessAllows:()=>true,createUserMessage:m=>({id:'native-'+events.length,...m}),classifyContentType:()=>'file',isVoiceContentType:()=>false,clearGroupHistory(){},
   setInterval:(fn,ms)=>{timers.push({fn,ms});return timers.length;},clearInterval:id=>{timers[id-1].cleared=true;},
  });
  const bot={sendTyping:async(target,sec)=>events.push(['typing',target.msgId,sec]),sendMarkdown:async()=>{}};
- const run=()=>handle({message:{kind:'c2c',senderId:'owner',messageId:'m2',content:'你好',attachments:[]},state:{},bot},manager,{appId:'a'},{info(){},warn(){},error(){},debug(){}});
+ const config={appId:'a'},logger={info(){},warn(){},error(){},debug(){}};
+ // The real inbound path: Unified Agent I/O channel -> trusted QQ Conversation entry.
+ const channel=createAgentIO().openInbound({platform:'qq-official',adapter:'qq-official-gateway',accountId:'a',deliver:s=>deliverInbound(s,manager,config,logger)});
+ const run=()=>handle({message:{kind:'c2c',senderId:'owner',messageId:'m2',content:'你好',attachments:[]},state:{},bot},manager,config,logger,channel);
  return {run,events,timers,record,idle};
 }
 test('with Interaction, input during a run goes to intervene and the guard is released at once',async()=>{

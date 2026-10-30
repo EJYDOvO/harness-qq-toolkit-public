@@ -1,30 +1,86 @@
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import { classifyContentType, isVoiceContentType, } from "./attachment.js";
 import { clearGroupHistory } from "../features/history-store.js";
+import { accessAllows } from "./qq-text-adapter.js";
 // ── 主处理函数 ──
 /**
- * 处理 QQ 入站消息（已经过 SDK 中间件链）
+ * QQ Official Adapter 侧标准化：已过 SDK 中间件链（访问控制、@ 门控、命令、
+ * 问答截获、合并、引用、附件）的普通聊天消息 → Unified Agent I/O 标准入站消息。
+ * 平台、Adapter 与账号由入站通道固定，不取自消息；platformData 只交回本
+ * Adapter 的会话入口，不会自动成为模型可见内容。
  */
-export async function handleInbound(ctx, manager, config, logger) {
+export function normalizeQQMessage(ctx) {
+    const msg = ctx.message;
+    const group = msg.kind === 'group';
+    return {
+        conversation: { type: group ? 'group' : 'direct', id: group ? (msg.groupOpenid ?? msg.senderId) : msg.senderId },
+        message: { ...(typeof msg.messageId === 'string' && msg.messageId ? { id: msg.messageId } : {}), text: msg.content ?? '' },
+        sender: { id: msg.senderId, ...(typeof msg.senderName === 'string' && msg.senderName ? { displayName: msg.senderName } : {}) },
+        ...(msg.timestamp === undefined ? {} : { timestamp: msg.timestamp }),
+        platformData: { context: ctx },
+    };
+}
+/**
+ * 处理 QQ 入站消息（已经过 SDK 中间件链）：标准化后交给 Unified Agent I/O 的
+ * 入站通道，由它去重并交给 deliverInbound。不再直接创建 Agent 输入。
+ */
+export async function handleInbound(ctx, manager, config, logger, channel) {
+    if (!channel) {
+        logger.error('im-qqbot: inbound withheld: Unified Agent I/O unavailable');
+        return;
+    }
+    const standard = normalizeQQMessage(ctx), hold = {};
+    standard.platformData.hold = hold;
+    const result = await channel.receive(standard);
+    if (result.status === 'duplicate') {
+        logger.debug?.('im-qqbot: duplicate inbound message suppressed');
+        return;
+    }
+    if (result.status !== 'accepted') {
+        logger.warn?.(`im-qqbot: inbound ${result.status}${result.reason ? ` (${result.reason})` : ''}`);
+        return;
+    }
+    // 阻塞等待本轮 turn 收敛，避免后续消息在 turn 运行期间被 followup 打断
+    if (hold.idle) {
+        try {
+            await hold.idle;
+        }
+        catch (err) {
+            logger.warn(`whenIdle rejected: ${err instanceof Error ? err.message : String(err)}`);
+        }
+    }
+}
+/**
+ * QQ 的可信会话入口（Unified Agent I/O 入站通道的 deliver）：Host 准入复核 →
+ * Conversation Manager（含 Character Identity 等包装）→ 原生 UserMessage 与
+ * followup，或运行中按可选 Interaction 策略 intervene。返回交接结果：
+ * accepted＝已创建 Agent 输入；rejected＝准入拒绝；not-delivered＝未创建输入。
+ */
+export async function deliverInbound(standard, manager, config, logger) {
+    const ctx = standard.platformData?.context, hold = standard.platformData?.hold ?? {};
     const msg = ctx.message;
     const mwState = ctx.state;
     const { bot } = ctx;
-    const scope = msg.kind === 'group' ? 'group' : 'c2c';
-    const peerId = scope === 'group' ? (msg.groupOpenid ?? msg.senderId) : msg.senderId;
+    const scope = standard.conversation.type === 'group' ? 'group' : 'c2c';
+    const peerId = standard.conversation.id;
+    // Defence in depth after the SDK accessPolicy: the same configuration admits
+    // the Conversation; the generic group contract never opens a disabled scope.
+    if (!accessAllows(config.access, scope, peerId) || (scope === 'c2c' && standard.sender.id !== peerId))
+        return { status: 'rejected', reason: 'unauthorized' };
     const replyTarget = {
         scope,
         targetId: peerId,
-        msgId: msg.messageId,
+        msgId: standard.message.id,
     };
     // ── 组装 agentBody（下载结果经 mwState.downloadedFiles 提供） ──
     const agentBody = assembleAgentBody(msg, mwState, scope, logger);
     if (!agentBody)
-        return;
-    logger.info(`Processing: scope=${scope} peerId=${peerId} body="${agentBody.slice(0, 200)}"`);
+        return { status: 'rejected', reason: 'empty-message' };
+    logger.info(`Processing: scope=${scope} length=${agentBody.length}`);
     // ── 获取或创建会话 ──
     let record;
     try {
-        record = await manager.getOrCreate(scope, peerId, msg.senderId, replyTarget);
+        record = await manager.getOrCreate(scope, peerId, standard.sender.id, replyTarget);
     }
     catch (err) {
         logger.error(`ERROR creating session: ${err instanceof Error ? err.message : String(err)}`);
@@ -35,8 +91,13 @@ export async function handleInbound(ctx, manager, config, logger) {
         catch (sendErr) {
             logger.error(`fallback reply failed: ${sendErr instanceof Error ? sendErr.message : String(sendErr)}`);
         }
-        return;
+        return { status: 'not-delivered', reason: 'session-unavailable' };
     }
+    // getOrCreate re-checks after each of its awaits, but disposal or rotation can
+    // still land before this continuation runs: never hand input to a Session
+    // that is no longer current (no input created, a re-delivery may proceed).
+    if (manager.isCurrentSession?.(record) !== true)
+        return { status: 'not-delivered', reason: 'session-changed' };
     // ── 构建 UserMessage → followup ──
     const content = [{ type: 'text', text: agentBody }];
     const message = createUserMessage({
@@ -50,14 +111,14 @@ export async function handleInbound(ctx, manager, config, logger) {
     const policy=manager.interactionPolicy?.(record),interactive=typeof policy?.intervene==='function';
     if(interactive&&record.agent.status==='running'){
         policy.intervene(message);
-        logger.info(`→ interaction input: key=${scope}:${peerId}`);
+        logger.info(`→ interaction input: scope=${scope}`);
     }else{
         record.agent.followup(message);
-        logger.info(`→ followup sent: key=${scope}:${peerId}`);
+        logger.info(`→ followup sent: scope=${scope}`);
     }
     // 群消息回复后清空历史缓存（避免下次 @ 时重复组包）
     if (scope === 'group') {
-        clearGroupHistory(config.appId, msg.groupOpenid ?? msg.senderId);
+        clearGroupHistory(config.appId, peerId);
     }
     if(interactive){
         record.typingTarget={...replyTarget};
@@ -69,15 +130,11 @@ export async function handleInbound(ctx, manager, config, logger) {
             record.typingKeepAlive=timer;
             record.agent.whenIdle().catch(()=>{}).finally(()=>{clearInterval(timer);if(record.typingKeepAlive===timer)record.typingKeepAlive=undefined;});
         }
-        return;
+        return { status: 'accepted' };
     }
-    // 阻塞等待本轮 turn 收敛，避免后续消息在 turn 运行期间被 followup 打断
-    try {
-        await record.agent.whenIdle();
-    }
-    catch (err) {
-        logger.warn(`whenIdle rejected: ${err instanceof Error ? err.message : String(err)}`);
-    }
+    // handleInbound waits for this after the handoff (SDK concurrency guard held).
+    hold.idle = record.agent.whenIdle();
+    return { status: 'accepted' };
 }
 // ══════════════════════════════════════════════════════════════
 // Body Assembly（5 层组装）

@@ -1,8 +1,10 @@
-// Unified Agent I/O, outbound core. Platform-neutral: it never imports a
-// platform SDK, Character or Interaction. Adapters own protocol details
-// (targets, quota, chunking, API errors); this module owns the logical
-// message: validation, per-Conversation order, cancellation between parts,
-// duplicate suppression and an honest result. Nothing here is durable.
+// Unified Agent I/O core. Platform-neutral: it never imports a platform SDK,
+// Character or Interaction. Adapters own protocol details (targets, quota,
+// chunking, API errors, event parsing); this module owns the logical message.
+// Outbound: validation, per-Conversation order, cancellation between parts,
+// duplicate suppression and an honest result. Inbound: the standard message
+// handoff from an adapter's channel to its trusted Conversation entry, with
+// scoped duplicate suppression. Nothing here is durable.
 import {createHash} from 'node:crypto';
 
 const CODE=/^[a-z][a-z-]{0,39}$/;
@@ -14,11 +16,14 @@ const notSent=(id,reason,stage='before-platform',parts=[])=>freeze({id,status:'n
 // with another fingerprint is a different message, never a retry of the first.
 const fingerprint=request=>createHash('sha256').update(JSON.stringify([request.target.conversation.type,request.target.conversation.id,request.message.text])).digest('hex');
 
+const INBOUND_KEYS=new Set(['conversation','message','sender','timestamp','platformData']);
+
 export function createAgentIO(options={}){
  const maxPerConversation=options.maxPendingPerConversation??32,maxPending=options.maxPending??512,maxConcurrent=options.maxConcurrent??8,maxText=options.maxTextLength??100_000,remember=options.rememberResults??1024;
  const now=options.now??Date.now,onEvent=typeof options.onEvent==='function'?options.onEvent:undefined;
  const adapters=new Map(),conversations=new Map(),results=new Map(),ready=[];
  let pending=0,active=0,closed=false;const running=new Set();
+ const channels=new Map(),received=new Map(),inboundWindow=options.inboundWindowMs??86_400_000,rememberInbound=options.rememberInbound??4096;
  const adapterKey=(platform,accountId)=>JSON.stringify([platform,accountId]);
 
  function registerAdapter(adapter){
@@ -128,6 +133,80 @@ export function createAgentIO(options={}){
   return notSent(id,failure.reason,failure.stage,done);
  }
 
+ // -- Inbound --
+ // A channel is the capability to submit messages for one platform account;
+ // only the adapter that opened it holds it, so platform, adapter and account
+ // are never taken from the message. `deliver` is the adapter's trusted
+ // Conversation entry (Host admission, Conversation Manager, native Agent
+ // input). Model input never reaches this layer.
+ function openInbound(channel){
+  if(closed)throw Error('Agent I/O closed');
+  if(!channel||!text(channel.platform)||!text(channel.adapter)||!text(channel.accountId))throw Error('Inbound channel requires platform, adapter and accountId');
+  if(typeof channel.deliver!=='function')throw Error('Inbound channel requires deliver()');
+  const key=adapterKey(channel.platform,channel.accountId);
+  if(channels.has(key))throw Error('An inbound channel is already open for this platform account');
+  const entry={channel,open:true};channels.set(key,entry);
+  const close=()=>{entry.open=false;if(channels.get(key)===entry)channels.delete(key);};
+  return Object.freeze({receive:message=>receive(entry,message),close});
+ }
+
+ function validateInbound(message){
+  if(!message||typeof message!=='object'||Object.keys(message).some(k=>!INBOUND_KEYS.has(k)))return 'invalid-message';
+  const {conversation,sender}=message,body=message.message;
+  if(!conversation||!['direct','group'].includes(conversation.type)||!text(conversation.id))return 'invalid-target';
+  if(!sender||!text(sender.id))return 'unauthorized';
+  if(!body||typeof body!=='object')return 'invalid-message';
+  if(Object.keys(body).some(k=>k!=='id'&&k!=='text'))return 'unsupported';
+  if(body.id!==undefined&&!text(body.id))return 'invalid-message';
+  if(typeof body.text!=='string')return 'invalid-message';
+  if(body.text.length>maxText)return 'too-large';
+  return null;
+ }
+
+ // One platform message is handed to the Agent at most once per process within
+ // its scope (platform, account, Conversation, platform message id), even when
+ // duplicates arrive concurrently. The result says what happened to this
+ // delivery, never that the Agent has processed it:
+ //   accepted   handed to the Conversation entry (native input created)
+ //   duplicate  the same message is in flight or already settled here
+ //   rejected   refused before any Agent input (invalid, unauthorized, closed)
+ //   failed     the entry failed; stage 'before-handoff' proves no Agent input
+ //              was created (a platform re-delivery may be processed), stage
+ //              'unknown' may follow an input and is never replayed.
+ async function receive(entry,message){
+  const started=now(),done=result=>reportInbound(entry.channel,result,started);
+  if(closed||!entry.open)return done({status:'rejected',reason:'closed'});
+  const invalid=validateInbound(message);if(invalid)return done({status:'rejected',reason:invalid});
+  const {platform,accountId}=entry.channel,id=message.message.id;
+  const key=id===undefined?undefined:JSON.stringify([platform,accountId,message.conversation.type,message.conversation.id,id]);
+  if(key!==undefined){
+   const known=received.get(key);
+   if(known&&(!known.settled||started-known.at<inboundWindow))return done({status:'duplicate'});
+   received.delete(key);received.set(key,{settled:false,at:started});
+   // Bounded: the oldest settled entries go first; in-flight ones never.
+   for(const [k,e] of received){if(received.size<=rememberInbound)break;if(e.settled)received.delete(k);}
+  }
+  const standard=Object.freeze({platform,adapter:entry.channel.adapter,accountId,conversation:Object.freeze({...message.conversation}),message:Object.freeze({...message.message}),sender:Object.freeze({...message.sender}),timestamp:message.timestamp,platformData:message.platformData});
+  let result;
+  try{
+   const outcome=await entry.channel.deliver(standard);
+   result=outcome?.status==='accepted'?{status:'accepted'}
+    :outcome?.status==='rejected'?{status:'rejected',reason:code(outcome.reason,'unauthorized')}
+    :outcome?.status==='not-delivered'?{status:'failed',stage:'before-handoff',reason:code(outcome.reason,'entry-failed')}
+    :{status:'failed',stage:'unknown',reason:'invalid-outcome'};
+  }catch{result={status:'failed',stage:'unknown',reason:'entry-error'};}
+  if(key!==undefined){
+   const record=received.get(key);
+   if(result.stage==='before-handoff')received.delete(key);else if(record){record.settled=true;record.at=now();}
+  }
+  return done(result);
+ }
+
+ function reportInbound(channel,result,started){
+  try{onEvent?.({event:'receive',platform:code(channel?.platform,'unknown'),status:result.status,reason:result.reason,stage:result.stage,elapsedMs:Math.max(0,now()-started)});}catch{}
+  return Object.freeze(result);
+ }
+
  function report(request,result,started){
   try{onEvent?.({event:'send',platform:code(request?.target?.platform,'unknown'),status:result.status,reason:result.reason,parts:result.parts.length,elapsedMs:Math.max(0,now()-started)});}catch{}
   return result;
@@ -139,7 +218,9 @@ export function createAgentIO(options={}){
   ready.length=0;
   await Promise.all([...running]);
   adapters.clear();
+  for(const entry of channels.values())entry.open=false;
+  channels.clear();received.clear();
  }
 
- return Object.freeze({sendMessage,registerAdapter,close});
+ return Object.freeze({sendMessage,registerAdapter,openInbound,close});
 }

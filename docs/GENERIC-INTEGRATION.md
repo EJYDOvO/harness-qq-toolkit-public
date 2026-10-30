@@ -62,6 +62,7 @@ overrides:
 
 - 基础 QQ 注入 agents/conversationManager/agentIO；未安装 Remote Ops 时审批/问答仍注册。停用 Manager 或 Agent I/O 会使依赖它们的 QQ 停用，不另开旧 Session Manager，也不退回旧的直接发送路径。
 - 未绑定 Interaction 时，普通回复、Streaming 静态降级、工具错误与轮次错误提示经 Agent I/O 的 `sendMessage()` 发送：逻辑消息 ID 取自原生 Session ID 与事件 seq（重复事件只发一次）；每个分片前复核对端仍被访问配置准入、来源 Session 仍是 Manager `isCurrentSession` 认可的当前 Session；`/stop` 与 `aborted`/`interrupted` 结束的 Turn 取消尚未交给 QQ 的输出。明确拒绝、结果未知与部分发送分别记录且不重发；进程内去重不跨重启。SDK 流式输出、审批/问答与 Interaction 气泡仍走 Gateway Sender。
+- 普通聊天入站（本分支 Iteration 02）：SDK 中间件链（白名单、群聊禁用、@ 门控、命令、问答、更正、合并、附件）不变，走到消息处理器的消息经 Agent I/O 入站通道去重后交给 QQ 会话入口，入口按同一访问配置复核，再经 Conversation Manager 创建原生输入；I/O 不授予任何权限。去重为进程内、有界，详见 [Agent I/O](../plugin-sources/dsh-agent-io/README.md)。
 - 进程共享 appId 租约拒绝重复 Gateway，卸载等待停止后释放；只构造一套 Sender、问答与审批通道。
 - 多进程使用同一凭据需外部单活管理；本机维护锁不能代表跨机器分布式锁。
 - 无效 Preset 不再退回其他 Agent 组合；已有 Session 继续按其原 Preset 恢复，缺失时拒绝。

@@ -6,6 +6,7 @@ import { homedir as diagnosticHome } from 'node:os';
 import { SessionManager } from "../session/index.js";
 import { handleInbound, createOutboundHandler, chunkMarkdownText } from "../transport/index.js";
 import { QQ_OFFICIAL, qqConversation, createQQTextAdapter } from "../transport/qq-text-adapter.js";
+import { deliverInbound } from "../transport/inbound.js";
 import { ReplyLimiter } from "../transport/reply-limiter.js";
 import { cacheMsgId, cacheEventId } from "../transport/msgid-cache.js";
 import { resolveReplyTarget, sendResolvedMarkdown } from "../transport/reply-target.js";
@@ -215,7 +216,9 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
     logger.info(`QQBot SDK initialized (UA: ${userAgent})`);
     // ── 中间件链 ──
     setupMiddlewares(bot, config, manager, logger);
-    // ── 入站：经过中间件链后的消息交给 dsh agent ──
+    // ── 入站：经过中间件链后的普通聊天消息 → Unified Agent I/O 入站通道（去重）→ 可信会话入口 → dsh agent ──
+    const inbound = io.openInbound({ platform: QQ_OFFICIAL, adapter: 'qq-official-gateway', accountId: config.appId, deliver: standard => deliverInbound(standard, manager, config, logger) });
+    ctx.effect(() => inbound.close);
     bot.on('message', async (mCtx) => {
         const msg = mCtx.message;
         // 记录最近 msgId，供无上下文的出站发送（文件发送显式 target、主动推送等）获取被动回复目标
@@ -223,7 +226,7 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
         if (config.debug) {
             logger.debug(`← message (post-middleware): ${JSON.stringify(msg, null, 2).slice(0, 500)}`);
         }
-        await handleInbound(mCtx, manager, config, logger);
+        await handleInbound(mCtx, manager, config, logger, inbound);
     });
     // ── 出站：dsh session/event → QQ 消息 ──
     // 获取 tools 服务（工具结果结构化展示），可选

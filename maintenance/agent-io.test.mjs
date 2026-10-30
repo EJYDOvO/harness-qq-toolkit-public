@@ -188,8 +188,82 @@ test('send events carry only enums and counts, never text, ids or targets',async
 });
 test('the Host plugin provides one frozen agentIO service and closes it with the context',async()=>{
  let service,cleanup;plugin.apply({provide:(name,value)=>{assert.equal(name,'agentIO');service=value;},effect:f=>{cleanup=f();},logger:{debug(){}}},{maxConcurrent:1});
- assert(Object.isFrozen(service));assert.deepEqual(Object.keys(service).sort(),['registerAdapter','sendMessage']);
+ assert(Object.isFrozen(service));assert.deepEqual(Object.keys(service).sort(),['openInbound','registerAdapter','sendMessage']);
  const f=fakeAdapter();f.routes.set('peer','s1');service.registerAdapter(f.adapter);assert.equal((await service.sendMessage(msg())).status,'sent');
  await cleanup();assert.equal((await service.sendMessage(msg())).reason,'closed');
  assert.deepEqual(plugin.inject,[]);assert.equal(plugin.name,'agent-io');
+});
+
+// ── Inbound: standard message handoff, scoped dedup and honest outcomes ──
+const inboundMsg=(id='qq-1',extra={})=>({conversation:{type:'direct',id:'peer'},message:{id,text:'你好'},sender:{id:'peer'},platformData:{raw:'opaque'},...extra});
+function inboundSetup(options={},deliver){
+ const io=createAgentIO(options),delivered=[];
+ const channel=io.openInbound({platform:'fake',adapter:'fake-gateway',accountId:'app-a',deliver:deliver??(async m=>{delivered.push(m);return {status:'accepted'};})});
+ return {io,channel,delivered};
+}
+test('an inbound message is handed to the trusted entry once, stamped with the channel identity',async()=>{
+ const {channel,delivered}=inboundSetup();
+ const r=await channel.receive(inboundMsg());assert.deepEqual({...r},{status:'accepted'});
+ assert.equal(delivered.length,1);const m=delivered[0];
+ assert.deepEqual([m.platform,m.adapter,m.accountId,m.conversation.id,m.message.id,m.message.text,m.sender.id],['fake','fake-gateway','app-a','peer','qq-1','你好','peer']);
+ assert(Object.isFrozen(m)&&Object.isFrozen(m.message));assert.deepEqual(m.platformData,{raw:'opaque'},'platformData is passed only to the same adapter entry');
+ assert.equal((await channel.receive(inboundMsg())).status,'duplicate');assert.equal(delivered.length,1);
+ // A message cannot name its own platform, adapter or account.
+ assert.deepEqual({...await channel.receive({...inboundMsg('qq-2'),platform:'other',accountId:'app-b'})},{status:'rejected',reason:'invalid-message'});
+});
+test('concurrent duplicates of one platform message cannot both reach the Agent',async()=>{
+ let open;const gate=new Promise(r=>open=r),calls=[];
+ const {channel}=inboundSetup({},async m=>{calls.push(m.message.id);await gate;return {status:'accepted'};});
+ const first=channel.receive(inboundMsg()),second=await channel.receive(inboundMsg());
+ assert.equal(second.status,'duplicate','in flight counts as seen');open();assert.equal((await first).status,'accepted');assert.deepEqual(calls,['qq-1']);
+});
+test('inbound dedup is scoped by platform, account and Conversation',async()=>{
+ const io=createAgentIO(),seen=[];const deliver=async m=>{seen.push([m.platform,m.accountId,m.conversation.type,m.conversation.id]);return {status:'accepted'};};
+ const a=io.openInbound({platform:'fake',adapter:'g',accountId:'app-a',deliver}),b=io.openInbound({platform:'fake',adapter:'g',accountId:'app-b',deliver}),c=io.openInbound({platform:'other',adapter:'g',accountId:'app-a',deliver});
+ for(const ch of [a,b,c])assert.equal((await ch.receive(inboundMsg('same'))).status,'accepted');
+ assert.equal((await a.receive({...inboundMsg('same'),conversation:{type:'direct',id:'peer-2'},sender:{id:'peer-2'}})).status,'accepted');
+ assert.equal((await a.receive({...inboundMsg('same'),conversation:{type:'group',id:'peer'}})).status,'accepted','a group with the same id is another Conversation');
+ assert.equal(seen.length,5);
+ assert.throws(()=>io.openInbound({platform:'fake',adapter:'g2',accountId:'app-a',deliver}),/already open/,'one channel per platform account');
+});
+test('entry outcomes: rejection and unknown failures are final, a proven non-handoff may be re-delivered',async()=>{
+ const outcomes=[];const {channel}=inboundSetup({},async()=>{const o=outcomes.shift();if(o instanceof Error)throw o;return o;});
+ outcomes.push({status:'rejected',reason:'unauthorized'});assert.deepEqual({...await channel.receive(inboundMsg('r'))},{status:'rejected',reason:'unauthorized'});
+ assert.equal((await channel.receive(inboundMsg('r'))).status,'duplicate');
+ outcomes.push({status:'not-delivered',reason:'session-unavailable'},{status:'accepted'});
+ assert.deepEqual({...await channel.receive(inboundMsg('n'))},{status:'failed',stage:'before-handoff',reason:'session-unavailable'});
+ assert.equal((await channel.receive(inboundMsg('n'))).status,'accepted','no Agent input was created, so the re-delivery is processed');
+ outcomes.push(new Error('after followup'));assert.deepEqual({...await channel.receive(inboundMsg('u'))},{status:'failed',stage:'unknown',reason:'entry-error'});
+ assert.equal((await channel.receive(inboundMsg('u'))).status,'duplicate','an unknown handoff is never replayed');
+ outcomes.push({status:'weird'});assert.deepEqual([(await channel.receive(inboundMsg('w'))).stage],['unknown']);
+});
+test('inbound memory is bounded in time and size and never forgets a message in flight',async()=>{
+ let t=1000;const {channel}=inboundSetup({now:()=>t,inboundWindowMs:100,rememberInbound:2});
+ await channel.receive(inboundMsg('a'));t+=50;assert.equal((await channel.receive(inboundMsg('a'))).status,'duplicate');
+ t+=200;assert.equal((await channel.receive(inboundMsg('a'))).status,'accepted','after the window the id is new again (documented limit)');
+ let open;const gate=new Promise(r=>open=r);const held=inboundSetup({rememberInbound:1},async m=>{if(m.message.id==='held')await gate;return {status:'accepted'};});
+ const pending=held.channel.receive(inboundMsg('held'));for(const id of ['x','y'])await held.channel.receive(inboundMsg(id));
+ assert.equal((await held.channel.receive(inboundMsg('held'))).status,'duplicate');open();await pending;
+});
+test('inbound validation refuses malformed or unsupported messages before any Agent input',async()=>{
+ const {channel,delivered}=inboundSetup();
+ const cases=[[{...inboundMsg(),sender:undefined},'unauthorized'],[{...inboundMsg(),conversation:{type:'channel',id:'x'}},'invalid-target'],
+  [{...inboundMsg(),message:{id:'m',text:'图',attachments:[]}},'unsupported'],[{...inboundMsg(),message:{id:'m'}},'invalid-message'],[null,'invalid-message']];
+ for(const [m,reason] of cases)assert.deepEqual({...await channel.receive(m)},{status:'rejected',reason});
+ assert.equal(delivered.length,0);
+ // Without a platform message id there is nothing to deduplicate by; content is never hashed instead.
+ await channel.receive({...inboundMsg(),message:{text:'同一句'}});await channel.receive({...inboundMsg(),message:{text:'同一句'}});assert.equal(delivered.length,2);
+});
+test('closing a channel or the I/O stops intake and frees the account for a reloaded adapter',async()=>{
+ const {io,channel,delivered}=inboundSetup();channel.close();
+ assert.deepEqual({...await channel.receive(inboundMsg())},{status:'rejected',reason:'closed'});
+ const again=io.openInbound({platform:'fake',adapter:'fake-gateway',accountId:'app-a',deliver:async()=>({status:'accepted'})});
+ assert.equal((await again.receive(inboundMsg())).status,'accepted');await io.close();
+ assert.equal((await again.receive(inboundMsg('z'))).reason,'closed');assert.throws(()=>io.openInbound({platform:'fake',adapter:'g',accountId:'app-a',deliver(){}}),/closed/);assert.equal(delivered.length,0);
+});
+test('receive events carry only enums and timing, never ids, text or senders',async()=>{
+ const events=[];const io=createAgentIO({onEvent:e=>events.push(e)});const ch=io.openInbound({platform:'fake',adapter:'g',accountId:'app-a',deliver:async()=>({status:'accepted'})});
+ await ch.receive({...inboundMsg('secret-id'),message:{id:'secret-id',text:'秘密正文'}});await ch.receive(inboundMsg('secret-id'));
+ for(const e of events){assert.equal(e.event,'receive');assert(!JSON.stringify(e).match(/secret|秘密|peer|app-a|opaque/));}
+ assert.deepEqual(events.map(e=>e.status),['accepted','duplicate']);
 });
