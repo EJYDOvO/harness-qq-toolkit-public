@@ -151,12 +151,23 @@ await ctx.get('agentIO').sendMessage({ id, target: conversation.target(record), 
 
 - 接线：Gateway 启动时为该应用 `openConversation({platform: 'qq-official', accountId: <APP_ID>, manager, scopes: {direct: 'c2c', group: 'group'}, admits: 访问配置})`，入站与出站共用；Session Key 仍为 `qqbot:<appId>:<scope>:<peer>`。
 - 目标：首片及每个后续分片前由共享 `route` 复核：对端仍被该 Gateway 的访问配置（`c2cMode/c2cAllow`、`groupMode/groupAllow`，规则同 SDK accessPolicy）准入，否则 `unauthorized`；`origin.sessionId` 必须等于 Manager 当前记录的 Session，且 `manager.isCurrentSession(record)` 为真（记录仍是映射项、Session 仍为当前、原生 Agent 仍在），否则 `stale`。QQ 的 `check` 再要求记录的回复目标仍指向同一 Conversation。Manager 不提供 `isCurrentSession` 时接线拒绝创建。只比较 Host 填写的证据，不信任模型 ID、Owner 声明或 platformData。
-- 稳定 ID 与取消（Gateway 侧）：普通回复、Streaming 静态降级（与该回复共用 ID）、工具错误、轮次错误各自用 `qq:<Session ID>:<原生事件 seq>:<assistant|tool|turn-error>`；每条消息带所属原生 Turn 的 `AbortSignal`。`/stop`、以 `aborted`/`interrupted` 结束的 Turn 会取消该 Session 尚未交给 QQ 的输出，含该 Turn 的迟到输出；因取消而结算的半截回复（`interrupted: true`）及取消后的缓冲不发送。已交给 QQ 的分片不撤回。
+- 稳定 ID 与取消（Gateway 侧）：普通回复、工具错误、轮次错误各自用 `qq:<Session ID>:<原生事件 seq>:<assistant|tool|turn-error>`；每条消息带所属原生 Turn 的 `AbortSignal`。`/stop`、以 `aborted`/`interrupted` 结束的 Turn 会取消该 Session 尚未交给 QQ 的输出，含该 Turn 的迟到输出；因取消而结算的半截回复（`interrupted: true`）及取消后的缓冲不发送。已交给 QQ 的分片不撤回。旧配置项 `streaming` 已停用：普通回复不再打开 SDK 流式消息，整条回复在 settlement 后作为一条逻辑消息发送。
 - 回复目标与被动回复限额：复用 Gateway 现有 Sender（同一 msg_id 4 次被动回复，超限/过期降级主动推送；诊断记录照旧）。
 - 分片：原 Markdown 分片器（`textChunkLimit`，默认 4500），超长单行再按上限切开且不拆代理对。
 - 错误：SDK `ApiError` 的 4xx（除 408）为 `not-sent`（429 为 `rate-limited`），状态 0（超时/网络）、408、5xx 及非 `ApiError` 为 `unknown`。
 
 QQ 插件现在原生 `inject` `agentIO`；未安装本插件时 Gateway 拒绝启动，不退回旧的直接发送路径。
+
+## QQ Official 出站：Interaction 气泡（Iteration 04）
+
+绑定 Interaction 时，策略只负责语义分泡、Hang-on、插话与回复节奏，把**已完整**的气泡交给桥接层的 `sendText(text, metadata)`；桥接层（`createInteractionOutbound`）把每个气泡、等待提示和工具/轮次错误提示都作为一条逻辑消息交给 `sendMessage()`，经上面的 QQ 文本 Adapter 由 Gateway Sender 发出。没有其他聊天直发路径：Gateway Sender 不再提供 SDK `openStream`，桥接层不调用 `sendMarkdown`。
+
+- **逻辑 ID**：`qq:<Session ID>:<原生 Turn>:<策略实例>:<回复>.<气泡>:<assistant|status>`；策略实例为进程内随机 8 位十六进制，回复与气泡序号来自 Interaction 元数据。同一气泡重复提交得到第一次的结果（不重发），不同气泡不会同号；同号异文为 `id-conflict`。工具/轮次错误沿用原生事件 ID。
+- **回复目标**：气泡元数据的 `input`（原生 UserMessage ID）在 QQ 侧映射到该输入的回复目标；QQ 文本 Adapter 只在该目标仍属于本 Conversation 时使用它，否则用记录的最新目标。被动回复额度、过期与主动降级不变。
+- **取消**：请求带策略令牌的 `AbortSignal` 与原生 Turn 的 `AbortSignal`（合并），`/stop`、插话撤回、Turn 中止都会停止尚未交给 QQ 的分片；交接前已取消的气泡不发起请求。
+- **结果**：只有 `sent` 视为确认；`not-sent`/`partial`/`unknown` 以 `delivery` 状态抛回给 Interaction，由它记录并扣留同一回复的后续气泡（不留空洞、不盲目重发）。`partial`/`unknown` 可能已可见，计为自然回复（不再发 Hang-on）。取消不记警告。
+- **授权**：每个分片前与普通回复相同，复核访问配置与 Manager 当前 Session（轮换、移除、撤权后的迟到气泡被拒）。
+- **诊断**：`static-request`/`static-receipt`/`static-failure` 另带 `turn`/`reply`/`bubble`/`kind`，仍不含正文、原始 ID 或凭据；原 `stream-*` 记录不再产生。
 
 ## QQ Official 入站
 
@@ -180,4 +191,4 @@ npm test
 
 ## 本轮未覆盖
 
-入站的附件/引用标准字段（现仍经 platformData 由 QQ 原逻辑组装）；被 SDK 合并的非首条消息 ID 不进入 I/O 去重；Character Identity 入站证据中间件与命令、问答、显式更正仍在 I/O 之前，各自只靠 SDK 消息 ID 去重（更正已用共享交接，但不经 I/O 入站去重）；Remote Ops 启动时的 Owner 路由恢复与 Character Identity 的准入仍直接调用 Manager `getOrCreate`（不是 Agent 输入）；Interaction 的 `sendText`/`openStream`、渐进分泡与 SDK Stream（04，现仍走 Gateway Sender）；附件、引用、Commands（05）；审批/问答展示（06，仍走 Gateway Sender）；通知/提醒与其历史授权规则（07，Character Identity Outbox 未改）；QQ Personal 及其他平台；持久发送状态与崩溃恢复；真实 QQ 手机收件验收。
+入站的附件/引用标准字段（现仍经 platformData 由 QQ 原逻辑组装）；被 SDK 合并的非首条消息 ID 不进入 I/O 去重；Character Identity 入站证据中间件与命令、问答、显式更正仍在 I/O 之前，各自只靠 SDK 消息 ID 去重（更正已用共享交接，但不经 I/O 入站去重）；Remote Ops 启动时的 Owner 路由恢复与 Character Identity 的准入仍直接调用 Manager `getOrCreate`（不是 Agent 输入）；Interaction 气泡的持久发送状态与崩溃后恢复（重启后同一气泡不会被识别为重复）；附件、引用、Commands（05）；审批/问答展示（06，仍走 Gateway Sender）；通知/提醒与其历史授权规则（07，Character Identity Outbox 未改）；QQ Personal 及其他平台；持久发送状态与崩溃恢复；真实 QQ 手机收件验收。

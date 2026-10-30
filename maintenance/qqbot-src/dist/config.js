@@ -20,7 +20,7 @@ export const ConfigSchema = Schema.object({
     groupPrompt: Schema.string().description('群聊额外system prompt'),
     directPrompt: Schema.string().description('私聊额外system prompt'),
     textChunkLimit: Schema.number().default(4500).description('单条消息最大字符数'),
-    streaming: Schema.boolean().default(true).description('是否启用流式输出（群聊始终不启用）'),
+    streaming: Schema.boolean().default(true).description('已停用，仅为兼容旧配置保留：QQ 普通聊天统一经 Unified Agent I/O 静态发送，不再使用 SDK 流式消息'),
     sessionIdleTimeout: Schema.number().default(30 * 60 * 1000).description('会话闲置超时(ms)'),
     sessionLifecycle: Schema.object({
         enabled: Schema.boolean().default(false),

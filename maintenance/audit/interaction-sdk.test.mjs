@@ -1,5 +1,6 @@
 // Uses an explicit code-only SDK/QQ fixture; never instantiates QQBot or contacts QQ.
 // Assertions describe release requirements and intentionally remain red on test.10.
+// Iteration 04: all chat output goes through the Unified Agent I/O; no SDK stream path.
 import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import vm from 'node:vm';import path from 'node:path';import {pathToFileURL} from 'node:url';
 import {Interaction} from '../../../character-agent-v1/packages/interaction-policy/policy.mjs';
 import {createConversations} from '../../plugin-sources/dsh-agent-io/conversation.mjs';
@@ -9,63 +10,75 @@ assert(sdk&&qq,'Set QQBOT_AUDIT_SDK_DIR and QQBOT_AUDIT_DIST to isolated code-on
 const {StreamSession}=await import(pathToFileURL(path.join(sdk,'streaming.js')));
 const {MessageApi}=await import(pathToFileURL(path.join(sdk,'protocol/api/messages.js')));
 const {ApiClient}=await import(pathToFileURL(path.join(sdk,'protocol/api/api-client.js')));
-const {ApiError,StreamInputState}=await import(pathToFileURL(path.join(sdk,'protocol/types.js')));
+const {ApiError}=await import(pathToFileURL(path.join(sdk,'protocol/types.js')));
 const {concurrencyGuard}=await import(pathToFileURL(path.join(sdk,'middleware/concurrency-guard.js')));
 const {ReplyLimiter}=await import(pathToFileURL(path.join(qq,'transport/reply-limiter.js')));
 const {cacheMsgId,getCachedReplyIds}=await import(pathToFileURL(path.join(qq,'transport/msgid-cache.js')));
 const {ConfigSchema}=await import(pathToFileURL(path.join(qq,'config.js')));
+// The reviewed QQ text adapter (no imports) from this checkout.
+const {createQQTextAdapter,classifyQQError}=await import(new URL('../qqbot-src/dist/transport/qq-text-adapter.js',import.meta.url));
 const source=fs.readFileSync(new URL('../qqbot-src/dist/gateway/bootstrap.js',import.meta.url),'utf8');
 const targetSource=fs.readFileSync(path.join(qq,'transport/reply-target.js'),'utf8').replace(/^import .*;\r?\n/gm,'').replaceAll('export function','function');
 const {resolveReplyTarget,sendResolvedMarkdown}=vm.runInNewContext(targetSource+'\n;({resolveReplyTarget,sendResolvedMarkdown});',{getCachedReplyIds,MsgType:{MARKDOWN:2}});
-const makeSender=vm.runInNewContext('(function(bot,deliveryRecorder){'+source.slice(source.indexOf('    const replyLimiter ='),source.indexOf('    // Unified Agent I/O text adapter'))+'return {sender,replyLimiter};})',{ReplyLimiter,resolveReplyTarget,sendResolvedMarkdown,randomUUID:()=> 'fixture-stream-id'});
-const makeOutbound=vm.runInNewContext(source.slice(source.indexOf('export function createInteractionOutbound'),source.indexOf('export async function bootstrapGateway')).replace('export function','function')+';createInteractionOutbound;',{AbortController,createOutboundHandler:()=>()=>{}});
+const slice=(start,end)=>{const a=source.indexOf(start),b=source.indexOf(end,a);assert(a>=0&&b>a,start);return source.slice(a,b);};
+const makeSender=vm.runInNewContext('(function(bot,deliveryRecorder){'+slice('    const replyLimiter =','    // Optional Agent policy')+'return {sender,replyLimiter};})',{ReplyLimiter,resolveReplyTarget,sendResolvedMarkdown});
+const makeOutbound=vm.runInNewContext(slice('export function createInteractionOutbound','export async function bootstrapGateway').replace('export function','function')+';createInteractionOutbound;',{AbortController,AbortSignal,randomUUID:()=> 'fixture-0000-4000',createOutboundHandler:()=>()=>{}});
+// The gateway's own Unified Agent I/O adapter registration (the only chat output path).
+const registerAdapter=vm.runInNewContext('(function(conversation,config,chunkMarkdownText,sender,diagnostics,outboundHandler,ctx){'+slice('    // Unified Agent I/O text adapter',"    ctx\n        .on('session/event'")+'})',{createQQTextAdapter});
 const micro=()=>new Promise(r=>setImmediate(r));
-function fixture(t,{streaming=false,rejectOver=Infinity,onRequest,diagnostics}={}){
- const payloads=[],bubbles=[],agent={session:{header:{id:'fixture'}},status:'running'},key={},timers=new Map();let timer=0;
+// The real Interaction policy, gateway bridge, Unified Agent I/O, shared Conversation
+// wiring, QQ text adapter, gateway sender, reply limiter and SDK MessageApi.
+function fixture(t,{rejectOver=Infinity,onRequest,diagnostics,limit=4500}={}){
+ const payloads=[],agent={session:{header:{id:'fixture'}},status:'running'},timers=new Map();let timer=0;
  const policy=new Interaction(agent,{throttleMs:0},{now:Date.now,set:fn=>{timers.set(++timer,fn);return timer;},clear:id=>timers.delete(id)});t.after(()=>policy.dispose());
- const api=new MessageApi({async request(_token,_method,_path,body){payloads.push(structuredClone(body));if((body.markdown?.content??body.content_raw??'').length>rejectOver)throw Error('fixture: over platform limit');if(onRequest)await onRequest(body);return {id:'synthetic-stream'};}},{getAccessToken:async()=> 'synthetic-token'},{markdownSupport:true});
- const bot={sendMarkdown:(target,text)=>api.sendRaw(target.scope,target.targetId,{appId:'fixture',clientSecret:'dummy'},{markdown:{content:text},msg_id:target.msgId}),send:opts=>api.sendRaw(opts.target.scope,opts.target.targetId,{appId:'fixture',clientSecret:'dummy'},{markdown:opts.markdown,...opts.extra}),openStream:({target})=>{const stream=new StreamSession(api,{openid:target.targetId,msgId:target.msgId,creds:{appId:'fixture',clientSecret:'dummy'},throttleMs:300});bubbles.push(stream);return stream;}};
+ const api=new MessageApi({async request(_token,_method,_path,body){payloads.push(structuredClone(body));if((body.markdown?.content??body.content_raw??'').length>rejectOver)throw Error('fixture: over platform limit');if(onRequest)await onRequest(body);return {id:'synthetic-receipt'};}},{getAccessToken:async()=> 'synthetic-token'},{markdownSupport:true});
+ const bot={sendMarkdown:(target,text)=>api.sendRaw(target.scope,target.targetId,{appId:'fixture',clientSecret:'dummy'},{markdown:{content:text},msg_id:target.msgId}),send:opts=>api.sendRaw(opts.target.scope,opts.target.targetId,{appId:'fixture',clientSecret:'dummy'},{markdown:opts.markdown,...opts.extra}),openStream(){throw Error('QQ chat output never opens an SDK stream');}};
  const {sender,replyLimiter}=makeSender(bot,diagnostics);
- const record={agent,sessionKey:'fixture',scope:'c2c',peerId:'fixture-owner',replyTarget:{scope:'c2c',targetId:'fixture-owner',msgId:'fixture-message'}};
+ const record={agent,sessionKey:'fixture',sessionId:'fixture',scope:'c2c',peerId:'fixture-owner',replyTarget:{scope:'c2c',targetId:'fixture-owner',msgId:'fixture-message'}};
  const manager={getOrCreate:async()=>record,getSessionRecord:()=>record,isCurrentSession:r=>r===record,findBySessionId:()=>record};
- // The shared Conversation wiring supplies the policy, as in the Gateway.
- const conversation=createConversations({},{createInput:m=>m,interactionPolicy:()=>policy})({platform:'qq-official',adapter:'qq-official-gateway',accountId:'fixture',manager,scopes:{direct:'c2c',group:'group'},admits:()=>true});
- const outbound=makeOutbound({get:()=>{throw Error('policy comes from the Conversation wiring');}},manager,sender,{streaming,textChunkLimit:4500},{},undefined,diagnostics,undefined,conversation);
+ // The shared Conversation wiring supplies the policy and the route, as in the Gateway.
+ const io=createAgentIO(),config={textChunkLimit:limit};
+ const conversation=createConversations(io,{createInput:m=>m,interactionPolicy:()=>policy})({platform:'qq-official',adapter:'qq-official-gateway',accountId:'fixture',manager,scopes:{direct:'c2c',group:'group'},admits:()=>true});
+ const outbound=makeOutbound({get:()=>{throw Error('policy comes from the Conversation wiring');}},manager,sender,config,{warn(){},debug(){},error(){}},undefined,diagnostics,io,conversation);
+ registerAdapter(conversation,config,chunk,sender,diagnostics,outbound,{effect(){}});
  const event=(type,data={})=>outbound(agent.session,{type,data});
  // What the shared handoff does for an admitted QQ input: QQ tracking, then the policy.
  manager.registerInteractionInput=(r,m)=>{manager.trackInteractionInput(r,m);policy.admitInput(m);};
  const input={id:'native-fixture-input',source:{kind:'user'}};manager.registerInteractionInput(record,input);event('turn/start',{turn:1});event('user/message',{turn:1,message:input});
  const final=text=>event('assistant/message',{turn:1,message:{content:[{type:'text',text}]}});
- return {policy,record,manager,sender,replyLimiter,payloads,bubbles,event,final,timers};
+ const texts=()=>payloads.map(b=>b.markdown?.content);
+ return {policy,record,manager,sender,replyLimiter,payloads,event,final,timers,io,texts};
 }
+// Line-based stand-in for the markdown chunker (the real one is covered by the light tests).
+const chunk=(text,limit)=>{const out=[];let cur='';for(const line of text.split('\n')){const next=cur?cur+'\n'+line:line;if(cur&&next.length>limit){out.push(cur);cur=line;}else cur=next;}if(cur)out.push(cur);return out.length?out:[text];};
 
-test('QQ receipt, not buffered update, confirms delivery; diagnostics connect settlement and SDK frames',async t=>{
+test('only a confirmed QQ send confirms a bubble; diagnostics connect settlement and requests, never text',async t=>{
  const traces=[],diagnostics={hash:()=> 'a'.repeat(24),trace:(event,fields)=>traces.push({event,...fields})};
- let release;const f=fixture(t,{streaming:true,diagnostics,onRequest:()=>new Promise(r=>release=r)});
- f.policy.text('QQ接口尚未确认');f.policy.update(f.policy.message);await micro();assert.equal(f.policy.delivered,false);assert(traces.some(x=>x.event==='stream-request'));
+ let release;const f=fixture(t,{diagnostics,onRequest:()=>new Promise(r=>release=r)});
+ f.policy.text('QQ接口尚未确认');f.policy.update(f.policy.message);await micro();assert.deepEqual(f.payloads,[],'nothing before the bubble is complete');
+ f.final('QQ接口尚未确认');await micro();await micro();assert.equal(f.policy.delivered,false);assert(traces.some(x=>x.event==='static-request'&&x.kind==='assistant'&&x.bubble===1));
  release();await f.policy.idle();assert.equal(f.policy.delivered,true);
- f.final('QQ接口尚未确认');await micro();release();await f.policy.idle();
- assert(traces.some(x=>x.event==='assistant-settlement'));assert(traces.some(x=>x.event==='stream-receipt'&&x.receipt));
- const requests=traces.filter(x=>x.event==='stream-request');assert.equal(new Set(requests.map(x=>x.stream)).size,1);assert.equal(requests.at(-1).associated,true);
+ assert(traces.some(x=>x.event==='assistant-settlement'));assert(traces.some(x=>x.event==='static-receipt'&&x.receipt));
+ assert(!JSON.stringify(traces).includes('QQ接口'));
 });
 
-test('missing stream receipt ID is observable without inventing association or retrying',async()=>{
+test('missing stream receipt ID is observable without inventing association or retrying (SDK patch, unused by chat output)',async()=>{
  const events=[],stream=new StreamSession({sendC2CStreamMessage:async()=>({})},{openid:'fixture',msgId:'fixture',creds:{}}).observe(e=>events.push(e));
  await stream.update('fixture');await stream.complete();assert.equal(events.filter(e=>e.type==='request').length,2);assert(events.filter(e=>e.type==='receipt').every(e=>e.receiptId===undefined));assert(events.every(e=>!e.streamMsgId));
 });
 
-test('SDK observer failure cannot break sending or change retry policy',async()=>{
+test('SDK observer failure cannot break sending or change retry policy (SDK patch, unused by chat output)',async()=>{
  let calls=0;const stream=new StreamSession({sendC2CStreamMessage:async()=>{calls++;return {id:'fixture'};}},{openid:'fixture',msgId:'fixture',creds:{}}).observe(()=>{throw Error('diagnostic error');});
  await stream.update('fixture');await stream.complete();assert.equal(calls,2);
 });
-for(const streaming of [false,true])for(const length of [4501,5001,10001])test(`Q01 ${streaming?'stream':'static'} ${length} chars respect configured 4500 limit and retain the entire message`,async t=>{
- const f=fixture(t,{streaming,rejectOver:5000}),text='长'.repeat(length);f.final(text);await f.policy.idle();
- assert(f.payloads.every(b=>(b.markdown?.content??b.content_raw).length<=4500),'adapter emitted an oversized payload');
- const output=streaming?f.payloads.filter(b=>b.input_state===StreamInputState.DONE).map(b=>b.content_raw).join(''):f.payloads.map(b=>b.markdown.content).join('');assert.equal(output,text);
+for(const length of [4501,5001,10001])test(`Q01 ${length} chars respect configured 4500 limit and retain the entire message`,async t=>{
+ const f=fixture(t,{rejectOver:5000}),text='长'.repeat(length);f.final(text);await f.policy.idle();
+ assert(f.payloads.every(b=>b.markdown.content.length<=4500),'adapter emitted an oversized payload');
+ assert.equal(f.texts().join(''),text);assert(f.payloads.every(b=>b.input_state===undefined),'no SDK stream frame');
 });
-test('Q02 streams share the same four-reply budget as static sends',async t=>{
- const f=fixture(t,{streaming:true});for(let i=0;i<6;i++){f.final('第'+i+'个工具步骤的完整回应');await f.policy.idle();}
- assert(f.payloads.filter(b=>b.input_state===StreamInputState.GENERATING&&b.msg_id).length<=4,'six independent passive streams bypassed ReplyLimiter');
+test('Q02 Interaction bubbles share the same four-reply passive budget as plain replies',async t=>{
+ const f=fixture(t);for(let i=0;i<6;i++){f.final('第'+i+'个工具步骤的完整回应');await f.policy.idle();}
+ assert.equal(f.payloads.length,6);assert(f.payloads.filter(b=>b.msg_id).length<=4,'six passive replies bypassed ReplyLimiter');
  assert(f.replyLimiter.checkLimit('fixture-message').remaining===0);
 });
 test('Q03 explicit target remains expired rather than resurrecting on the next limit check',()=>{
@@ -76,22 +89,25 @@ test('Q04 expired explicit target duplicated in cache must not bypass fallback',
  const target={scope:'c2c',targetId:'expiry-fixture',msgId:'expired-twice'},limiter=new ReplyLimiter({ttlMs:10});cacheMsgId(target.scope,target.targetId,target.msgId);limiter.record(target.msgId);limiter.messages.get(target.msgId).firstSeenAt=Date.now()-20;
  assert.equal(resolveReplyTarget(target,limiter,true).msgId,undefined);
 });
-test('Q05 SDK throttled text stays unsent when output is canceled',async t=>{
- const f=fixture(t,{streaming:true});f.policy.text('已经发送的前缀');f.policy.update(f.policy.message);await f.policy.idle();
- f.policy.text('取消前仍在SDK缓冲中的尾巴');f.policy.update(f.policy.message);await f.policy.idle();
- const before=f.payloads.length;f.policy.stopOutput();await f.policy.idle();assert(!f.payloads.slice(before).some(b=>b.content_raw.includes('尾巴')));
+test('Q05 generated text that is not a complete bubble stays unsent when output is canceled',async t=>{
+ const f=fixture(t);f.policy.text('已经生成的前缀');f.policy.update(f.policy.message);await f.policy.idle();
+ f.policy.text('取消前仍未完成的尾巴');f.policy.update(f.policy.message);await f.policy.idle();
+ f.policy.stopOutput();f.final('已经生成的前缀取消前仍未完成的尾巴');await f.policy.idle();assert.deepEqual(f.payloads,[]);
 });
-test('Q06 a known rate-limit rejection cannot retry new content after stop',async t=>{
- let calls=0;const f=fixture(t,{streaming:true,onRequest:()=>{if(++calls===1)throw Object.assign(Error('rate limit'),{code:429});}});
- f.policy.text('应该取消的SDK重试');f.policy.update(f.policy.message);await micro();assert.equal(calls,1);f.policy.stopOutput();await f.policy.idle();assert.equal(calls,1,'SDK retried and completed after stop');
+test('Q06 a rate-limit rejection is reported and never retried, also after stop',async t=>{
+ let calls=0;const f=fixture(t,{onRequest:()=>{calls++;throw new ApiError('请求过于频繁',429,'/fixture',50002);}});
+ f.final('被限流的气泡');await f.policy.idle();assert.equal(calls,1);assert(f.policy.errors.includes('bubble-delivery-failed'));
+ f.policy.stopOutput();await f.policy.idle();assert.equal(calls,1,'retried after stop');
 });
-test('Q07 SDK stream failure must still carry the committed suffix or signal undelivered result',async t=>{
- let calls=0;const f=fixture(t,{streaming:true,onRequest:()=>{if(++calls===1)throw Object.assign(Error('fixture rejection before delivery'),{delivery:'rejected'});}});
- f.policy.text('前缀');f.policy.update(f.policy.message);await f.policy.idle();f.policy.text('最终尾巴');f.final('前缀最终尾巴');await f.policy.idle();
- assert(f.payloads.some(b=>b.content_raw==='前缀最终尾巴'));
+test('Q07 a refused bubble withholds the rest of its reply instead of leaving a gap; the next reply is delivered',async t=>{
+ let calls=0;const f=fixture(t,{onRequest:()=>{if(++calls===1)throw new ApiError('rejected',400,'/fixture',0);}});
+ f.final('第一段完整文本，写得足够长。\n\n第二段完整文本，同样足够长。');await f.policy.idle();
+ assert.deepEqual(f.texts(),['第一段完整文本，写得足够长。\n\n']);assert(f.policy.errors.includes('bubble-delivery-failed'));
+ f.event('turn/end',{turn:1,reason:{kind:'completed'}});f.event('turn/start',{turn:2});const next={id:'next-input',source:{kind:'user'}};f.manager.registerInteractionInput(f.record,next);f.event('user/message',{turn:2,message:next});
+ f.event('assistant/message',{turn:2,message:{content:[{type:'text',text:'下一次回复。'}]}});await f.policy.idle();assert.equal(f.texts().at(-1),'下一次回复。');
 });
-test('Q08 successful static and SDK stream controls preserve a 4500-character result',async t=>{
- for(const streaming of [false,true]){const f=fixture(t,{streaming}),text='长'.repeat(4500);f.final(text);await f.policy.idle();assert.equal(f.payloads.at(-1).markdown?.content??f.payloads.at(-1).content_raw,text);}
+test('Q08 a 4500-character result is one bubble and one payload',async t=>{
+ const f=fixture(t),text='长'.repeat(4500);f.final(text);await f.policy.idle();assert.deepEqual(f.texts(),[text]);
 });
 test('Q09 Web input on a QQ-bound Session must not send response or hang-on to QQ',async t=>{
  const f=fixture(t);f.event('user/message',{source:{kind:'web'},content:[{type:'text',text:'Web-only'}]});f.policy.hangOn();f.final('Web-only结果');await f.policy.idle();assert.deepEqual(f.payloads,[]);
@@ -108,8 +124,8 @@ test('Q10 actual SDK request deadline must include reading a stalled response bo
  }finally{globalThis.fetch=saved;}
 });
 test('Q11 rate-limit recognition accepts the actual SDK ApiError fields',()=>{
- const stream=new StreamSession({}, {openid:'fixture',msgId:'fixture',creds:{}});
- assert.equal(stream.isRateLimitError(new ApiError('请求过于频繁',429,'/fixture',50002)),true);
+ assert.equal(classifyQQError(new ApiError('请求过于频繁',429,'/fixture',50002)).outcome,'not-sent');
+ assert.equal(classifyQQError(new ApiError('timeout',0,'/fixture',0)).outcome,'unknown');
 });
 test('Q12 merge survivor retains per-peer exclusion until its downstream completes',async()=>{
  const guard=concurrencyGuard({strategy:'merge',maxQueue:8});let releaseA,releaseB,active=0,peak=0;
@@ -143,15 +159,14 @@ test('Q15 native Web user source cannot impersonate a registered QQ input',async
  f.event('assistant/message',{turn:2,message:{content:[{type:'text',text:'QQ result'}]}});await f.policy.idle();assert.equal(f.payloads.at(-1).markdown.content,'QQ result');
 });
 
-for(const streaming of [false,true])test(`native Host context retains admitted QQ output through SDK (streaming=${streaming})`,async t=>{
- const f=fixture(t,{streaming});
+test('native Host context retains admitted QQ output through the Unified I/O; the bubble before a tool goes out while it runs',async t=>{
+ const f=fixture(t);
  for(const kind of ['agent-instructions','runtime-context','skill-catalog','time-context'])f.event('user/message',{message:{id:kind,source:{kind}}});
- f.policy.text('查询前缀');f.policy.update(f.policy.message);await f.policy.idle();
- f.event('tool/call',{callId:'search'});f.event('user/message',{id:'new-time',source:{kind:'time-context'}});
- f.event('tool/result',{message:{source:{callId:'search'}}});f.final('查询前缀，完整结果');
+ f.final('我先查一下。');f.event('tool/call',{callId:'search'});await f.policy.idle();assert.deepEqual(f.texts(),['我先查一下。'],'sent while the tool runs');
+ f.event('user/message',{id:'new-time',source:{kind:'time-context'}});
+ f.event('tool/result',{message:{source:{callId:'search'}}});f.final('完整结果。');
  f.event('turn/end',{turn:1,reason:{kind:'completed'}});await f.policy.idle();
- const delivered=streaming?f.payloads.filter(b=>b.input_state===StreamInputState.DONE).map(b=>b.content_raw).join(''):f.payloads.map(b=>b.markdown.content).join('');
- assert.equal(delivered,'查询前缀，完整结果');assert.equal(f.record.interactionSuppressed,false);
+ assert.deepEqual(f.texts(),['我先查一下。','完整结果。']);assert.equal(f.record.interactionSuppressed,false);
 });
 
 for(const kind of ['web','schedule','unknown','user'])test(`native context cannot reactivate unadmitted ${kind} output`,async t=>{
@@ -160,20 +175,26 @@ for(const kind of ['web','schedule','unknown','user'])test(`native context canno
  f.policy.hangOn();f.final('非QQ结果');await f.policy.idle();assert.deepEqual(f.payloads,[]);
 });
 
-test('Q16 cancellation during a settled long static send suppresses remaining protocol chunks',async t=>{
+test('Q16 cancellation during a settled long send suppresses the remaining protocol parts',async t=>{
  let release;const gate=new Promise(r=>release=r);const f=fixture(t,{onRequest:()=>gate});
- f.final('字'.repeat(10001));await micro();assert.equal(f.payloads.length,1);f.policy.stopOutput();release();await f.policy.idle();assert.equal(f.payloads.length,1);
+ f.final('字'.repeat(10001));await micro();await micro();assert.equal(f.payloads.length,1);f.policy.stopOutput();release();await f.policy.idle();assert.equal(f.payloads.length,1);
 });
 
-test('Q17 cancellation reaches an in-flight committed stream retry',async t=>{
- let calls=0;const f=fixture(t,{streaming:true,onRequest:()=>{calls++;throw Object.assign(Error('rate limit'),{code:429});}});
- f.final('最终结果');await micro();assert.equal(calls,1);f.policy.stopOutput();await f.policy.idle();assert.equal(calls,1);
+test('Q17 a long reply commits complete bubbles while generating, in order, without duplicates',async t=>{
+ const f=fixture(t),section=n=>`第${n}部分的完整说明。`.repeat(28);const text=[1,2,3,4].map(section).join('\n\n');
+ for(let i=0;i<text.length;i+=40){f.policy.text(text.slice(i,i+40));f.policy.update(f.policy.message);await f.policy.idle();}
+ const early=f.texts();assert(early.length>=1&&early.length<=2,'committed before settlement');assert(text.startsWith(early.join('')));
+ f.final(text);await f.policy.idle();assert.equal(f.texts().join(''),text);assert.deepEqual(f.texts().slice(0,early.length),early);assert(f.texts().length<=3);
 });
 
-test('Q18 a long uncommitted stream never completes overflow bubbles',async t=>{
- const f=fixture(t,{streaming:true});f.policy.text('草'.repeat(10001));f.policy.update(f.policy.message);await f.policy.idle();
- assert(!f.payloads.some(b=>b.input_state===StreamInputState.DONE));assert(f.payloads.every(b=>b.content_raw.length<=4500));
- f.policy.stopOutput();await f.policy.idle();assert(!f.payloads.some(b=>b.input_state===StreamInputState.DONE));
+test('Q18 a long uncommitted reply never sends a partial bubble, also after stop',async t=>{
+ const f=fixture(t);f.policy.text('草'.repeat(10001));f.policy.update(f.policy.message);await f.policy.idle();
+ assert.deepEqual(f.payloads,[]);f.policy.stopOutput();await f.policy.idle();assert.deepEqual(f.payloads,[]);
+});
+test('Q19 Session rotation and revoked access stop queued bubbles before QQ',async t=>{
+ let release;const gate=new Promise(r=>release=r);const f=fixture(t,{onRequest:()=>gate});
+ f.final('第一段完整文本，写得足够长。\n\n第二段完整文本，同样足够长。');await micro();await micro();assert.equal(f.payloads.length,1);
+ f.manager.isCurrentSession=()=>false;release();await f.policy.idle();assert.equal(f.payloads.length,1,'the second bubble is refused as stale');
 });
 test('QQ lifecycle configuration parses through the installed Host schema and remains opt-in',()=>{
  const legacy=ConfigSchema({});assert.deepEqual(legacy.sessionLifecycle,{enabled:false,freshOnHostRestart:true,inactivityMs:43200000});

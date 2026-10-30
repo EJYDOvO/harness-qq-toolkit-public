@@ -2,6 +2,8 @@
 
 为 DeepSeek Harness 提供 **QQ 接入兼容补丁、可选 Remote Ops 插件和维护工具**。普通 DSH Agent 可以独立使用 QQ 接入，不需要 Character Agent、角色 Preset 或记忆插件。
 
+**Iteration 04（源码，未部署）：** Interaction 出站迁移：Interaction 只生成并提交完整气泡（长回复在生成期间按定稿规则提前提交，其余在 settlement 后提交），QQ 桥接层把每个气泡、等待提示和工具/轮次错误提示都作为一条逻辑消息交给 Agent I/O `sendMessage()`，经 QQ 文本 Adapter 发送；稳定逻辑 ID 关联原生 Session、Turn、回复与气泡，回复目标按原生输入选择，逐片复核权限与当前 Session，`/stop`、插话撤回与 Turn 中止停止未发出的分片，未确认的气泡不重发且扣留同回复后续气泡。Interaction 专属的 QQ SDK Stream 发送路径与普通回复的 SDK 流式输出均已移除（`streaming` 配置项停用）；Agent I/O 公共接口不变（仍为 `0.1.0-test.4`，只有 `sendMessage()`）。详见 [Agent I/O](plugin-sources/dsh-agent-io/README.md)。
+
 **Iteration 03（源码，未部署）：** Agent I/O `0.1.0-test.4` 新增 `openConversation()`：平台无关的 Conversation 接线把入站交接（Conversation Manager `getOrCreate` → `isCurrentSession` → 原生 `UserMessage` → Interaction `intervene`/`followup`）与出站可信路由（Manager 当前记录 + `isCurrentSession`，每个分片前复核）收在一处，出入站共用 `{platform, accountId, conversation}` 引用。QQ Official 入站、出站文本 Adapter、显式更正与 `/stop` 已改用它，原 QQ 内的重复交接与三处 Interaction 查询已删除；Session Key、持久状态与 Character 包装不变。详见 [Agent I/O](plugin-sources/dsh-agent-io/README.md#openconversationoptions--conversationiteration-03)。
 
 **Iteration 02（已配套 Character test.24 授权部署）：** 普通聊天入站改经 Agent I/O `0.1.0-test.3` 的 `openInbound()`：QQ Adapter 标准化 → I/O 按平台/账号/Conversation/消息 ID 去重（并发重复也只交接一次）→ 可信会话入口（同一访问配置复核 → Conversation Manager → 原生 followup 或 Interaction intervene）。命令、问答、审批、附件预处理与 Character Owner 准入不变。

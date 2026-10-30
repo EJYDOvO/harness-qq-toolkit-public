@@ -55,12 +55,15 @@ export function accessAllows(access, scope, peerId) {
 }
 /**
  * Protocol parts for `conversation.registerAdapter()`.
- * @param send      (replyTarget, text, {index, sessionId}) → SDK result; resolves the
- *                  passive-reply target and applies the quota.
- * @param split     text → markdown-aware chunks.
- * @param limit     hard per-message character limit.
+ * @param send         (replyTarget, text, {index, sessionId, messageId}) → SDK result; resolves the
+ *                     passive/active target through the gateway sender (quota, diagnostics).
+ * @param split        text → markdown-aware chunks.
+ * @param limit        hard per-message character limit.
+ * @param replyTarget  optional (record, messageId) → the reply target of the input a
+ *                     logical message answers (Interaction bubbles); used only while
+ *                     it names this record's Conversation, otherwise the record's latest.
  */
-export function createQQTextAdapter({ send, split, limit = 4500 }) {
+export function createQQTextAdapter({ send, split, limit = 4500, replyTarget }) {
     return {
         // After the shared route check, before every part: the record's reply
         // target must still point at exactly this Conversation.
@@ -71,7 +74,11 @@ export function createQQTextAdapter({ send, split, limit = 4500 }) {
         },
         split: text => hardLimit(split(text), limit),
         async send(route, text, info) {
-            const result = await send({ ...route.record.replyTarget }, text, { index: info.index, sessionId: route.record.sessionId });
+            const record = route.record;
+            let own;
+            try { own = typeof replyTarget === 'function' ? replyTarget(record, info.messageId) : undefined; } catch { own = undefined; }
+            const target = own && own.scope === record.scope && own.targetId === record.peerId ? own : record.replyTarget;
+            const result = await send({ ...target }, text, { index: info.index, sessionId: record.sessionId, messageId: info.messageId });
             return { receipt: typeof result?.id === 'string' ? result.id : undefined };
         },
         classify: classifyQQError,

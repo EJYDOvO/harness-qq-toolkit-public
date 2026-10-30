@@ -75,6 +75,11 @@ function dispatchInteraction(event, manager) {
     return false;
 }
 // Reusable transport wiring, separately testable without creating a QQ gateway.
+// Every QQ chat message (Interaction bubbles and hang-on lines, plain replies,
+// tool results, turn errors) is one logical message for the Unified Agent I/O,
+// which owns ordering, cancellation between parts, the route check before every
+// part, duplicate suppression and an honest result. There is no direct
+// sendMarkdown or SDK stream path for chat output here.
 export function createInteractionOutbound(ctx, manager, sender, config, logger, toolsRegistry, diagnostics, io, conversation) {
     // The Agent's Interaction policy from the shared Conversation wiring (the
     // same lookup the inbound handoff uses); null means the lookup failed.
@@ -85,39 +90,9 @@ export function createInteractionOutbound(ctx, manager, sender, config, logger, 
         const targets=record.interactionTargets??=new Map();targets.delete(message.id);targets.set(message.id,{...record.replyTarget});
         while(targets.size>100)targets.delete(targets.keys().next().value);
     };
-    const targetFor=(record,meta,fallback)=>{const own=typeof meta?.input==='string'?record.interactionTargets?.get(meta.input):undefined;return own?{...own}:fallback;};
     // QQ side of an admitted Interaction input (the shared handoff calls the
     // policy itself): resume output and remember the input's reply target.
     manager.trackInteractionInput=(record,message)=>{record.interactionSuppressed=false;rememberTarget(record,message);};
-    const limit = Math.max(100, Math.min(4500, config.textChunkLimit ?? 4500));
-    function pieces(text) {
-        const parts=[];
-        while(text.length){let end=Math.min(limit,text.length);if(end<text.length&&/[\uD800-\uDBFF]/u.test(text[end-1]))end--;parts.push(text.slice(0,end));text=text.slice(end);}
-        return parts;
-    }
-    function boundedStream(target,meta) {
-        let stream, latest='', cancelled=false;
-        return {
-            async update(text) {
-                if(cancelled)return;
-                latest=text;
-                const first=pieces(text)[0];if(first===undefined)return;
-                stream??=sender.openStream(target,meta);
-                await stream.update(first);
-            },
-            async complete(){
-                // Overflow remains buffered until durable assistant settlement.
-                const parts=pieces(latest);
-                for(let i=0;i<parts.length;i++){
-                    if(cancelled)return;
-                    if(i>0){stream=sender.openStream(target,meta);await stream.update(parts[i]);}
-                    if(cancelled)return;
-                    await stream?.complete();
-                }
-            },
-            cancel(){cancelled=true;stream?.cancel?.();}
-        };
-    }
     // Native Turn lifecycle per Session (bounded). Output not yet handed to the
     // platform is cancelled by /stop, by a Turn that ends aborted/interrupted,
     // and stays cancelled for late output of that Turn, without Session rotation.
@@ -135,29 +110,45 @@ export function createInteractionOutbound(ctx, manager, sender, config, logger, 
         else if(event?.type==='turn/end'&&['aborted','interrupted'].includes(event.data?.reason?.kind))turnControl(sessionId,event.data?.turn)?.abort();
     }
     manager.cancelOutput=record=>{for(const control of turns.get(record?.sessionId)?.values()??[])control.abort();};
+    // Logical messages being handed over, by id: the QQ text adapter reads the
+    // reply target of the input a bubble answers and its diagnostic fields.
+    const deliveries=new Map();
+    async function submit(record,text,{id,input,turn,signal,delivery}){
+        if(!io){logger.error?.('im-qqbot: output withheld: Unified Agent I/O unavailable');return {id,status:'not-sent',reason:'adapter-unavailable',parts:[]};}
+        const signals=[turnControl(record.sessionId,turn)?.signal,signal].filter(s=>s instanceof AbortSignal);
+        const own=typeof input==='string'?record.interactionTargets?.get(input):undefined;
+        const mine=id!==undefined&&!deliveries.has(id);if(mine)deliveries.set(id,{target:own&&{...own},input:typeof input==='string'?input:undefined,delivery});
+        try{return await io.sendMessage({...(id?{id}:{}),target:conversation.target(record),origin:{sessionId:record.sessionId},message:{text},...(signals.length?{signal:signals.length>1?AbortSignal.any(signals):signals[0]}:{})});}
+        finally{if(mine)deliveries.delete(id);}
+    }
+    // Logical id of an Interaction message: the native Session and Turn, the
+    // policy instance, its reply and bubble numbers and the kind. A repeated
+    // submission of one bubble maps to the same id; two bubbles never do.
+    const epochs=new WeakMap();
+    function bubbleId(record,policy,meta){
+        if(!['assistant','status'].includes(meta?.kind)||!Number.isSafeInteger(meta.reply)||!Number.isSafeInteger(meta.bubble))return undefined;
+        let epoch=epochs.get(policy);if(!epoch){epoch=randomUUID().slice(0,8);epochs.set(policy,epoch);}
+        return `qq:${record.sessionId}:${Number.isSafeInteger(meta.turn)?meta.turn:'-'}:${epoch}:${meta.reply}.${meta.bubble}:${meta.kind}`;
+    }
     // Static text of the original outbound router (replies without an Interaction
     // policy, tool results, turn errors). With a policy it stays on the policy's
-    // ordered external channel; otherwise the whole logical message goes to the
-    // Unified Agent I/O, which re-checks the route when it sends. The QQ text
-    // adapter chunks it; there is no direct sendMarkdown path left here.
+    // ordered external channel; otherwise it goes to the Unified Agent I/O directly.
     async function deliverText(record, text, tag, origin) {
         try {
             const policy = policyFor(record);
             if(policy===null)return;
-            if(policy?.transport){for(const part of chunkMarkdownText(text, config.textChunkLimit ?? 4500))await policy.external(part, { kind: 'tool-or-error' });return;}
-            if(!io){logger.error?.(`im-qqbot: ${tag} withheld: Unified Agent I/O unavailable`);return;}
             // Logical id from the trusted native event (Session id + durable seq +
             // kind): a repeated event or settlement maps to the same id, two
             // legitimate messages with equal text never do. No id is invented.
             const id=Number.isSafeInteger(origin?.seq)&&['assistant','tool','turn-error'].includes(origin.kind)?`qq:${record.sessionId}:${origin.seq}:${origin.kind}`:undefined;
-            const signal=turnControl(record.sessionId,origin?.turn)?.signal;
-            const result=await io.sendMessage({...(id?{id}:{}),target:conversation.target(record),origin:{sessionId:record.sessionId},message:{text},...(signal?{signal}:{})});
+            if(policy?.transport){await policy.external(text, { kind: 'tool-or-error', ...(id?{logicalId:id}:{}), ...(Number.isSafeInteger(origin?.turn)?{turn:origin.turn}:{}) });return;}
+            const result=await submit(record,text,{id,turn:origin?.turn,delivery:{kind:origin?.kind==='assistant'?'assistant':'tool-or-error'}});
             if(result.duplicate)logger.debug?.(`im-qqbot: ${tag} duplicate suppressed`);
             else if(result.status!=='sent')logger.warn?.(`im-qqbot: ${tag} ${result.status}${result.reason?` (${result.reason})`:''}`);
         }
         catch { logger.error?.(`im-qqbot: ${tag} delivery failed`); }
     }
-    const legacyOutbound = createOutboundHandler(manager, { openStream: (...args) => sender.openStream(...args), deliverText }, config, logger, toolsRegistry);
+    const legacyOutbound = createOutboundHandler(manager, { deliverText }, config, logger, toolsRegistry);
     const outboundHandler = (session, event) => {
         observeTurn(session.header.id, event);
         const record = manager.findBySessionId(session.header.id);
@@ -178,16 +169,26 @@ export function createInteractionOutbound(ctx, manager, sender, config, logger, 
                 }
             }
             if(record.interactionSuppressed)return;
-            const target = { ...record.replyTarget };
             if(['turn/start','turn/end','assistant/message'].includes(event.type))trace('host-event',{seq:event.seq,turn:event.data?.turn});
-            policy.bind({ key: manager, requireIngress: true, deliveryReceipts:true,trace,sendText: async (text,meta) => {const to=targetFor(record,meta,target);for(const part of pieces(text)){if(meta?.cancelled?.())return;await sender.sendMarkdown(to, part,{delivery:{...scope,...meta}});meta?.onDelivered?.();}},
-                waitingForUser: () => manager.approvalChannel?.pending.has(record.sessionKey) || manager.questionChannel?.pending.has(record.sessionKey),
-                ...(config.streaming && target.scope === 'c2c' && target.msgId ? { openStream: meta => boundedStream(targetFor(record,meta,target),{...scope,...meta}) } : {}) });
+            // The policy commits complete bubbles; each is one logical message.
+            // Only 'sent' resolves: anything else is reported with its delivery
+            // state, and the policy never resends an unconfirmed bubble.
+            policy.bind({ key: manager, requireIngress: true, trace, sendText: async (text,meta={}) => {
+                    const kind=['assistant','status','tool-or-error'].includes(meta.kind)?meta.kind:'assistant';
+                    if(meta.cancelled?.()===true)throw Object.assign(new Error('QQ output cancelled'),{delivery:'not-sent',reason:'cancelled'});
+                    const result=await submit(record,text,{id:typeof meta.logicalId==='string'?meta.logicalId:bubbleId(record,policy,meta),input:meta.input,turn:meta.turn,signal:meta.signal,
+                        delivery:{...scope,kind,...Object.fromEntries(['turn','reply','bubble'].filter(k=>Number.isSafeInteger(meta[k])).map(k=>[k,meta[k]]))}});
+                    if(result.status==='sent')return result;
+                    if(result.reason!=='cancelled')logger.warn?.(`im-qqbot: interaction ${kind} ${result.status}${result.reason?` (${result.reason})`:''}`);
+                    throw Object.assign(new Error('QQ output '+result.status),{delivery:result.status,reason:result.reason});
+                },
+                waitingForUser: () => manager.approvalChannel?.pending.has(record.sessionKey) || manager.questionChannel?.pending.has(record.sessionKey) });
             policy.event(event);
             if (['assistant/chunk', 'assistant/message'].includes(event.type)) return;
         }
         return legacyOutbound(session, event);
     };
+    outboundHandler.delivery=id=>typeof id==='string'?deliveries.get(id):undefined;
     return outboundHandler;
 }
 export async function bootstrapGateway(ctx, agents, config, logger) {
@@ -245,7 +246,7 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
     catch {
         toolsRegistry = undefined;
     }
-    // 发送适配器：将 QQBot 实例适配为 QQBotSender（openStream 参数形态不同）。
+    // 发送适配器：将 QQBot 实例适配为 QQBotSender（只保留静态 Markdown；聊天输出不再使用 SDK 流式消息）。
     // sendMarkdown 统一做被动回复限额管控：同一 msgId 超限/过期时降级主动推送。
     const replyLimiter = new ReplyLimiter({ limit: 4 });
     const diagnostics=typeof deliveryRecorder==='undefined'?null:deliveryRecorder;
@@ -256,39 +257,20 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
             try{const result=await sendResolvedMarkdown(bot,resolved,content,opts);diagnostics?.trace('static-receipt',{...fields,receipt:diagnostics?.hash(result?.id),missingReceipt:!result?.id});return result;}
             catch(error){diagnostics?.trace('static-failure',{...fields,httpStatus:error?.httpStatus,bizCode:error?.bizCode});throw error;}
         },
-        openStream: (target,meta={}) => {
-            const resolved=resolveReplyTarget(target, replyLimiter, false);
-            const fields={...meta,input:diagnostics?.hash(resolved.msgId),stream:diagnostics?.hash(randomUUID()),passive:!!resolved.msgId};
-            diagnostics?.trace('stream-open',fields);
-            if(!resolved.msgId){
-                let text='',cancelled=false;
-                return {async update(value){text=value;},async complete(){if(!cancelled){let result;try{result=await sendResolvedMarkdown(bot,resolved,text);}catch(error){diagnostics?.trace('fallback-failure',{...fields,length:text.length,httpStatus:error?.httpStatus,bizCode:error?.bizCode});throw error;}diagnostics?.trace('fallback-receipt',{...fields,length:text.length,textHash:diagnostics?.hash(text),receipt:diagnostics?.hash(result?.id)});meta.onDelivered?.();}},cancel(){cancelled=true;diagnostics?.trace('stream-cancel',fields);}};
-            }
-            const stream=bot.openStream({
-            target: {
-                scope: target.scope,
-                targetId: target.targetId,
-                msgId: resolved.msgId,
-            },
-        });
-            stream.observe?.(event=>{
-                diagnostics?.trace('stream-'+event.type,{...fields,index:event.index,msgSeq:event.msgSeq,state:event.state,retry:event.retry,associated:!!event.streamMsgId,association:diagnostics?.hash(event.streamMsgId),length:event.text?.length,textHash:diagnostics?.hash(event.text),receipt:diagnostics?.hash(event.receiptId),missingReceipt:event.type==='receipt'&&!event.receiptId,httpStatus:event.httpStatus,bizCode:event.bizCode});
-                if(event.type==='receipt')meta.onDelivered?.();
-            });
-            return stream;
-        },
     };
+    // Optional Agent policy. No Character, Remote Ops or policy package dependency.
+    const outboundHandler = createInteractionOutbound(ctx, manager, sender, config, logger, toolsRegistry,deliveryRecorder, io, conversation);
     // Unified Agent I/O text adapter for this application, behind the shared
-    // route check. It reuses the sender above for reply targets, passive-reply
-    // quota and diagnostics.
+    // route check: the only QQ chat output path. It reuses the sender above for
+    // reply targets, passive-reply quota and diagnostics; an Interaction bubble
+    // answers the reply target of its own input.
     const releaseTextAdapter = conversation.registerAdapter(createQQTextAdapter({
         limit: config.textChunkLimit ?? 4500,
         split: text => chunkMarkdownText(text, config.textChunkLimit ?? 4500),
-        send: (target, text, info) => sender.sendMarkdown(target, text, { delivery: { session: diagnostics?.hash(info.sessionId), index: info.index } }),
+        replyTarget: (_record, messageId) => outboundHandler.delivery(messageId)?.target,
+        send: (target, text, info) => sender.sendMarkdown(target, text, { delivery: { ...outboundHandler.delivery(info.messageId)?.delivery, session: diagnostics?.hash(info.sessionId), index: info.index } }),
     }));
     ctx.effect(() => releaseTextAdapter);
-    // Optional Agent policy. No Character, Remote Ops or policy package dependency.
-    const outboundHandler = createInteractionOutbound(ctx, manager, sender, config, logger, toolsRegistry,deliveryRecorder, io, conversation);
     ctx
         .on('session/event', outboundHandler);
     // ── 问答通道（ask_user_question → QQ 文本 + 按钮） ──

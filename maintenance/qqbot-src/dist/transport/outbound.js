@@ -61,16 +61,10 @@ class OutboundRouter {
     onChunk(sessionId, record, event) {
         let buffer = this.buffers.get(sessionId);
         if (buffer === undefined) {
-            buffer = new OutboundBuffer(record, this.bot, this.config.textChunkLimit, this.logger, this.shouldStream(record));
+            buffer = new OutboundBuffer(record, this.bot, this.config.textChunkLimit, this.logger);
             this.buffers.set(sessionId, buffer);
         }
         buffer.append(event.text);
-    }
-    /** 是否启用流式：配置开启 + c2c + 有 msgId（群聊不支持流式） */
-    shouldStream(record) {
-        return this.config.streaming
-            && record.replyTarget.scope === 'c2c'
-            && !!record.replyTarget.msgId;
     }
     /** 完整 assistant 消息：有流式 buffer 则 flush，否则直接发送文本块 */
     onMessage(sessionId, record, event, origin) {
