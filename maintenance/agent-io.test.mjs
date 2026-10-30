@@ -3,8 +3,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import {registerHooks} from 'node:module';
 import {createAgentIO} from '../plugin-sources/dsh-agent-io/io.mjs';
-import * as plugin from '../plugin-sources/dsh-agent-io/index.mjs';
+// The Host provides @deepseek-ai/dsh-llm to plugins; a stand-in outside the Host.
+registerHooks({resolve:(specifier,context,next)=>specifier==='@deepseek-ai/dsh-llm'?{url:'data:text/javascript,export const createUserMessage=m=>({role:"user",...m})',shortCircuit:true}:next(specifier,context)});
+const plugin=await import('../plugin-sources/dsh-agent-io/index.mjs');
 
 const deferred=()=>{let resolve,reject;const promise=new Promise((a,b)=>{resolve=a;reject=b;});return {promise,resolve,reject};};
 const tick=()=>new Promise(r=>setImmediate(r));
@@ -31,9 +34,11 @@ test('a text message reaches the adapter once and multi-part sends stay one logi
  assert(Object.isFrozen(r)&&Object.isFrozen(r.parts[0]));
 });
 test('the core is platform-neutral: no SDK, Character or Interaction import',()=>{
- for(const file of ['io.mjs','index.mjs']){
+ // Only the Host message constructor joins the plugin entry; the core and the
+ // Conversation wiring import nothing beyond node:crypto.
+ for(const [file,allowed] of [['io.mjs',['node:crypto']],['conversation.mjs',[]],['index.mjs',['@deepseek-ai/dsh-llm','./io.mjs','./conversation.mjs']]]){
   const imports=[...fs.readFileSync(new URL('../plugin-sources/dsh-agent-io/'+file,import.meta.url),'utf8').matchAll(/^import .* from '([^']+)'/gm)].map(m=>m[1]);
-  assert(imports.every(i=>i==='node:crypto'||i==='./io.mjs'),file+': '+imports);
+  assert(imports.every(i=>allowed.includes(i)),file+': '+imports);
  }
 });
 test('the same logical message id is never sent twice, even while the first send is in flight',async()=>{
@@ -188,7 +193,7 @@ test('send events carry only enums and counts, never text, ids or targets',async
 });
 test('the Host plugin provides one frozen agentIO service and closes it with the context',async()=>{
  let service,cleanup;plugin.apply({provide:(name,value)=>{assert.equal(name,'agentIO');service=value;},effect:f=>{cleanup=f();},logger:{debug(){}}},{maxConcurrent:1});
- assert(Object.isFrozen(service));assert.deepEqual(Object.keys(service).sort(),['openInbound','registerAdapter','sendMessage']);
+ assert(Object.isFrozen(service));assert.deepEqual(Object.keys(service).sort(),['openConversation','openInbound','registerAdapter','sendMessage']);
  const f=fakeAdapter();f.routes.set('peer','s1');service.registerAdapter(f.adapter);assert.equal((await service.sendMessage(msg())).status,'sent');
  await cleanup();assert.equal((await service.sendMessage(msg())).reason,'closed');
  assert.deepEqual(plugin.inject,[]);assert.equal(plugin.name,'agent-io');

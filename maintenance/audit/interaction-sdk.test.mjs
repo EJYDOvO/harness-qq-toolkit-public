@@ -2,6 +2,8 @@
 // Assertions describe release requirements and intentionally remain red on test.10.
 import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import vm from 'node:vm';import path from 'node:path';import {pathToFileURL} from 'node:url';
 import {Interaction} from '../../../character-agent-v1/packages/interaction-policy/policy.mjs';
+import {createConversations} from '../../plugin-sources/dsh-agent-io/conversation.mjs';
+import {createAgentIO} from '../../plugin-sources/dsh-agent-io/io.mjs';
 const sdk=process.env.QQBOT_AUDIT_SDK_DIR,qq=process.env.QQBOT_AUDIT_DIST;
 assert(sdk&&qq,'Set QQBOT_AUDIT_SDK_DIR and QQBOT_AUDIT_DIST to isolated code-only fixture directories');
 const {StreamSession}=await import(pathToFileURL(path.join(sdk,'streaming.js')));
@@ -24,10 +26,14 @@ function fixture(t,{streaming=false,rejectOver=Infinity,onRequest,diagnostics}={
  const api=new MessageApi({async request(_token,_method,_path,body){payloads.push(structuredClone(body));if((body.markdown?.content??body.content_raw??'').length>rejectOver)throw Error('fixture: over platform limit');if(onRequest)await onRequest(body);return {id:'synthetic-stream'};}},{getAccessToken:async()=> 'synthetic-token'},{markdownSupport:true});
  const bot={sendMarkdown:(target,text)=>api.sendRaw(target.scope,target.targetId,{appId:'fixture',clientSecret:'dummy'},{markdown:{content:text},msg_id:target.msgId}),send:opts=>api.sendRaw(opts.target.scope,opts.target.targetId,{appId:'fixture',clientSecret:'dummy'},{markdown:opts.markdown,...opts.extra}),openStream:({target})=>{const stream=new StreamSession(api,{openid:target.targetId,msgId:target.msgId,creds:{appId:'fixture',clientSecret:'dummy'},throttleMs:300});bubbles.push(stream);return stream;}};
  const {sender,replyLimiter}=makeSender(bot,diagnostics);
- const record={agent,sessionKey:'fixture',replyTarget:{scope:'c2c',targetId:'fixture-owner',msgId:'fixture-message'}};
- const manager={getSessionRecord:()=>record,findBySessionId:()=>record};
- const outbound=makeOutbound({get:()=>({serviceFor:()=>({get:()=>policy})})},manager,sender,{streaming,textChunkLimit:4500},{},undefined,diagnostics);
+ const record={agent,sessionKey:'fixture',scope:'c2c',peerId:'fixture-owner',replyTarget:{scope:'c2c',targetId:'fixture-owner',msgId:'fixture-message'}};
+ const manager={getOrCreate:async()=>record,getSessionRecord:()=>record,isCurrentSession:r=>r===record,findBySessionId:()=>record};
+ // The shared Conversation wiring supplies the policy, as in the Gateway.
+ const conversation=createConversations({},{createInput:m=>m,interactionPolicy:()=>policy})({platform:'qq-official',adapter:'qq-official-gateway',accountId:'fixture',manager,scopes:{direct:'c2c',group:'group'},admits:()=>true});
+ const outbound=makeOutbound({get:()=>{throw Error('policy comes from the Conversation wiring');}},manager,sender,{streaming,textChunkLimit:4500},{},undefined,diagnostics,undefined,conversation);
  const event=(type,data={})=>outbound(agent.session,{type,data});
+ // What the shared handoff does for an admitted QQ input: QQ tracking, then the policy.
+ manager.registerInteractionInput=(r,m)=>{manager.trackInteractionInput(r,m);policy.admitInput(m);};
  const input={id:'native-fixture-input',source:{kind:'user'}};manager.registerInteractionInput(record,input);event('turn/start',{turn:1});event('user/message',{turn:1,message:input});
  const final=text=>event('assistant/message',{turn:1,message:{content:[{type:'text',text}]}});
  return {policy,record,manager,sender,replyLimiter,payloads,bubbles,event,final,timers};
@@ -116,14 +122,15 @@ test('Q12 merge survivor retains per-peer exclusion until its downstream complet
 // Reuse the existing deterministic middleware fixture, which evaluates the actual
 // patched middleware body. The assertions below cover gaps in its original tests.
 const support=fs.readFileSync(new URL('../interaction.test.mjs',import.meta.url),'utf8');
+const wiringSource=support.slice(support.indexOf('const wiring='),support.indexOf('\n',support.indexOf('const wiring=')));
 const fixtureSource=support.slice(support.indexOf('function middleware('),support.indexOf("test('explicit correction"));
-const middlewareFixture=vm.runInNewContext(fixtureSource+'\n;middleware;',{fs,vm,assert,URL,base:new URL('../qqbot-src/dist/gateway/',import.meta.url)});
+const middlewareFixture=vm.runInNewContext(wiringSource+'\n'+fixtureSource+'\n;middleware;',{fs,vm,assert,URL,Math,createAgentIO,createConversations,base:new URL('../qqbot-src/dist/gateway/',import.meta.url)});
 test('Q13 generic correction refreshes reply target without Character admission hook',async()=>{
  const f=middlewareFixture();f.record.replyTarget={scope:'c2c',targetId:'owner',msgId:'old'};
  await f.run('更正：保留文件',{message:{kind:'c2c',senderId:'owner',messageId:'new',content:'更正：保留文件'}});assert.equal(f.record.replyTarget.msgId,'new');
 });
 test('Q14 native stop remains available if a reloading policy service cannot resolve its Agent',async()=>{
- const f=middlewareFixture();f.manager.ctx.get=()=>({serviceFor:()=>({get(){throw Error('Agent outside Interaction scope');}})});
+ const f=middlewareFixture('throw');
  await assert.doesNotReject(()=>f.run('/stop'));assert(f.events.some(e=>e[0]==='native-stop'));
 });
 

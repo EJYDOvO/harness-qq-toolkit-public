@@ -1,11 +1,12 @@
 {
   "name": "dsh-agent-io",
-  "version": "0.1.0-test.3",
+  "version": "0.1.0-test.4",
   "type": "module",
   "main": "index.mjs",
   "exports": {
     ".": "./index.mjs",
-    "./io": "./io.mjs"
+    "./io": "./io.mjs",
+    "./conversation": "./conversation.mjs"
   },
   "files": [
     "*.mjs",

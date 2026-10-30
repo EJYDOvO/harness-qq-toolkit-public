@@ -5,7 +5,7 @@ import { resolve as diagnosticPath } from 'node:path';
 import { homedir as diagnosticHome } from 'node:os';
 import { SessionManager } from "../session/index.js";
 import { handleInbound, createOutboundHandler, chunkMarkdownText } from "../transport/index.js";
-import { QQ_OFFICIAL, qqConversation, createQQTextAdapter } from "../transport/qq-text-adapter.js";
+import { QQ_OFFICIAL, QQ_SCOPES, accessAllows, createQQTextAdapter } from "../transport/qq-text-adapter.js";
 import { deliverInbound } from "../transport/inbound.js";
 import { ReplyLimiter } from "../transport/reply-limiter.js";
 import { cacheMsgId, cacheEventId } from "../transport/msgid-cache.js";
@@ -75,8 +75,10 @@ function dispatchInteraction(event, manager) {
     return false;
 }
 // Reusable transport wiring, separately testable without creating a QQ gateway.
-export function createInteractionOutbound(ctx, manager, sender, config, logger, toolsRegistry, diagnostics, io) {
-    const policyFor = record => { try { return record && ctx.get('agentPresets')?.serviceFor?.(record.agent, 'interactionPolicy')?.get(record.agent); } catch { logger.warn?.('Interaction scope temporarily unavailable; withholding output');return null; } };
+export function createInteractionOutbound(ctx, manager, sender, config, logger, toolsRegistry, diagnostics, io, conversation) {
+    // The Agent's Interaction policy from the shared Conversation wiring (the
+    // same lookup the inbound handoff uses); null means the lookup failed.
+    const policyFor = record => { if (!record) return record; const policy = conversation.policy(record); if (policy === null) logger.warn?.('Interaction scope temporarily unavailable; withholding output'); return policy; };
     // Reply targets stay on the QQ side: Interaction only names the native input id.
     const rememberTarget=(record,message)=>{
         if(typeof message?.id!=='string'||!record.replyTarget)return;
@@ -84,11 +86,9 @@ export function createInteractionOutbound(ctx, manager, sender, config, logger, 
         while(targets.size>100)targets.delete(targets.keys().next().value);
     };
     const targetFor=(record,meta,fallback)=>{const own=typeof meta?.input==='string'?record.interactionTargets?.get(meta.input):undefined;return own?{...own}:fallback;};
-    manager.interactionPolicy=record=>policyFor(record)??undefined;
-    manager.registerInteractionInput=(record,message)=>{
-        const policy=policyFor(record);
-        if(policy){record.interactionSuppressed=false;rememberTarget(record,message);policy.admitInput?.(message);}
-    };
+    // QQ side of an admitted Interaction input (the shared handoff calls the
+    // policy itself): resume output and remember the input's reply target.
+    manager.trackInteractionInput=(record,message)=>{record.interactionSuppressed=false;rememberTarget(record,message);};
     const limit = Math.max(100, Math.min(4500, config.textChunkLimit ?? 4500));
     function pieces(text) {
         const parts=[];
@@ -151,7 +151,7 @@ export function createInteractionOutbound(ctx, manager, sender, config, logger, 
             // legitimate messages with equal text never do. No id is invented.
             const id=Number.isSafeInteger(origin?.seq)&&['assistant','tool','turn-error'].includes(origin.kind)?`qq:${record.sessionId}:${origin.seq}:${origin.kind}`:undefined;
             const signal=turnControl(record.sessionId,origin?.turn)?.signal;
-            const result=await io.sendMessage({...(id?{id}:{}),target:{platform:QQ_OFFICIAL,accountId:config.appId,conversation:qqConversation(record)},origin:{sessionId:record.sessionId},message:{text},...(signal?{signal}:{})});
+            const result=await io.sendMessage({...(id?{id}:{}),target:conversation.target(record),origin:{sessionId:record.sessionId},message:{text},...(signal?{signal}:{})});
             if(result.duplicate)logger.debug?.(`im-qqbot: ${tag} duplicate suppressed`);
             else if(result.status!=='sent')logger.warn?.(`im-qqbot: ${tag} ${result.status}${result.reason?` (${result.reason})`:''}`);
         }
@@ -198,8 +198,16 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
     ctx.effect(() => async () => { await shutdown?.(); if (gatewayLeases.get(config.appId) === lease) gatewayLeases.delete(config.appId); });
     const io = ctx.get('agentIO');
     if (!io) throw new Error('Install and configure dsh-agent-io before QQ');
+    if (typeof io.openConversation !== 'function') throw new Error('dsh-agent-io 0.1.0-test.4 or later (openConversation) is required before QQ');
     const manager = new SessionManager(ctx, agents, config, logger);
     ctx.effect(()=>()=>manager.disposeAll()); // also release the adapter if SDK setup fails
+    // One Conversation wiring for this application: the same Conversation
+    // reference, Manager route and current-Session check for the inbound handoff
+    // and the outbound text adapter. The access configuration admits both ways.
+    const conversation = io.openConversation({ platform: QQ_OFFICIAL, adapter: 'qq-official-gateway', accountId: config.appId, manager, scopes: QQ_SCOPES,
+        admits: (scope, peer) => accessAllows(config.access, scope, peer),
+        onInput: (record, message, policy) => { if (policy) manager.trackInteractionInput?.(record, message); } });
+    ctx.effect(() => conversation.close);
     const deliveryRecorder=createDeliveryRecorder(config.deliveryDiagnostics,logger);
     ctx.effect(()=>()=>deliveryRecorder?.close());
     // ── 初始化 QQ Bot SDK ──
@@ -215,9 +223,9 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
     });
     logger.info(`QQBot SDK initialized (UA: ${userAgent})`);
     // ── 中间件链 ──
-    setupMiddlewares(bot, config, manager, logger);
-    // ── 入站：经过中间件链后的普通聊天消息 → Unified Agent I/O 入站通道（去重）→ 可信会话入口 → dsh agent ──
-    const inbound = io.openInbound({ platform: QQ_OFFICIAL, adapter: 'qq-official-gateway', accountId: config.appId, deliver: standard => deliverInbound(standard, manager, config, logger) });
+    setupMiddlewares(bot, config, manager, logger, conversation);
+    // ── 入站：经过中间件链后的普通聊天消息 → Unified Agent I/O 入站通道（去重）→ 可信会话入口 → 共享交接 → dsh agent ──
+    const inbound = conversation.openInbound(standard => deliverInbound(standard, conversation, config, logger));
     ctx.effect(() => inbound.close);
     bot.on('message', async (mCtx) => {
         const msg = mCtx.message;
@@ -226,7 +234,7 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
         if (config.debug) {
             logger.debug(`← message (post-middleware): ${JSON.stringify(msg, null, 2).slice(0, 500)}`);
         }
-        await handleInbound(mCtx, manager, config, logger, inbound);
+        await handleInbound(mCtx, logger, inbound);
     });
     // ── 出站：dsh session/event → QQ 消息 ──
     // 获取 tools 服务（工具结果结构化展示），可选
@@ -270,16 +278,17 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
             return stream;
         },
     };
-    // Unified Agent I/O text adapter for this application. It reuses the sender
-    // above for reply targets, passive-reply quota and diagnostics.
-    const releaseTextAdapter = io.registerAdapter(createQQTextAdapter({
-        accountId: config.appId, manager, access: config.access, limit: config.textChunkLimit ?? 4500,
+    // Unified Agent I/O text adapter for this application, behind the shared
+    // route check. It reuses the sender above for reply targets, passive-reply
+    // quota and diagnostics.
+    const releaseTextAdapter = conversation.registerAdapter(createQQTextAdapter({
+        limit: config.textChunkLimit ?? 4500,
         split: text => chunkMarkdownText(text, config.textChunkLimit ?? 4500),
         send: (target, text, info) => sender.sendMarkdown(target, text, { delivery: { session: diagnostics?.hash(info.sessionId), index: info.index } }),
     }));
     ctx.effect(() => releaseTextAdapter);
     // Optional Agent policy. No Character, Remote Ops or policy package dependency.
-    const outboundHandler = createInteractionOutbound(ctx, manager, sender, config, logger, toolsRegistry,deliveryRecorder, io);
+    const outboundHandler = createInteractionOutbound(ctx, manager, sender, config, logger, toolsRegistry,deliveryRecorder, io, conversation);
     ctx
         .on('session/event', outboundHandler);
     // ── 问答通道（ask_user_question → QQ 文本 + 按钮） ──

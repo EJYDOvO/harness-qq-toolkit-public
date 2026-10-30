@@ -9,6 +9,7 @@ import path from 'node:path';
 import vm from 'node:vm';
 import {fileURLToPath} from 'node:url';
 import {createAgentIO} from '../plugin-sources/dsh-agent-io/io.mjs';
+import {qqAdapter as adapterModule,qqConversation} from './qq-conversation-fixture.mjs';
 
 const dist=new URL('./qqbot-src/dist/',import.meta.url);
 const read=file=>fs.readFileSync(new URL(file,dist),'utf8').replaceAll('\r\n','\n');
@@ -17,7 +18,6 @@ const load=(file,names,context={})=>vm.runInNewContext(strip(read(file))+`\n;({$
 const slice=(source,start,end)=>{const a=source.indexOf(start),b=source.indexOf(end,a);assert(a>=0&&b>a,start);return source.slice(a,b);};
 const tick=async(n=5)=>{for(let i=0;i<n;i++)await new Promise(r=>setImmediate(r));};
 
-const adapterModule=load('transport/qq-text-adapter.js','QQ_OFFICIAL,qqConversation,classifyQQError,accessAllows,createQQTextAdapter');
 const {ReplyLimiter}=load('transport/reply-limiter.js','ReplyLimiter');
 const {resolveReplyTarget,sendResolvedMarkdown}=load('transport/reply-target.js','resolveReplyTarget,sendResolvedMarkdown',{MsgType:{MARKDOWN:2},getCachedReplyIds:()=>[]});
 // Real chunker when a validation profile is present (same resolution as the
@@ -52,23 +52,25 @@ function gateway({io=createAgentIO(),appId='app-a',policy,streaming=false,limit=
  agents.set('s1',record.agent);
  const sessions=new Map([['c2c:owner',record]]);
  // The Manager's ownership contract: the record is the mapped one and its live Agent is registered.
- const manager={getSessionRecord:(scope,peer)=>sessions.get(scope+':'+peer),findBySessionId:id=>[...sessions.values()].find(r=>r.sessionId===id),
+ const manager={getOrCreate:async()=>{throw Error('no inbound in these fixtures');},getSessionRecord:(scope,peer)=>sessions.get(scope+':'+peer),findBySessionId:id=>[...sessions.values()].find(r=>r.sessionId===id),
   isCurrentSession:r=>sessions.get((r.scope)+':'+r.peerId)===r&&agents.get(r.sessionId)===r.agent,approvalChannel:{pending:new Map()},questionChannel:{pending:new Map()}};
  const logger={info(){},debug:m=>logs.push(['debug',m]),warn:m=>logs.push(['warn',m]),error:m=>logs.push(['error',m])};
  const config={appId,streaming,textChunkLimit:limit,showToolResults:false,access:access??{c2cMode:'allowlist',c2cAllow:['owner'],groupMode:'allowlist',groupAllow:['grp']}};
- const ctx={get:name=>name==='agentPresets'?{serviceFor:()=>policy?{get:()=>policy}:undefined}:undefined,effect:f=>cleanups.push(f())};
+ const ctx={get:()=>undefined,effect:f=>cleanups.push(f())};
+ // The application's Conversation wiring, as bootstrapGateway opens it.
+ const conversation=qqConversation({io,manager,config,policy:()=>policy});
  const chunkMarkdownText=(text,max)=>chunker(text,max);
  // The gateway's own sender and adapter registration, exactly as reviewed.
  const wiring=slice(source,'    const replyLimiter = new ReplyLimiter({ limit: 4 });','    // Optional Agent policy. No Character');
  const {sender,diagnostics}=vm.runInNewContext('(function(){'+wiring+';return {sender,diagnostics};})()',{
-  ReplyLimiter,deliveryRecorder:recorder,bot,randomUUID:()=>'00000000-0000-4000-8000-000000000000',resolveReplyTarget,sendResolvedMarkdown,io,createQQTextAdapter:adapterModule.createQQTextAdapter,config,manager,chunkMarkdownText,ctx});
+  ReplyLimiter,deliveryRecorder:recorder,bot,randomUUID:()=>'00000000-0000-4000-8000-000000000000',resolveReplyTarget,sendResolvedMarkdown,io,conversation,createQQTextAdapter:adapterModule.createQQTextAdapter,config,manager,chunkMarkdownText,ctx});
  // The original outbound router and buffer with their patched static send.
  class StreamingWriter{constructor(deps){this.deps=deps;this.text='';(writer??={}).instances=[...(writer.instances??[]),this];}append(t){this.text+=t;}async finish(){this.finished=true;}get shouldFallback(){return writer?.fallback===true;}abort(){this.aborted=true;}}
  const {OutboundBuffer}=load('transport/outbound-buffer.js','OutboundBuffer',{StreamingWriter});
  const {createOutboundHandler}=load('transport/outbound.js','createOutboundHandler',{OutboundBuffer,formatToolResult:name=>`工具 ${name} 失败`,parseEvent,extractTurnError});
  const body=slice(source,'    const policyFor =','    return outboundHandler;');
  const handler=vm.runInNewContext('(function(){'+body+';return outboundHandler;})()',{
-  ctx,manager,sender,config,logger,toolsRegistry:undefined,diagnostics,io,createOutboundHandler,chunkMarkdownText,AbortController,QQ_OFFICIAL:adapterModule.QQ_OFFICIAL,qqConversation:adapterModule.qqConversation});
+  ctx,manager,sender,config,logger,toolsRegistry:undefined,diagnostics,io,conversation,createOutboundHandler,chunkMarkdownText,AbortController});
  // Native Session events as the Host emits them: durable seq, Turn in data.
  let seq=0,call=0;const session={header:{id:'s1'}};
  const emit=(event,id=record.sessionId)=>{handler({header:{id}},event);return event;};
@@ -80,7 +82,7 @@ function gateway({io=createAgentIO(),appId='app-a',policy,streaming=false,limit=
   tool:(name,error,turn=1)=>{const callId='call-'+(++call);native('tool/call',{turn,step:1,callId,name,arguments:'{}'});return native('tool/result',{turn,step:1,message:{role:'tool',source:{callId},content:[]},...(error?{error:{name:'Error',code:error}}:{})});},
   end:(reason={kind:'completed'},turn=1)=>native('turn/end',{turn,reason}),
  };
- return {io,bot,logs,record,sessions,agents,manager,emit,ev,writer,cleanups,diagnostics,sender,config,session};
+ return {io,bot,logs,record,sessions,agents,manager,conversation,emit,ev,writer,cleanups,diagnostics,sender,config,session};
 }
 const warns=g=>g.logs.filter(([level])=>level!=='debug');
 test('a plain Agent reply without Interaction reaches QQ once through the Unified I/O, with a stable event id',async()=>{
@@ -199,7 +201,7 @@ test('two QQ applications on one I/O keep separate adapters, queues and targets'
 });
 test('a group Conversation maps to the QQ group scope and its own record',async()=>{
  const g=gateway();g.sessions.clear();const group={...g.record,scope:'group',peerId:'grp',replyTarget:{scope:'group',targetId:'grp',msgId:'g1'}};g.sessions.set('group:grp',group);
- assert.deepEqual({...adapterModule.qqConversation(group)},{type:'group',id:'grp'});
+ assert.deepEqual(JSON.parse(JSON.stringify(g.conversation.target(group))),{platform:'qq-official',accountId:'app-a',conversation:{type:'group',id:'grp'}});
  const r=await g.io.sendMessage({target:{platform:'qq-official',accountId:'app-a',conversation:{type:'group',id:'grp'}},origin:{sessionId:'s1'},message:{text:'群消息'}});
  assert.equal(r.status,'sent');assert.deepEqual(g.bot.sent,[{msgId:'g1',eventId:undefined,targetId:'grp',content:'群消息'}]);
  const wrong=await g.io.sendMessage({target:{platform:'qq-official',accountId:'app-a',conversation:{type:'direct',id:'grp'}},origin:{sessionId:'s1'},message:{text:'x'}});
@@ -217,14 +219,15 @@ test('QQ error classification only treats a 4xx refusal as not sent',()=>{
  assert.deepEqual([0,408,429,400,403,500,503,200].map(s=>[s,c(new ApiError(s)).outcome]),[[0,'unknown'],[408,'unknown'],[429,'not-sent'],[400,'not-sent'],[403,'not-sent'],[500,'unknown'],[503,'unknown'],[200,'unknown']]);
  assert.equal(c(new Error('socket hang up')).outcome,'unknown');assert.equal(c(undefined).outcome,'unknown');
 });
-test('the adapter refuses a Manager without the ownership check and mirrors the SDK access rules',()=>{
- assert.throws(()=>adapterModule.createQQTextAdapter({accountId:'a',manager:{getSessionRecord(){}},send(){},split:t=>[t]}),/ownership check required/);
+test('the wiring refuses a Manager without the ownership check, and the access rules mirror the SDK',()=>{
+ assert.throws(()=>qqConversation({io:createAgentIO(),manager:{getOrCreate(){},getSessionRecord(){}},config:{appId:'a',access:{}}}),/ownership check required/);
  const allows=adapterModule.accessAllows;
  assert.deepEqual([allows({c2cMode:'allowlist',c2cAllow:['u']},'c2c','u'),allows({c2cMode:'allowlist',c2cAllow:['u']},'c2c','v'),allows({c2cMode:'allowlist',c2cAllow:[]},'c2c','u'),allows({c2cMode:'allowlist',c2cAllow:['*']},'c2c','v'),allows({},'c2c','u'),allows({groupMode:'disabled'},'group','g'),allows({groupMode:'allowlist',groupAllow:['g']},'group','g'),allows({c2cMode:'bogus'},'c2c','u')],[true,false,false,true,true,false,true,false]);
 });
 test('the QQ plugin declares the agentIO service and the gateway refuses to start without it',()=>{
  assert.match(read('index.js'),/inject = \['agents', 'conversationManager', 'agentIO'\]/);
  assert.match(read('gateway/bootstrap.js'),/if \(!io\) throw new Error\('Install and configure dsh-agent-io before QQ'\)/);
+ assert.match(read('gateway/bootstrap.js'),/if \(typeof io\.openConversation !== 'function'\) throw new Error\('dsh-agent-io 0\.1\.0-test\.4 or later \(openConversation\) is required before QQ'\)/,'an older I/O package stops the Gateway with a clear error');
  assert.match(read('gateway/middleware-setup.js'),/manager\.cancelOutput\?\.\(record\)/,'/stop cancels unsent I/O output first');
  // The original router no longer holds a direct static sender.
  for(const file of ['transport/outbound.js','transport/outbound-buffer.js'])assert(!/\.sendMarkdown\(|chunkMarkdownText/.test(strip(read(file)).replace(/\/\*\*[\s\S]*?\*\//g,'')),file);
