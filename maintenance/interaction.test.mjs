@@ -2,19 +2,23 @@
 // tests prove adapter wiring, not QQ network delivery or SDK internals.
 import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import vm from 'node:vm';
 import {createAgentIO} from '../plugin-sources/dsh-agent-io/io.mjs';
+import {createConversations} from '../plugin-sources/dsh-agent-io/conversation.mjs';
 const base=new URL('./qqbot-src/dist/gateway/',import.meta.url);
+// The shared Conversation wiring as the agent-io plugin builds it, with a stand-in native message.
+const wiring=(io,manager,interactionPolicy,extra={})=>createConversations(io,{createInput:m=>({id:'native-'+Math.random().toString(36).slice(2),...m}),interactionPolicy})({platform:'qq-official',adapter:'qq-official-gateway',accountId:extra.accountId??'app',manager,scopes:{direct:'c2c',group:'group'},admits:()=>true,...extra});
 function outbound(policy,streaming=true,diagnostics){
  const source=fs.readFileSync(new URL('bootstrap.js',base),'utf8').replaceAll('\r\n','\n');
  const start=source.indexOf('    const policyFor ='),end=source.indexOf('    return outboundHandler;',start);assert(start>=0&&end>start);
  const body=source.slice(start,end);
  assert(body.includes('const outboundHandler'));assert(!body.includes('bootstrapGateway'));
  const sent=[],legacy=[],delivered=[],record={sessionKey:'fixture',sessionId:'fixture',agent:{},replyTarget:{scope:'c2c',targetId:'owner',msgId:'m1'},scope:'c2c',peerId:'owner'};
- const manager={getSessionRecord:()=>record,findBySessionId:()=>record,approvalChannel:{pending:new Map()},questionChannel:{pending:new Map()}};
+ const manager={getOrCreate:async()=>record,getSessionRecord:()=>record,isCurrentSession:r=>r===record,findBySessionId:()=>record,approvalChannel:{pending:new Map()},questionChannel:{pending:new Map()}};
  const sender={sendMarkdown:async(t,s)=>sent.push([t,s]),openStream:()=>({update:async()=>{},complete:async()=>{}})};
  const io={sendMessage:async request=>{delivered.push(request);return {status:'sent',parts:[]};}};
+ const conversation=wiring(io,manager,a=>{assert.equal(a,record.agent);return policy;});
  const handler=vm.runInNewContext('(function(){'+body+';return outboundHandler;})()',{
-  ctx:{get:()=>({serviceFor:()=>policy?{get:a=>{assert.equal(a,record.agent);return policy;}}:undefined})},manager,sender,config:{streaming,appId:'app'},logger:{},toolsRegistry:undefined,diagnostics,io,
-  chunkMarkdownText:text=>[text],QQ_OFFICIAL:'qq-official',qqConversation:r=>({type:'direct',id:r.peerId}),
+  ctx:{get:()=>{throw Error('the policy comes from the shared Conversation wiring');}},manager,sender,config:{streaming,appId:'app'},logger:{},toolsRegistry:undefined,diagnostics,io,conversation,
+  chunkMarkdownText:text=>[text],
   createOutboundHandler:(_m,s)=>async(session,event)=>{legacy.push(event.type);if(event.type==='tool/result')await s.deliverText(record,'tool error','sendToolResult');}
  });
  return {handler,sent,legacy,delivered,record,manager,session:{header:{id:'fixture'}}};
@@ -36,21 +40,23 @@ test('QQ no-stream configuration does not accidentally open a stream',async()=>{
 
 test('native Host context does not stop QQ output, and cannot clear background suppression',()=>{
  const events=[],p={bind(t){this.transport=t;},admitInput(){},event:e=>events.push(e.type),stopOutput(){this.stops=(this.stops??0)+1;}};
- const f=outbound(p);f.manager.registerInteractionInput(f.record,{id:'qq',source:{kind:'user'}});
+ const f=outbound(p);f.manager.trackInteractionInput(f.record,{id:'qq',source:{kind:'user'}});
  const context=kind=>f.handler(f.session,{type:'user/message',data:{message:{source:{kind}}}});
  for(const kind of ['agent-instructions','runtime-context','skill-catalog','time-context'])context(kind);
  f.handler(f.session,{type:'assistant/message'});assert.equal(p.stops??0,0);assert.equal(events.at(-1),'assistant/message');
  for(const kind of ['web','schedule','unknown']){
   context(kind);const before=events.length;context('time-context');context('agent-instructions');
   f.handler(f.session,{type:'assistant/message'});assert.equal(events.length,before);assert.equal(f.record.interactionSuppressed,true);
-  f.manager.registerInteractionInput(f.record,{id:'next-qq',source:{kind:'user'}});
+  f.manager.trackInteractionInput(f.record,{id:'next-qq',source:{kind:'user'}});
  }
 });
 function middleware(enabled=true){
  const source=fs.readFileSync(new URL('middleware-setup.js',base),'utf8').replace(/^import .*;\r?\n/gm,'').replace('export function setupMiddlewares','function setupMiddlewares');
  const chain=[],events=[],agent={status:'running'},policy={revise:m=>events.push(['revise',m]),stopOutput:()=>events.push(['stop-output'])};
- const record={agent},manager={getSessionRecord:()=>record,ctx:{get:n=>n==='agentPresets'?{serviceFor:()=>enabled?{get:()=>policy}:undefined}:undefined}};
- const sandbox={buildCommandList:()=>[{name:'stop',handler:()=>events.push(['native-stop'])}],createUserMessage:m=>m,
+ const record={agent,scope:'c2c',peerId:'owner'},manager={getOrCreate:async()=>record,getSessionRecord:()=>record,isCurrentSession:r=>r===record};
+ // enabled==='throw': a reloading policy service that cannot resolve this Agent.
+ const conversation=wiring(createAgentIO(),manager,()=>{if(enabled==='throw')throw Error('Agent outside Interaction scope');return enabled?policy:undefined;});
+ const sandbox={buildCommandList:()=>[{name:'stop',handler:()=>events.push(['native-stop'])}],
   slashCommand:({commands})=>({middleware:async(c,next)=>c.message.content==='/stop'?commands.find(x=>x.name==='stop').handler(c):next()}),
   questionAnswer:()=>async(c,next)=>{if(c.answerPending)events.push(['answer']);else await next();},
   concurrencyGuard:()=>async(_c,next)=>{events.push(['merge']);await next();},getHistoryStore(){},historyGroupKey(){},
@@ -58,7 +64,7 @@ function middleware(enabled=true){
  };
  for(const name of ['errorHandler','messageFilter','mentionGate','contentSanitizer','rateLimiter','typingIndicator','quoteRef','historyBuffer','envelopeFormatter','attachmentProcessor'])sandbox[name]=()=>async(_c,next)=>next();
  const setup=vm.runInNewContext(source+';setupMiddlewares;',sandbox);
- setup({use:f=>chain.push(f)},{access:{c2cMode:'allowlist',c2cAllow:['owner'],groupMode:'disabled',groupAllow:[]}},manager,{});
+ setup({use:f=>chain.push(f)},{access:{c2cMode:'allowlist',c2cAllow:['owner'],groupMode:'disabled',groupAllow:[]}},manager,{},conversation);
  const run=async(content,extra={})=>{const c={message:{content,kind:'c2c',senderId:'owner',...extra.message},...extra};let i=0;const next=async()=>{if(i<chain.length)await chain[i++](c,next);else events.push(['inbound']);};await next();};
  return {run,events,agent,manager,record};
 }
@@ -84,7 +90,7 @@ test('trusted correction admission must succeed and return the same record befor
 test('QQ bridge delegates non-user sources to the policy and traces suppression by enum',()=>{
  const traces=[],diagnostics={hash:v=>v===undefined?undefined:'b'.repeat(24),trace:(e,f)=>traces.push([e,f])};
  const events=[],known=new Set(['child-1']),p={bind(t){this.transport=t;},admitInput(){},event:e=>events.push(e.type),stopOutput(){this.stops=(this.stops??0)+1;},admitsSource:m=>known.has(m?.source?.senderSessionId)};
- const f=outbound(p,true,diagnostics);f.manager.registerInteractionInput(f.record,{id:'qq',source:{kind:'user'}});
+ const f=outbound(p,true,diagnostics);f.manager.trackInteractionInput(f.record,{id:'qq',source:{kind:'user'}});
  const settled=id=>f.handler(f.session,{type:'user/message',data:{message:{source:{kind:'subagent-settled',senderSessionId:id}}}});
  settled('child-1');f.handler(f.session,{type:'assistant/message'});
  assert.equal(f.record.interactionSuppressed,false);assert.equal(p.stops??0,0);assert.equal(events.at(-1),'assistant/message');
@@ -94,33 +100,34 @@ test('QQ bridge delegates non-user sources to the policy and traces suppression 
  // A recognized continuation lifts an earlier background suppression for its own turn.
  settled('child-1');assert.equal(f.record.interactionSuppressed,false);
  // Without admitsSource the original conservative suppression is kept.
- const q={bind(t){this.transport=t;},admitInput(){},event(){},stopOutput(){}},g=outbound(q);g.manager.registerInteractionInput(g.record,{id:'qq'});
+ const q={bind(t){this.transport=t;},admitInput(){},event(){},stopOutput(){}},g=outbound(q);g.manager.trackInteractionInput(g.record,{id:'qq'});
  g.handler(g.session,{type:'user/message',data:{message:{source:{kind:'subagent-settled',senderSessionId:'child-1'}}}});assert.equal(g.record.interactionSuppressed,true);
 });
 test('QQ bridge sends each reply to the target of its own input id',async()=>{
  const p={bind(t){this.transport=t;},admitInput(){},event(){}};const f=outbound(p,false);
- f.manager.registerInteractionInput(f.record,{id:'input-1',source:{kind:'user'}});
- f.record.replyTarget={scope:'c2c',targetId:'owner',msgId:'m2'};f.manager.registerInteractionInput(f.record,{id:'input-2',source:{kind:'user'}});
+ f.manager.trackInteractionInput(f.record,{id:'input-1',source:{kind:'user'}});
+ f.record.replyTarget={scope:'c2c',targetId:'owner',msgId:'m2'};f.manager.trackInteractionInput(f.record,{id:'input-2',source:{kind:'user'}});
  f.handler(f.session,{type:'turn/start'});
  await p.transport.sendText('旧任务尾部',{input:'input-1'});await p.transport.sendText('新回复',{input:'input-2'});await p.transport.sendText('无归属',{});await p.transport.sendText('未知',{input:'other'});
  assert.deepEqual(f.sent.map(([t,s])=>[s,t.msgId]),[['旧任务尾部','m1'],['新回复','m2'],['无归属','m2'],['未知','m2']]);
- for(let i=0;i<120;i++)f.manager.registerInteractionInput(f.record,{id:'bulk-'+i});assert.equal(f.record.interactionTargets.size,100);assert(!f.record.interactionTargets.has('input-1'));
+ for(let i=0;i<120;i++)f.manager.trackInteractionInput(f.record,{id:'bulk-'+i});assert.equal(f.record.interactionTargets.size,100);assert(!f.record.interactionTargets.has('input-1'));
 });
 function inbound(policy,status='running'){
  const source=fs.readFileSync(new URL('../transport/inbound.js',base),'utf8').replace(/^import .*;\r?\n/gm,'').replace(/^export (?=(?:async )?function)/gm,'');
  const events=[],timers=[];let idle;const whenIdle=new Promise(r=>idle=r);
  const agent={status,followup:m=>events.push(['followup',m.source.kind]),whenIdle:()=>{events.push(['wait']);return whenIdle;}};
- const record={agent,replyTarget:{scope:'c2c',targetId:'owner',msgId:'m1'}};
- const manager={getOrCreate:async()=>record,isCurrentSession:r=>r===record,registerInteractionInput:(_r,m)=>events.push(['register',m.source.kind]),interactionPolicy:()=>policy};
+ const record={agent,scope:'c2c',peerId:'owner',replyTarget:{scope:'c2c',targetId:'owner',msgId:'m1'}};
+ const manager={getOrCreate:async()=>record,getSessionRecord:()=>record,isCurrentSession:r=>r===record};
+ const io=createAgentIO(),conversation=wiring(io,manager,()=>policy,{accountId:'a',onInput:(_r,m)=>events.push(['register',m.source.kind])});
  const {handleInbound:handle,deliverInbound}=vm.runInNewContext('(function(){'+source+';return {handleInbound,deliverInbound};})()',{
-  accessAllows:()=>true,createUserMessage:m=>({id:'native-'+events.length,...m}),classifyContentType:()=>'file',isVoiceContentType:()=>false,clearGroupHistory(){},
+  QQ_SCOPES:{direct:'c2c',group:'group'},classifyContentType:()=>'file',isVoiceContentType:()=>false,clearGroupHistory(){},
   setInterval:(fn,ms)=>{timers.push({fn,ms});return timers.length;},clearInterval:id=>{timers[id-1].cleared=true;},
  });
  const bot={sendTyping:async(target,sec)=>events.push(['typing',target.msgId,sec]),sendMarkdown:async()=>{}};
  const config={appId:'a'},logger={info(){},warn(){},error(){},debug(){}};
  // The real inbound path: Unified Agent I/O channel -> trusted QQ Conversation entry.
- const channel=createAgentIO().openInbound({platform:'qq-official',adapter:'qq-official-gateway',accountId:'a',deliver:s=>deliverInbound(s,manager,config,logger)});
- const run=()=>handle({message:{kind:'c2c',senderId:'owner',messageId:'m2',content:'你好',attachments:[]},state:{},bot},manager,config,logger,channel);
+ const channel=conversation.openInbound(s=>deliverInbound(s,conversation,config,logger));
+ const run=()=>handle({message:{kind:'c2c',senderId:'owner',messageId:'m2',content:'你好',attachments:[]},state:{},bot},logger,channel);
  return {run,events,timers,record,idle};
 }
 test('with Interaction, input during a run goes to intervene and the guard is released at once',async()=>{

@@ -3,8 +3,7 @@ import { buildCommandList } from "../commands/index.js";
 import { attachmentProcessor } from "../middleware/attachment.js";
 import { questionAnswer } from "../middleware/question-answer.js";
 import { getHistoryStore, historyGroupKey } from "../features/history-store.js";
-import { createUserMessage } from '@deepseek-ai/dsh-llm';
-export function setupMiddlewares(bot, config, manager, logger) {
+export function setupMiddlewares(bot, config, manager, logger, conversation) {
     // 1. 错误兜底（最外层洋葱皮）
     bot.use(errorHandler());
     // 2. 消息过滤：bot 回声 + 消息去重
@@ -65,8 +64,9 @@ export function setupMiddlewares(bot, config, manager, logger) {
             // Unified Agent I/O output of this Session that has not reached QQ yet.
             if (record) manager.cancelOutput?.(record);
             try {
-                const service = record && manager.ctx.get('agentPresets')?.serviceFor?.(record.agent, 'interactionPolicy');
-                service?.get(record.agent).stopOutput();
+                const policy = record && conversation.policy(record);
+                if (policy === null) throw new Error('Interaction lookup failed');
+                policy?.stopOutput();
             } catch { logger.warn?.('Interaction unavailable during stop; continuing native cancellation'); }
             return nativeStop(cmdCtx);
         };
@@ -87,16 +87,16 @@ export function setupMiddlewares(bot, config, manager, logger) {
         const correction = /^更正[：:]\s*(\S[\s\S]*)$/u.exec(msg.content ?? '');
         if (msg.kind !== 'c2c' || !correction || msg.attachments?.length) return next();
         const record = manager.getSessionRecord('c2c', msg.senderId);
-        const policy = record && manager.ctx.get('agentPresets')?.serviceFor?.(record.agent, 'interactionPolicy')?.get(record.agent);
+        const policy = record && conversation.policy(record);
         if (!policy || record.agent.status !== 'running') return next();
         if (manager.admitInteractionInput) {
             const admitted = await manager.admitInteractionInput(mCtx);
             if (admitted !== record) throw new Error('Interaction Session changed during admission');
         }
         record.replyTarget = { scope: 'c2c', targetId: msg.senderId, msgId: msg.messageId };
-        const message=createUserMessage({ content: [{ type: 'text', text: msg.content }], source: { kind: 'user' } });
-        manager.registerInteractionInput?.(record,message);
-        policy.revise(message);
+        // The shared handoff re-checks the current Session and creates the native input.
+        const handed = conversation.submit(record, msg.content, { revise: true });
+        if (handed.status !== 'accepted') throw new Error('Interaction Session changed during admission');
     });
     // 9. 并发串行 + 消息合并（同 peer 排队，避免 session 冲突）
     bot.use(concurrencyGuard({

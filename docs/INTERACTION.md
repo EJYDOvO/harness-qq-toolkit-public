@@ -27,7 +27,7 @@ gateway/bootstrap.js 用原生 agentPresets.serviceFor 获取当前 Agent 的策
 ### 执行期间的入站（配套 Interaction test.6）
 
 - 安装了支持 `intervene` 的 Interaction 时，`handleInbound` 不再在 followup 后等待整轮结束：Agent 运行中到达的输入交给 `policy.intervene(message)`，由 Interaction 决定 cancel/steer/followup；空闲时照常 followup。并发保护只覆盖入站处理瞬间，QQ 输出仍由 Interaction 的单一队列串行发送。
-- Iteration 02（本分支）起这一选择在 QQ 会话入口 `deliverInbound` 中执行：消息先经 Agent I/O 入站通道去重，同一 QQ 消息重复推送不会再次 intervene 或 followup；registerInteractionInput、intervene 与 followup 的判定不变。
+- Iteration 03 起这一选择由 dsh-agent-io 的共享 Conversation 接线（`handoff`/`submit`）执行，QQ 会话入口 `deliverInbound` 只调用它；Iteration 02 起：消息先经 Agent I/O 入站通道去重，同一 QQ 消息重复推送不会再次 intervene 或 followup；输入登记（QQ 侧 `trackInteractionInput` 与策略 `admitInput`）、intervene 与 followup 的判定不变。
 - 由于入站链路提前结束，SDK typing 中间件不再续期；桥接层改为每个会话一个 50 秒间隔的 typing 保活，Agent 空闲即停止。
 - 未安装 Interaction 或旧版 policy 没有 `intervene` 时，保留原有“等待整轮结束”的串行行为。显式“更正：”中间件保持在合并之前。
 - 诊断新增 `intervene` 事件的枚举字段：decision（revise/priority/supplement/append/dropped）、phase（text/tool/waiting-user）、why（judge/timeout/error/invalid/explicit/none），不记录消息内容。

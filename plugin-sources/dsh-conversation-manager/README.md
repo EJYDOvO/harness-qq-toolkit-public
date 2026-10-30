@@ -42,6 +42,8 @@ const manager = conversations.openAdapter('example:account', {
 ctx.effect(() => () => manager.disposeAll());
 ```
 
+聊天平台不必自己调用下表接口完成 Agent 输入交接：[dsh-agent-io](../dsh-agent-io/README.md) 的 `openConversation({manager, scopes, admits, …})` 用本句柄完成入站 `getOrCreate` → `isCurrentSession` → 原生输入，以及出站的 `getSessionRecord` + `isCurrentSession` 复核，本插件的算法与状态不变。
+
 这些回调处理已经通过平台鉴权的输入，不能把模型字段当作活动证明或权限。`key` 必须属于该 namespace；拒绝重复或前缀重叠的活动命名空间。不同 Conversation 默认独立 Session，不自动进行跨平台账号关联。`replyTarget` 是 Adapter 的不透明数据，不在 Manager 中解释平台消息 ID。
 
 | 接口 | 用途 |

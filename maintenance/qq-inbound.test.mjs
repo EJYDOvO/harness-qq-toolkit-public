@@ -12,15 +12,15 @@ import os from 'node:os';
 import {randomUUID,createHash} from 'node:crypto';
 import {fileURLToPath,pathToFileURL} from 'node:url';
 import {createAgentIO} from '../plugin-sources/dsh-agent-io/io.mjs';
+import {qqAdapter,qqConversation} from './qq-conversation-fixture.mjs';
 
 const dist=new URL('./qqbot-src/dist/',import.meta.url);
 const read=file=>fs.readFileSync(new URL(file,dist),'utf8').replaceAll('\r\n','\n');
 const strip=source=>source.replace(/^import [^;]*;\n/gm,'').replace(/^export (?=(?:async )?function|class|const)/gm,'');
 const tick=async(n=5)=>{for(let i=0;i<n;i++)await new Promise(r=>setImmediate(r));};
-const {accessAllows,QQ_OFFICIAL}=vm.runInNewContext(strip(read('transport/qq-text-adapter.js'))+'\n;({accessAllows,QQ_OFFICIAL})');
-let inputs=0;
+const {QQ_OFFICIAL,QQ_SCOPES}=qqAdapter;
 const inbound=vm.runInNewContext(strip(read('transport/inbound.js'))+'\n;({normalizeQQMessage,handleInbound,deliverInbound})',{
- accessAllows,createUserMessage:m=>({id:'native-'+(++inputs),role:'user',...m}),classifyContentType:()=>'file',isVoiceContentType:()=>false,clearGroupHistory(){},setInterval:()=>0,clearInterval(){},
+ QQ_SCOPES,classifyContentType:()=>'file',isVoiceContentType:()=>false,clearGroupHistory(){},setInterval:()=>0,clearInterval(){},
 });
 // The installed SDK middlewares (access, @ gate, commands, merge) when available.
 const profile=process.env.QQBOT_TEST_PROFILE??fileURLToPath(new URL('../data/profiles/qqbot-validation/',import.meta.url));
@@ -37,17 +37,18 @@ function manager(){
   async getOrCreate(scope,peer,sender,target){m.calls.push({scope,peer,sender,target});if(m.fail)throw m.fail;
    const key=scope+':'+peer;let r=records.get(key);if(!r||m.rotate){m.rotate=false;r={sessionKey:key,sessionId:'s'+(records.size+1)+'-'+m.calls.length,agent:agent('a-'+m.calls.length),scope,peerId:peer,replyTarget:target};records.set(key,r);history.push(r);}
    r.replyTarget=target;return r;},
-  registerInteractionInput:(r,msg)=>m.registered.push(msg.id),interactionPolicy:()=>m.policy,records,
+  getSessionRecord:(scope,peer)=>records.get(scope+':'+peer),trackInteractionInput:(r,msg)=>m.registered.push(msg.id),records,
   isCurrentSession:r=>records.get(r.scope+':'+r.peerId)===r};
  return m;
 }
 const owner={c2cMode:'allowlist',c2cAllow:['owner'],groupMode:'disabled',groupAllow:[]};
 function gateway({io=createAgentIO(),appId='app-a',access=owner,commands=[]}={}){
  const mgr=manager(),logs=[],config={appId,access,requireMention:true},logger={info(){},debug:m=>logs.push(['debug',m]),warn:m=>logs.push(['warn',m]),error:m=>logs.push(['error',m])};
- // The same wiring as bootstrapGateway: one channel per QQ application.
- const channel=io.openInbound({platform:QQ_OFFICIAL,adapter:'qq-official-gateway',accountId:appId,deliver:s=>inbound.deliverInbound(s,mgr,config,logger)});
+ // The same wiring as bootstrapGateway: one Conversation wiring and channel per QQ application.
+ const conversation=qqConversation({io,manager:mgr,config,policy:()=>mgr.policy});
+ const channel=conversation.openInbound(s=>inbound.deliverInbound(s,conversation,config,logger));
  const replies=[],typing=[];
- const final=ctx=>inbound.handleInbound(ctx,mgr,config,logger,channel);
+ const final=ctx=>inbound.handleInbound(ctx,logger,channel);
  const chain=sdk?[sdk.messageFilter({skipSelfEcho:false}),sdk.accessPolicy({c2c:{mode:access.c2cMode,allow:access.c2cAllow},group:{mode:access.groupMode,allow:access.groupAllow}}),sdk.mentionGate({requireMentionInGroup:true}),sdk.slashCommand({autoHelp:false,commands}).middleware,sdk.concurrencyGuard({strategy:'merge',maxQueue:10})]:[];
  const event=({kind='c2c',sender='owner',group,id='msg-1',content='你好',attachments=[],mention=false}={})=>{
   const target={scope:kind==='group'?'group':'c2c',targetId:kind==='group'?group:sender,msgId:id};
@@ -58,7 +59,7 @@ function gateway({io=createAgentIO(),appId='app-a',access=owner,commands=[]}={})
  // Full SDK middleware chain, then the message handler (bot.on('message')).
  const push=async options=>{const ctx=event(options);let i=0;const next=async()=>{if(ctx.stopped)return;const mw=chain[i++];return mw?mw(ctx,next):final(ctx);};await next();return ctx;};
  const direct=options=>final(event(options)); // a re-delivery the SDK filter no longer remembers (another Gateway, or after it purged the id)
- return {io,mgr,channel,logs,replies,push,direct,event,config,logger};
+ return {io,mgr,conversation,channel,logs,replies,push,direct,event,config,logger};
 }
 const all=g=>g.mgr.history.flatMap(r=>r.agent.received);
 const texts=g=>all(g).map(m=>m.content[0].text);
@@ -67,7 +68,7 @@ test('ordinary QQ text reaches the right Agent through the Unified I/O channel a
  const g=gateway();await g.direct({id:'msg-1',content:'今天怎么样'});
  assert.deepEqual(texts(g),['今天怎么样']);assert.equal(all(g)[0].source.kind,'user');
  assert.deepEqual(JSON.parse(JSON.stringify(g.mgr.calls)),[{scope:'c2c',peer:'owner',sender:'owner',target:{scope:'c2c',targetId:'owner',msgId:'msg-1'}}],'reply target keeps the QQ msg_id');
- assert.deepEqual(g.mgr.registered,['native-'+inputs],'trusted Interaction input registration is unchanged');
+ assert.deepEqual(g.mgr.registered,[],'QQ Interaction tracking applies only with a policy');
  assert(!g.logs.some(([,m])=>m.includes('今天怎么样')||m.includes('owner')),'no chat text or raw identity in logs');
 });
 test('the same messageId pushed again creates one input, also once the SDK filter has forgotten it',async()=>{
@@ -114,10 +115,11 @@ test('Session routing follows the Manager: current Session, rotation, and a fail
  g.mgr.fail=null;await g.direct({id:'m3',content:'失败'});assert.equal(all(g).length,3,'a proven non-handoff can be re-delivered once');
 });
 test('with Interaction, input during a run is an intervention once; without it, a native followup that holds until idle',async()=>{
- const g=gateway(),interventions=[];g.mgr.policy={intervene:m=>interventions.push(m.content[0].text)};
+ const g=gateway(),interventions=[],admitted=[];g.mgr.policy={intervene:m=>interventions.push(m.content[0].text),admitInput:m=>admitted.push(m.id)};
  await g.direct({id:'i0',content:'开始'});const record=[...g.mgr.records.values()][0];record.agent.status='running';
  await g.direct({id:'i1',content:'插话'});await g.direct({id:'i1',content:'插话'});
  assert.deepEqual(interventions,['插话']);assert.deepEqual(record.agent.received.map(m=>m.content[0].text),['开始'],'no second native input for the interjection');
+ assert.equal(admitted.length,2);assert.deepEqual(g.mgr.registered,admitted,'each admitted input is tracked once on the QQ side, before the policy sees it');
  const h=gateway();let idle;const agentIdle=new Promise(r=>idle=r);
  await h.direct({id:'w0'});const r=[...h.mgr.records.values()][0];r.agent.idle=agentIdle;
  let done=false;const waiting=h.direct({id:'w1',content:'等待'}).then(()=>done=true);await tick();
@@ -134,12 +136,18 @@ test('closing the channel on Gateway disposal leaves no live intake; a reloaded 
  assert.equal(all(g).length,0);assert(g.logs.some(([,m])=>m==='im-qqbot: inbound rejected (closed)'));
  const reloaded=gateway({io});await reloaded.direct({id:'late'});assert.equal(all(reloaded).length,1);
  const bootstrap=read('gateway/bootstrap.js');
- assert.match(bootstrap,/const inbound = io\.openInbound\(\{ platform: QQ_OFFICIAL, adapter: 'qq-official-gateway', accountId: config\.appId,/);
- assert.match(bootstrap,/ctx\.effect\(\(\) => inbound\.close\);/);assert.match(bootstrap,/await handleInbound\(mCtx, manager, config, logger, inbound\);/);
+ assert.match(bootstrap,/const conversation = io\.openConversation\(\{ platform: QQ_OFFICIAL, adapter: 'qq-official-gateway', accountId: config\.appId, manager, scopes: QQ_SCOPES,/);
+ assert.match(bootstrap,/const inbound = conversation\.openInbound\(standard => deliverInbound\(standard, conversation, config, logger\)\);/);
+ assert.match(bootstrap,/ctx\.effect\(\(\) => inbound\.close\);/);assert.match(bootstrap,/ctx\.effect\(\(\) => conversation\.close\);/);assert.match(bootstrap,/await handleInbound\(mCtx, logger, inbound\);/);
+ assert(!/io\.openInbound\(|io\.registerAdapter\(/.test(bootstrap),'QQ opens no channel or adapter beside its Conversation wiring');
 });
 test('the replaced path: the message handler never creates Agent input itself, and the I/O stays platform-neutral',()=>{
  const source=read('transport/inbound.js'),handler=source.slice(source.indexOf('export async function handleInbound'),source.indexOf('export async function deliverInbound'));
- assert(handler.includes('channel.receive(standard)'));assert(!/\.followup\(|getOrCreate\(|\.intervene\(|createUserMessage\(/.test(handler));
+ assert(handler.includes('channel.receive(standard)'));
+ // The Session lookup, current-Session check and native input now live only in the shared wiring.
+ const code=source.replace(/\/\*[\s\S]*?\*\//g,'').replace(/\/\/.*$/gm,'');
+ assert(!/\.followup\(|getOrCreate\(|isCurrentSession|\.intervene\(|createUserMessage|registerInteractionInput|interactionPolicy/.test(code));
+ assert(source.includes('conversation.handoff(standard, { replyTarget, content: agentBody })'));
  assert(!/body="|peerId=\$\{|key=\$\{scope\}:\$\{peerId\}/.test(source),'no chat text or raw peer id in the Processing/followup logs');
  const core=fs.readFileSync(new URL('../plugin-sources/dsh-agent-io/io.mjs',import.meta.url),'utf8');
  assert.deepEqual(core.match(/^import .*$/gm),["import {createHash} from 'node:crypto';"]);
@@ -148,14 +156,14 @@ test('the replaced path: the message handler never creates Agent input itself, a
 // ── Serialization and lifecycle races (deterministic: controlled promises) ──
 const deferred=()=>{let resolve;const promise=new Promise(r=>{resolve=r;});return {promise,resolve};};
 const blocking=(inputs,gate,fail)=>{let n=0;return {calls:()=>n,async getOrCreate(scope,peer){n++;if(n===1){await gate.promise;if(fail)throw Error('fixture restore failed');}
- const r={sessionKey:scope+':'+peer,sessionId:'s',scope,peerId:peer,agent:{status:'idle',followup:m=>inputs.push(m),whenIdle:()=>Promise.resolve()}};this.current=r;return r;},isCurrentSession(r){return r===this.current;}};};
+ const r={sessionKey:scope+':'+peer,sessionId:'s',scope,peerId:peer,agent:{status:'idle',followup:m=>inputs.push(m),whenIdle:()=>Promise.resolve()}};this.current=r;return r;},getSessionRecord(){return this.current;},isCurrentSession(r){return r===this.current;}};};
 test('the SDK merge guard serializes one Conversation: a duplicate behind a failed handoff is delivered once, behind an accepted one it is suppressed',needsSdk,async()=>{
  for(const fail of [true,false]){
   const inputs=[],gate=deferred(),mgr=blocking(inputs,gate,fail),g=gateway(),config={appId:'app-a',access:owner},logger={info(){},debug(){},warn(){},error(){}};
-  const channel=createAgentIO().openInbound({platform:QQ_OFFICIAL,adapter:'qq-official-gateway',accountId:'app-a',deliver:s=>inbound.deliverInbound(s,mgr,config,logger)});
+  const conversation=qqConversation({io:createAgentIO(),manager:mgr,config}),channel=conversation.openInbound(s=>inbound.deliverInbound(s,conversation,config,logger));
   // The SDK filter has forgotten the id (another Gateway, or after its purge); the merge guard still runs.
   const guard=sdk.concurrencyGuard({strategy:'merge',maxQueue:10});
-  const push=id=>{const ctx=g.event({id});return guard(ctx,()=>inbound.handleInbound(ctx,mgr,config,logger,channel));};
+  const push=id=>{const ctx=g.event({id});return guard(ctx,()=>inbound.handleInbound(ctx,logger,channel));};
   const first=push('same');await tick();const second=push('same');await tick();
   assert.equal(mgr.calls(),1,'the duplicate waits in the guard, not inside the I/O');
   gate.resolve();await Promise.all([first,second]);
@@ -189,7 +197,7 @@ test('Gateway disposal while an input waits for its Conversation: no input on th
   const gate=deferred();let held;
   if(where==='inside'){const drain=manager.drainSessionClosures.bind(manager);manager.drainSessionClosures=async(...a)=>{await gate.promise;return drain(...a);};}
   else held=manager.inConversation('qqbot:app-a:c2c:owner',()=>gate.promise); // a command, rotation or compaction
-  const channel=createAgentIO().openInbound({platform:QQ_OFFICIAL,adapter:'qq-official-gateway',accountId:'app-a',deliver:s=>inbound.deliverInbound(s,manager,config,quiet)});
+  const conversation=qqConversation({io:createAgentIO(),manager,config}),channel=conversation.openInbound(s=>inbound.deliverInbound(s,conversation,config,quiet));
   const first=channel.receive(standardFor(g,'race'));await tick();
   channel.close();const closing=manager.disposeAll();await tick();gate.resolve();await held;
   assert.deepEqual({...await first},{status:'failed',stage:'before-handoff',reason:'session-unavailable'},where);await closing;
@@ -200,7 +208,7 @@ test('disposal between the Session lookup and the handoff: the entry re-checks t
  const order=[],{manager,config}=conversationManager(t,order),g=gateway();
  await manager.getOrCreate('c2c','owner','owner',{scope:'c2c',targetId:'owner',msgId:'warm'});
  let closing;const entry=Object.create(manager);entry.getOrCreate=async(...a)=>{const r=await manager.getOrCreate(...a);closing=manager.disposeAll();return r;};
- const io=createAgentIO(),channel=io.openInbound({platform:QQ_OFFICIAL,adapter:'qq-official-gateway',accountId:'app-a',deliver:s=>inbound.deliverInbound(s,entry,config,quiet)});
+ const conversation=qqConversation({io:createAgentIO(),manager:entry,config}),channel=conversation.openInbound(s=>inbound.deliverInbound(s,conversation,config,quiet));
  const result=await channel.receive(standardFor(g,'window'));await closing;
  assert.deepEqual({...result},{status:'failed',stage:'before-handoff',reason:'session-changed'});
  assert.deepEqual(order,['cancel','dispose'],'the disposed Agent received no input');

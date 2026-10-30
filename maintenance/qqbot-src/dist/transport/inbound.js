@@ -1,7 +1,6 @@
-import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import { classifyContentType, isVoiceContentType, } from "./attachment.js";
 import { clearGroupHistory } from "../features/history-store.js";
-import { accessAllows } from "./qq-text-adapter.js";
+import { QQ_SCOPES } from "./qq-text-adapter.js";
 // ── 主处理函数 ──
 /**
  * QQ Official Adapter 侧标准化：已过 SDK 中间件链（访问控制、@ 门控、命令、
@@ -24,7 +23,7 @@ export function normalizeQQMessage(ctx) {
  * 处理 QQ 入站消息（已经过 SDK 中间件链）：标准化后交给 Unified Agent I/O 的
  * 入站通道，由它去重并交给 deliverInbound。不再直接创建 Agent 输入。
  */
-export async function handleInbound(ctx, manager, config, logger, channel) {
+export async function handleInbound(ctx, logger, channel) {
     if (!channel) {
         logger.error('im-qqbot: inbound withheld: Unified Agent I/O unavailable');
         return;
@@ -51,38 +50,40 @@ export async function handleInbound(ctx, manager, config, logger, channel) {
     }
 }
 /**
- * QQ 的可信会话入口（Unified Agent I/O 入站通道的 deliver）：Host 准入复核 →
- * Conversation Manager（含 Character Identity 等包装）→ 原生 UserMessage 与
- * followup，或运行中按可选 Interaction 策略 intervene。返回交接结果：
- * accepted＝已创建 Agent 输入；rejected＝准入拒绝；not-delivered＝未创建输入。
+ * QQ 的可信会话入口（Unified Agent I/O 入站通道的 deliver）。平台无关的交接
+ * （访问配置复核 → Conversation Manager getOrCreate（含 Character Identity 等
+ * 包装）→ isCurrentSession → 原生 UserMessage → Interaction intervene 或
+ * followup）由共享的 Conversation 接线完成；这里只保留 QQ 协议：C2C 发送者、
+ * 回复目标、模型可见正文组装、兜底提示、群历史、typing 与等待本轮结束。
+ * 返回交接结果：accepted＝已创建 Agent 输入；rejected＝准入拒绝；
+ * not-delivered＝未创建输入。
  */
-export async function deliverInbound(standard, manager, config, logger) {
+export async function deliverInbound(standard, conversation, config, logger) {
     const ctx = standard.platformData?.context, hold = standard.platformData?.hold ?? {};
     const msg = ctx.message;
     const mwState = ctx.state;
     const { bot } = ctx;
-    const scope = standard.conversation.type === 'group' ? 'group' : 'c2c';
+    const scope = QQ_SCOPES[standard.conversation.type];
     const peerId = standard.conversation.id;
-    // Defence in depth after the SDK accessPolicy: the same configuration admits
-    // the Conversation; the generic group contract never opens a disabled scope.
-    if (!accessAllows(config.access, scope, peerId) || (scope === 'c2c' && standard.sender.id !== peerId))
+    // A QQ C2C Conversation is its own sender. The shared entry re-checks the
+    // access configuration and never opens a disabled group scope.
+    if (scope === 'c2c' && standard.sender.id !== peerId)
         return { status: 'rejected', reason: 'unauthorized' };
     const replyTarget = {
         scope,
         targetId: peerId,
         msgId: standard.message.id,
     };
-    // ── 组装 agentBody（下载结果经 mwState.downloadedFiles 提供） ──
-    const agentBody = assembleAgentBody(msg, mwState, scope, logger);
-    if (!agentBody)
-        return { status: 'rejected', reason: 'empty-message' };
-    logger.info(`Processing: scope=${scope} length=${agentBody.length}`);
-    // ── 获取或创建会话 ──
-    let record;
-    try {
-        record = await manager.getOrCreate(scope, peerId, standard.sender.id, replyTarget);
-    }
-    catch (err) {
+    // ── 组装 agentBody（下载结果经 mwState.downloadedFiles 提供），准入之后才组装 ──
+    const agentBody = () => {
+        const body = assembleAgentBody(msg, mwState, scope, logger);
+        if (body)
+            logger.info(`Processing: scope=${scope} length=${body.length}`);
+        return body;
+    };
+    const result = await conversation.handoff(standard, { replyTarget, content: agentBody });
+    if (result.reason === 'session-unavailable') {
+        const err = result.error;
         logger.error(`ERROR creating session: ${err instanceof Error ? err.message : String(err)}`);
         // 兜底回复：会话创建失败时告知用户，避免静默无响应
         try {
@@ -91,36 +92,19 @@ export async function deliverInbound(standard, manager, config, logger) {
         catch (sendErr) {
             logger.error(`fallback reply failed: ${sendErr instanceof Error ? sendErr.message : String(sendErr)}`);
         }
-        return { status: 'not-delivered', reason: 'session-unavailable' };
     }
-    // getOrCreate re-checks after each of its awaits, but disposal or rotation can
-    // still land before this continuation runs: never hand input to a Session
-    // that is no longer current (no input created, a re-delivery may proceed).
-    if (manager.isCurrentSession?.(record) !== true)
-        return { status: 'not-delivered', reason: 'session-changed' };
-    // ── 构建 UserMessage → followup ──
-    const content = [{ type: 'text', text: agentBody }];
-    const message = createUserMessage({
-        content,
-        source: { kind: 'user' },
-    });
-    manager.registerInteractionInput?.(record,message);
-    // With Interaction, input that arrives mid-run reaches the Agent now: the
+    if (result.status !== 'accepted')
+        return { status: result.status, reason: result.reason };
+    const { record } = result;
+    // With Interaction, input that arrives mid-run reached the Agent now: the
     // policy chooses native steer/followup/cancel, and its single send queue
     // keeps QQ output serial, so the concurrency guard need not wait for idle.
-    const policy=manager.interactionPolicy?.(record),interactive=typeof policy?.intervene==='function';
-    if(interactive&&record.agent.status==='running'){
-        policy.intervene(message);
-        logger.info(`→ interaction input: scope=${scope}`);
-    }else{
-        record.agent.followup(message);
-        logger.info(`→ followup sent: scope=${scope}`);
-    }
+    logger.info(result.mode === 'intervene' ? `→ interaction input: scope=${scope}` : `→ followup sent: scope=${scope}`);
     // 群消息回复后清空历史缓存（避免下次 @ 时重复组包）
     if (scope === 'group') {
         clearGroupHistory(config.appId, peerId);
     }
-    if(interactive){
+    if(result.interactive){
         record.typingTarget={...replyTarget};
         // The typing middleware stops refreshing when this chain returns; keep one
         // refresh per Session alive until the Agent is idle again.

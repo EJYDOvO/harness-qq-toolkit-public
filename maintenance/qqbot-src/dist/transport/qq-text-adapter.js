@@ -1,18 +1,16 @@
 /**
  * QQ Official text adapter for the Unified Agent I/O (dsh-agent-io).
  *
- * Owns only QQ protocol: Conversation → reply target through the trusted
- * Conversation Manager record, passive-reply quota and diagnostics (reused
- * from the gateway sender), platform chunking, and QQ API error classification.
- * Ordering, cancellation and duplicate suppression belong to the I/O core.
- * No SDK import: the gateway injects the send and split functions.
+ * Owns only QQ protocol: the reply target of the trusted Conversation Manager
+ * record, passive-reply quota and diagnostics (reused from the gateway sender),
+ * platform chunking, and QQ API error classification. The route itself (access,
+ * current Session of exactly this Conversation) is the shared Conversation
+ * wiring's; ordering, cancellation and duplicate suppression belong to the I/O
+ * core. No SDK import: the gateway injects the send and split functions.
  */
 export const QQ_OFFICIAL = 'qq-official';
-const scopes = { direct: 'c2c', group: 'group' };
-/** Logical Conversation of a Conversation Manager record (never model input). */
-export function qqConversation(record) {
-    return { type: record.scope === 'group' ? 'group' : 'direct', id: record.peerId };
-}
+/** Conversation type → existing Manager scope (keeps `qqbot:<appId>:<scope>:<peer>` keys). */
+export const QQ_SCOPES = Object.freeze({ direct: 'c2c', group: 'group' });
 // The markdown chunker keeps code fences and tables whole and may exceed the
 // limit on one long line; cut those at the limit without splitting a surrogate pair.
 function hardLimit(parts, limit) {
@@ -56,39 +54,20 @@ export function accessAllows(access, scope, peerId) {
     return policy.allow.some(value => value === '*' || value === peerId);
 }
 /**
- * @param accountId QQ application id this gateway serves.
- * @param manager   the gateway's Conversation Manager handle (trusted routing).
- * @param access    the gateway's access configuration (c2cMode/c2cAllow/groupMode/groupAllow).
+ * Protocol parts for `conversation.registerAdapter()`.
  * @param send      (replyTarget, text, {index, sessionId}) → SDK result; resolves the
  *                  passive-reply target and applies the quota.
  * @param split     text → markdown-aware chunks.
  * @param limit     hard per-message character limit.
  */
-export function createQQTextAdapter({ accountId, manager, access, send, split, limit = 4500 }) {
-    // The Manager's own ownership check is required: without it a late reply
-    // could not be proven to belong to the current Session, so refuse to start.
-    if (typeof manager?.getSessionRecord !== 'function' || typeof manager.isCurrentSession !== 'function') throw new Error('Conversation Manager ownership check required');
+export function createQQTextAdapter({ send, split, limit = 4500 }) {
     return {
-        platform: QQ_OFFICIAL,
-        accountId,
-        // Checked before every part: the peer must still be admitted, and the
-        // origin Session must still be the Manager's current Session of exactly
-        // this Conversation with its live Agent, so rotation, removal, Agent
-        // disposal, revoked access or a late Turn from an older Session cannot
-        // reach the user. Only Host-filled evidence is compared; nothing here
-        // trusts model-supplied ids or platformData.
-        resolve(target, origin) {
-            const scope = scopes[target.conversation.type];
-            if (!scope) return { ok: false, reason: 'invalid-target' };
-            if (typeof origin?.sessionId !== 'string' || !origin.sessionId) return { ok: false, reason: 'unauthorized' };
-            if (!accessAllows(access, scope, target.conversation.id)) return { ok: false, reason: 'unauthorized' };
-            const record = manager.getSessionRecord(scope, target.conversation.id);
-            if (!record || record.sessionId !== origin.sessionId) return { ok: false, reason: 'stale' };
-            if (manager.isCurrentSession(record) !== true) return { ok: false, reason: 'stale' };
-            if (record.scope !== scope || record.peerId !== target.conversation.id) return { ok: false, reason: 'invalid-target' };
+        // After the shared route check, before every part: the record's reply
+        // target must still point at exactly this Conversation.
+        check(record) {
             const reply = record.replyTarget;
-            if (!reply || reply.scope !== scope || reply.targetId !== target.conversation.id) return { ok: false, reason: 'invalid-target' };
-            return { ok: true, route: { record } };
+            if (!reply || reply.scope !== record.scope || reply.targetId !== record.peerId) return { ok: false, reason: 'invalid-target' };
+            return { ok: true };
         },
         split: text => hardLimit(split(text), limit),
         async send(route, text, info) {
