@@ -17,7 +17,7 @@ const load=(file,names,context={})=>vm.runInNewContext(strip(read(file))+`\n;({$
 const slice=(source,start,end)=>{const a=source.indexOf(start),b=source.indexOf(end,a);assert(a>=0&&b>a,start);return source.slice(a,b);};
 const tick=async(n=5)=>{for(let i=0;i<n;i++)await new Promise(r=>setImmediate(r));};
 
-const adapterModule=load('transport/qq-text-adapter.js','QQ_OFFICIAL,qqConversation,classifyQQError,createQQTextAdapter');
+const adapterModule=load('transport/qq-text-adapter.js','QQ_OFFICIAL,qqConversation,classifyQQError,accessAllows,createQQTextAdapter');
 const {ReplyLimiter}=load('transport/reply-limiter.js','ReplyLimiter');
 const {resolveReplyTarget,sendResolvedMarkdown}=load('transport/reply-target.js','resolveReplyTarget,sendResolvedMarkdown',{MsgType:{MARKDOWN:2},getCachedReplyIds:()=>[]});
 // Real chunker when a validation profile is present (same resolution as the
@@ -25,6 +25,16 @@ const {resolveReplyTarget,sendResolvedMarkdown}=load('transport/reply-target.js'
 const profile=process.env.QQBOT_TEST_PROFILE??fileURLToPath(new URL('../data/profiles/qqbot-validation/',import.meta.url));
 const chunkerFile=path.join(profile,'node_modules/@tencent-connect/dsh-qqbot/dist/transport/chunker.js');
 const realChunker=fs.existsSync(chunkerFile)?vm.runInNewContext(strip(fs.readFileSync(chunkerFile,'utf8').replaceAll('\r\n','\n'))+'\n;chunkMarkdownText'):null;
+// The installed native event parser when present, otherwise the same rules.
+const eventsFile=path.join(profile,'node_modules/@tencent-connect/dsh-qqbot/dist/transport/events.js');
+const realEvents=fs.existsSync(eventsFile)?vm.runInNewContext(strip(fs.readFileSync(eventsFile,'utf8').replaceAll('\r\n','\n'))+'\n;({parseEvent,extractTurnError})'):null;
+const parseEvent=realEvents?.parseEvent??(raw=>{const d=raw.data??{};switch(raw.type){
+ case 'assistant/chunk':return d.chunk?.type==='text-delta'&&d.chunk.text?{type:raw.type,text:d.chunk.text}:undefined;
+ case 'assistant/message':return Array.isArray(d.message?.content)?{type:raw.type,content:d.message.content}:undefined;
+ case 'tool/call':return d.callId&&d.name?{type:raw.type,callId:d.callId,name:d.name,arguments:d.arguments??''}:undefined;
+ case 'tool/result':return d.message?.source?.callId?{type:raw.type,callId:d.message.source.callId,error:d.error,raw:d}:undefined;
+ case 'turn/end':return {type:raw.type,reason:d.reason??{}};}});
+const extractTurnError=realEvents?.extractTurnError??(r=>r.kind==='error'?{code:r.error?.code??'UNKNOWN',message:r.error?.message??'unknown error'}:undefined);
 const lineChunker=(text,limit)=>{const out=[];let cur='';for(const line of text.split('\n')){const next=cur?cur+'\n'+line:line;if(cur&&next.length>limit){out.push(cur);cur=line;}else cur=next;}if(cur)out.push(cur);return out.length?out:[text];};
 
 class ApiError extends Error{name='ApiError';constructor(status){super('API Error [/v2/users/OPENID/messages]');this.httpStatus=status;this.path='/v2/users/OPENID/messages';}}
@@ -36,13 +46,16 @@ function fakeBot(){
   send:opts=>deliver({msgId:undefined,eventId:opts.extra?.event_id,targetId:opts.target.targetId,content:opts.markdown.content}),
   openStream(){throw Error('SDK stream is not used by these fixtures');}};
 }
-function gateway({io=createAgentIO(),appId='app-a',policy,streaming=false,limit=4500,chunker=lineChunker,writer,recorder}={}){
+function gateway({io=createAgentIO(),appId='app-a',policy,streaming=false,limit=4500,chunker=lineChunker,writer,recorder,access}={}){
  const source=read('gateway/bootstrap.js'),bot=fakeBot(),logs=[],cleanups=[];
- const record={sessionKey:'qqbot:'+appId+':c2c:owner',sessionId:'s1',agent:{},replyTarget:{scope:'c2c',targetId:'owner',msgId:'m1'},scope:'c2c',peerId:'owner'};
+ const agents=new Map(),record={sessionKey:'qqbot:'+appId+':c2c:owner',sessionId:'s1',agent:{id:'s1'},replyTarget:{scope:'c2c',targetId:'owner',msgId:'m1'},scope:'c2c',peerId:'owner'};
+ agents.set('s1',record.agent);
  const sessions=new Map([['c2c:owner',record]]);
- const manager={getSessionRecord:(scope,peer)=>sessions.get(scope+':'+peer),findBySessionId:id=>[...sessions.values()].find(r=>r.sessionId===id),approvalChannel:{pending:new Map()},questionChannel:{pending:new Map()}};
- const logger={info(){},debug(){},warn:m=>logs.push(['warn',m]),error:m=>logs.push(['error',m])};
- const config={appId,streaming,textChunkLimit:limit,showToolResults:false};
+ // The Manager's ownership contract: the record is the mapped one and its live Agent is registered.
+ const manager={getSessionRecord:(scope,peer)=>sessions.get(scope+':'+peer),findBySessionId:id=>[...sessions.values()].find(r=>r.sessionId===id),
+  isCurrentSession:r=>sessions.get((r.scope)+':'+r.peerId)===r&&agents.get(r.sessionId)===r.agent,approvalChannel:{pending:new Map()},questionChannel:{pending:new Map()}};
+ const logger={info(){},debug:m=>logs.push(['debug',m]),warn:m=>logs.push(['warn',m]),error:m=>logs.push(['error',m])};
+ const config={appId,streaming,textChunkLimit:limit,showToolResults:false,access:access??{c2cMode:'allowlist',c2cAllow:['owner'],groupMode:'allowlist',groupAllow:['grp']}};
  const ctx={get:name=>name==='agentPresets'?{serviceFor:()=>policy?{get:()=>policy}:undefined}:undefined,effect:f=>cleanups.push(f())};
  const chunkMarkdownText=(text,max)=>chunker(text,max);
  // The gateway's own sender and adapter registration, exactly as reviewed.
@@ -50,81 +63,137 @@ function gateway({io=createAgentIO(),appId='app-a',policy,streaming=false,limit=
  const {sender,diagnostics}=vm.runInNewContext('(function(){'+wiring+';return {sender,diagnostics};})()',{
   ReplyLimiter,deliveryRecorder:recorder,bot,randomUUID:()=>'00000000-0000-4000-8000-000000000000',resolveReplyTarget,sendResolvedMarkdown,io,createQQTextAdapter:adapterModule.createQQTextAdapter,config,manager,chunkMarkdownText,ctx});
  // The original outbound router and buffer with their patched static send.
- class StreamingWriter{constructor(deps){this.deps=deps;this.text='';(writer??={}).instances=[...(writer.instances??[]),this];}append(t){this.text+=t;}async finish(){this.finished=true;}get shouldFallback(){return writer?.fallback===true;}abort(){}}
+ class StreamingWriter{constructor(deps){this.deps=deps;this.text='';(writer??={}).instances=[...(writer.instances??[]),this];}append(t){this.text+=t;}async finish(){this.finished=true;}get shouldFallback(){return writer?.fallback===true;}abort(){this.aborted=true;}}
  const {OutboundBuffer}=load('transport/outbound-buffer.js','OutboundBuffer',{StreamingWriter});
- const {createOutboundHandler}=load('transport/outbound.js','createOutboundHandler',{OutboundBuffer,formatToolResult:name=>`工具 ${name} 失败`,parseEvent:e=>e,extractTurnError:r=>r?.error});
+ const {createOutboundHandler}=load('transport/outbound.js','createOutboundHandler',{OutboundBuffer,formatToolResult:name=>`工具 ${name} 失败`,parseEvent,extractTurnError});
  const body=slice(source,'    const policyFor =','    return outboundHandler;');
  const handler=vm.runInNewContext('(function(){'+body+';return outboundHandler;})()',{
-  ctx,manager,sender,config,logger,toolsRegistry:undefined,diagnostics,io,createOutboundHandler,chunkMarkdownText,QQ_OFFICIAL:adapterModule.QQ_OFFICIAL,qqConversation:adapterModule.qqConversation});
- const emit=event=>handler({header:{id:record.sessionId}},event);
- return {io,bot,logs,record,sessions,manager,emit,writer,cleanups,diagnostics,sender};
+  ctx,manager,sender,config,logger,toolsRegistry:undefined,diagnostics,io,createOutboundHandler,chunkMarkdownText,AbortController,QQ_OFFICIAL:adapterModule.QQ_OFFICIAL,qqConversation:adapterModule.qqConversation});
+ // Native Session events as the Host emits them: durable seq, Turn in data.
+ let seq=0,call=0;const session={header:{id:'s1'}};
+ const emit=(event,id=record.sessionId)=>{handler({header:{id}},event);return event;};
+ const native=(type,data,id)=>emit({type,seq:++seq,data},id);
+ const ev={
+  turn:(turn=1)=>native('turn/start',{turn}),
+  reply:(text,turn=1,extra={})=>native('assistant/message',{turn,step:1,message:{role:'assistant',content:[{type:'text',text}]},stream:[],...extra}),
+  chunk:(text,turn=1)=>native('assistant/chunk',{turn,step:1,chunk:{type:'text-delta',text}}),
+  tool:(name,error,turn=1)=>{const callId='call-'+(++call);native('tool/call',{turn,step:1,callId,name,arguments:'{}'});return native('tool/result',{turn,step:1,message:{role:'tool',source:{callId},content:[]},...(error?{error:{name:'Error',code:error}}:{})});},
+  end:(reason={kind:'completed'},turn=1)=>native('turn/end',{turn,reason}),
+ };
+ return {io,bot,logs,record,sessions,agents,manager,emit,ev,writer,cleanups,diagnostics,sender,config,session};
 }
-const reply=text=>({type:'assistant/message',content:[{type:'text',text}]});
-
-test('a plain Agent reply without Interaction reaches QQ once through the Unified I/O',async()=>{
- const g=gateway();g.emit(reply('你好'));await tick();
- assert.deepEqual(g.bot.sent,[{msgId:'m1',eventId:undefined,targetId:'owner',content:'你好'}]);assert.deepEqual(g.logs,[]);
+const warns=g=>g.logs.filter(([level])=>level!=='debug');
+test('a plain Agent reply without Interaction reaches QQ once through the Unified I/O, with a stable event id',async()=>{
+ const io=createAgentIO(),calls=[];const spy={...io,sendMessage:r=>{calls.push(r);return io.sendMessage(r);}};
+ const g=gateway({io:spy});g.ev.turn();const event=g.ev.reply('你好');await tick();
+ assert.deepEqual(g.bot.sent,[{msgId:'m1',eventId:undefined,targetId:'owner',content:'你好'}]);assert.deepEqual(warns(g),[]);
+ assert.equal(calls[0].id,`qq:s1:${event.seq}:assistant`,'Session id + durable seq + kind, never random');
+ assert.equal(calls[0].signal?.aborted,false,'tied to the native Turn');
 });
-test('streamed chunks, the final message and turn end produce exactly one send',async()=>{
- const g=gateway();for(const t of ['你','好'])g.emit({type:'assistant/chunk',text:t});g.emit(reply('你好'));g.emit({type:'turn/end'});await tick();
- assert.deepEqual(g.bot.sent.map(s=>s.content),['你好']);
+test('a repeated native event or a second settlement of the same message is sent once; equal text from another event is sent again',async()=>{
+ const g=gateway();g.ev.turn();const first=g.ev.reply('好的');g.emit(first);g.emit({...first});
+ const tool=g.ev.tool('read','denied');g.emit({type:'tool/call',seq:tool.seq-1,data:{turn:1,step:1,callId:tool.data.message.source.callId,name:'read',arguments:'{}'}});g.emit(tool);await tick();
+ assert.deepEqual(g.bot.sent.map(s=>s.content),['好的','工具 read 失败']);
+ assert.equal(g.logs.filter(([,m])=>/duplicate suppressed/.test(m)).length,3);
+ g.ev.reply('好的');await tick();
+ assert.deepEqual(g.bot.sent.map(s=>s.content),['好的','工具 read 失败','好的'],'a different event is a different legitimate message');
+ // After the first send finished, a late duplicate still gets the earlier outcome.
+ g.emit(first);await tick();assert.equal(g.bot.sent.length,3);
+});
+test('the same logical id with different text or another Conversation is a conflict, not the earlier success',async()=>{
+ const g=gateway();g.sessions.set('group:grp',{...g.record,sessionKey:'k2',scope:'group',peerId:'grp',replyTarget:{scope:'group',targetId:'grp',msgId:'g1'}});
+ const base={id:'qq:s1:7:assistant',target:{platform:'qq-official',accountId:'app-a',conversation:{type:'direct',id:'owner'}},origin:{sessionId:'s1'},message:{text:'原文'}};
+ assert.equal((await g.io.sendMessage(base)).status,'sent');
+ const changed=await g.io.sendMessage({...base,message:{text:'改写'}});assert.deepEqual([changed.status,changed.reason,changed.duplicate],['not-sent','id-conflict',undefined]);
+ const moved=await g.io.sendMessage({...base,target:{...base.target,conversation:{type:'group',id:'grp'}}});assert.equal(moved.reason,'id-conflict');
+ const again=await g.io.sendMessage(base);assert.deepEqual([again.status,again.duplicate],['sent',true]);
+ assert.deepEqual(g.bot.sent.map(s=>s.content),['原文']);
+});
+test('/stop inside one Session cancels its queued output and late output of that Turn; the next Turn sends normally',async()=>{
+ const g=gateway({limit:50});let open;g.bot.gates.push(new Promise(r=>open=r));
+ g.ev.turn(1);g.ev.reply(['一'.repeat(40),'二'.repeat(40),'三'.repeat(40)].join('\n'),1);g.ev.reply('排队中',1);await tick();
+ // /stop: the gateway's stop wrapper calls cancelOutput before native cancellation.
+ g.manager.cancelOutput(g.record);open();await tick(10);
+ assert.deepEqual(g.bot.sent.map(s=>s.content),['一'.repeat(40)],'the part already at QQ is not withdrawn; nothing else of Turn 1');
+ g.ev.reply('被打断的半句',1,{interrupted:true});g.ev.end({kind:'interrupted'},1);g.ev.tool('read','late',1);await tick();
+ assert.equal(g.bot.sent.length,1,'interrupted partial and late Turn 1 output are not delivered');
+ assert.deepEqual(warns(g).map(([,m])=>m),['im-qqbot: sendMarkdown partial (cancelled)','im-qqbot: sendMarkdown not-sent (cancelled)','im-qqbot: sendToolResult not-sent (cancelled)']);
+ g.ev.turn(2);g.ev.reply('第二轮',2);await tick();
+ assert.deepEqual(g.bot.sent.map(s=>s.content),['一'.repeat(40),'第二轮'],'same Session, new Turn');
+});
+test('a Turn that ends aborted cancels its queued output without /stop and without Session rotation',async()=>{
+ const g=gateway();let open;g.bot.gates.push(new Promise(r=>open=r));
+ g.ev.turn(3);g.ev.reply('先发',3);g.ev.reply('后到',3);await tick();g.ev.end({kind:'aborted',reason:{kind:'user'}},3);open();await tick();
+ assert.deepEqual(g.bot.sent.map(s=>s.content),['先发']);
+});
+test('queued output stops after Session rotation, Agent disposal or revoked access',async()=>{
+ const rotated=gateway();let open;rotated.bot.gates.push(new Promise(r=>open=r));
+ rotated.ev.reply('第一条');rotated.ev.reply('旧会话的迟到回复');await tick();
+ rotated.sessions.set('c2c:owner',{...rotated.record,sessionId:'s2'});open();await tick();
+ assert.deepEqual(rotated.bot.sent.map(s=>s.content),['第一条']);assert.deepEqual(warns(rotated),[['warn','im-qqbot: sendMarkdown not-sent (stale)']]);
+ rotated.sessions.delete('c2c:owner');rotated.ev.reply('已移除');await tick();assert.equal(rotated.bot.sent.length,1);
+ const disposed=gateway();disposed.agents.delete('s1');disposed.ev.reply('Agent 已卸载');await tick();
+ assert.equal(disposed.bot.sent.length,0,'the record is still mapped but its Agent is gone');assert.deepEqual(warns(disposed),[['warn','im-qqbot: sendMarkdown not-sent (stale)']]);
+ const revoked=gateway();let gate;revoked.bot.gates.push(new Promise(r=>gate=r));revoked.ev.reply('允许时');revoked.ev.reply('撤销后');await tick();
+ revoked.config.access.c2cAllow=[];gate();await tick();
+ assert.deepEqual(revoked.bot.sent.map(s=>s.content),['允许时']);assert.deepEqual(warns(revoked),[['warn','im-qqbot: sendMarkdown not-sent (unauthorized)']]);
+ const closed=gateway({access:{c2cMode:'allowlist',c2cAllow:['owner'],groupMode:'disabled',groupAllow:[]}});closed.sessions.set('group:grp',{...closed.record,scope:'group',peerId:'grp',replyTarget:{scope:'group',targetId:'grp',msgId:'g1'}});
+ const r=await closed.io.sendMessage({target:{platform:'qq-official',accountId:'app-a',conversation:{type:'group',id:'grp'}},origin:{sessionId:'s1'},message:{text:'群'}});
+ assert.deepEqual([r.status,r.reason],['not-sent','unauthorized'],'disabled group scope is never written to');
 });
 test('the QQ adapter chunks long text, keeps order and falls back to proactive after the passive quota',async()=>{
  const lines=Array.from({length:6},(_,i)=>String(i).repeat(40));const g=gateway({limit:50});
- g.emit(reply(lines.join('\n')));await tick(20);
+ g.ev.reply(lines.join('\n'));await tick(20);
  assert.deepEqual(g.bot.sent.map(s=>s.content),lines);
  assert.deepEqual(g.bot.sent.map(s=>s.msgId),['m1','m1','m1','m1',undefined,undefined],'four passive replies per msg_id, then proactive');
- const h=gateway({limit:50});h.emit(reply('x'.repeat(120)));await tick(10);
+ const h=gateway({limit:50});h.ev.reply('x'.repeat(120));await tick(10);
  assert.deepEqual(h.bot.sent.map(s=>s.content.length),[50,50,20],'one long line is cut at the platform limit');
- const pair=gateway({limit:50});pair.emit(reply('a'.repeat(49)+'😀'+'b'));await tick(10);
+ const pair=gateway({limit:50});pair.ev.reply('a'.repeat(49)+'😀'+'b');await tick(10);
  assert.deepEqual(pair.bot.sent.map(s=>s.content),['a'.repeat(49),'😀b'],'a surrogate pair is never split');
 });
 test('with the installed markdown chunker, parts stay within the limit and rebuild the text in order',{skip:realChunker?false:'no validation profile with the installed chunker'},async()=>{
  const table='| a | b |\n| - | - |\n| 1 | 2 |',code='```js\n'+Array.from({length:4},(_,i)=>'line'+i).join('\n')+'\n```';
  const text=['前言'.repeat(10),table,code,'后记'.repeat(10),'长'.repeat(90)].join('\n');
- const g=gateway({limit:40,chunker:realChunker});g.emit(reply(text));await tick(30);
+ const g=gateway({limit:40,chunker:realChunker});g.ev.reply(text);await tick(30);
  const parts=g.bot.sent.map(s=>s.content);assert(parts.length>2);assert(parts.every(p=>p.length<=40));
  assert.equal(parts.join('').replaceAll('\n',''),text.replaceAll('\n',''));assert(parts.some(p=>p.includes(table)),'a short table is never split across parts');
 });
-test('tool errors and turn errors use the same ordered path',async()=>{
- const g=gateway();g.emit({type:'tool/call',callId:'c1',name:'read',arguments:'{}'});g.emit({type:'tool/result',callId:'c1',error:'denied',raw:{}});
- g.emit({type:'turn/end',reason:{error:{code:'MODEL_ERROR',message:'fixture'}}});await tick();
+test('tool errors and turn errors use the same ordered path with their own event ids',async()=>{
+ const g=gateway();g.ev.turn();g.ev.tool('read','denied');g.ev.end({kind:'error',error:{code:'MODEL_ERROR',message:'fixture'}});await tick();
  assert.deepEqual(g.bot.sent.map(s=>s.content),['工具 read 失败','⚠️ 本轮异常结束\n`MODEL_ERROR`: fixture']);
 });
-test('a QQ rejection is not-sent and an unknown outcome is not resent; later replies still go out',async()=>{
- const g=gateway();g.bot.failures.push(new ApiError(400));g.emit(reply('被拒'));await tick();
- g.bot.failures.push(new ApiError(0));g.emit(reply('超时'));await tick();
- g.bot.failures.push(new ApiError(502));g.emit(reply('网关'));await tick();
- g.emit(reply('之后'));await tick();
- assert.deepEqual(g.bot.sent.map(s=>s.content),['被拒','超时','网关','之后'],'each attempted exactly once');
- assert.deepEqual(g.logs,[['warn','im-qqbot: sendMarkdown not-sent (platform-rejected)'],['warn','im-qqbot: sendMarkdown unknown (timeout-or-network)'],['warn','im-qqbot: sendMarkdown unknown (platform-unavailable)']]);
+test('order holds across a rejection, an unknown outcome and a partial; nothing is resent',async()=>{
+ const g=gateway({limit:50});g.bot.failures.push(new ApiError(400));g.ev.reply('被拒');
+ g.bot.failures.push(undefined,new ApiError(0));g.ev.reply('甲'.repeat(40)+'\n'+'乙'.repeat(40));
+ g.bot.failures.push(new ApiError(502));g.ev.reply('网关');
+ g.bot.failures.push(undefined,new ApiError(403));g.ev.reply('丙'.repeat(40)+'\n'+'丁'.repeat(40)+'\n'+'戊'.repeat(40));
+ g.ev.reply('之后');await tick(30);
+ assert.deepEqual(g.bot.sent.map(s=>s.content),['被拒','甲'.repeat(40),'乙'.repeat(40),'网关','丙'.repeat(40),'丁'.repeat(40),'之后'],'each part attempted once, in order; the part after a refusal is skipped');
+ assert.deepEqual(warns(g),[['warn','im-qqbot: sendMarkdown not-sent (platform-rejected)'],['warn','im-qqbot: sendMarkdown unknown (timeout-or-network)'],['warn','im-qqbot: sendMarkdown unknown (platform-unavailable)'],['warn','im-qqbot: sendMarkdown partial (platform-rejected)']]);
  assert(!JSON.stringify(g.logs).includes('OPENID'),'no API path or identifier in the log');
 });
-test('a reply queued behind a rotated Session is not delivered to the new Session',async()=>{
- const g=gateway();let open;g.bot.gates.push(new Promise(r=>open=r));
- g.emit(reply('第一条'));g.emit(reply('旧会话的迟到回复'));await tick();
- g.sessions.set('c2c:owner',{...g.record,sessionId:'s2'});open();await tick();
- assert.deepEqual(g.bot.sent.map(s=>s.content),['第一条']);assert.deepEqual(g.logs,[['warn','im-qqbot: sendMarkdown not-sent (stale)']]);
- g.sessions.delete('c2c:owner');g.emit(reply('已移除'));await tick();assert.equal(g.bot.sent.length,1);
-});
-test('with Interaction bound, tool errors stay on the policy channel and the I/O is not used',async()=>{
- const external=[],policy={bind(t){this.transport=t;},event(){},external:async(t,m)=>external.push([t,m.kind])};
+test('with Interaction bound, replies and tool errors stay on the policy channel and the I/O is not used',async()=>{
+ const external=[],events=[],policy={bind(t){this.transport=t;},event(e){events.push(e.type);},external:async(t,m)=>external.push([t,m.kind])};
  const io=createAgentIO(),calls=[];const spy={...io,sendMessage:r=>{calls.push(r);return io.sendMessage(r);},registerAdapter:io.registerAdapter};
- const g=gateway({io:spy,policy});g.emit({type:'turn/start'});g.emit({type:'tool/call',callId:'c1',name:'read',arguments:'{}'});g.emit({type:'tool/result',callId:'c1',error:'x',raw:{}});await tick();
+ const g=gateway({io:spy,policy});g.ev.turn();g.ev.reply('交给策略');g.ev.tool('read','x');g.ev.end();await tick();
  assert.deepEqual(external,[['工具 read 失败','tool-or-error']]);assert.equal(calls.length,0);assert.equal(g.bot.sent.length,0);
+ assert(events.includes('assistant/message'),'the reply belongs to the policy, not the router');
  // Interaction's own static bubbles are unchanged in this slice (gateway sender).
  await policy.transport.sendText('气泡',{});assert.deepEqual(g.bot.sent.map(s=>s.content),['气泡']);
 });
-test('the SDK stream path is not migrated; only its static fallback goes through the I/O',async()=>{
- const streamed=gateway({streaming:true,writer:{fallback:false}});streamed.emit({type:'assistant/chunk',text:'流'});streamed.emit(reply('流'));await tick();
+test('the SDK stream path is not migrated; its static fallback shares the reply id and is not sent twice',async()=>{
+ const streamed=gateway({streaming:true,writer:{fallback:false}});streamed.ev.chunk('流');streamed.ev.reply('流');await tick();
  assert.equal(streamed.bot.sent.length,0);assert.equal(streamed.writer.instances[0].finished,true);
- const fallback=gateway({streaming:true,writer:{fallback:true}});fallback.emit({type:'assistant/chunk',text:'降级'});fallback.emit(reply('降级'));await tick();
+ const fallback=gateway({streaming:true,writer:{fallback:true}});fallback.ev.chunk('降级');const message=fallback.ev.reply('降级');fallback.ev.end();await tick();
+ fallback.emit(message);await tick();
  assert.deepEqual(fallback.bot.sent.map(s=>s.content),['降级']);
+ const stopped=gateway({streaming:true,writer:{fallback:true}});stopped.ev.chunk('半');stopped.ev.end({kind:'interrupted'});await tick();
+ assert.equal(stopped.bot.sent.length,0,'a cancelled Turn does not flush its buffer');assert.equal(stopped.writer.instances[0].aborted,true);
 });
 test('two QQ applications on one I/O keep separate adapters, queues and targets',async()=>{
  const io=createAgentIO(),a=gateway({io,appId:'app-a'}),b=gateway({io,appId:'app-b'});
- let open;a.bot.gates.push(new Promise(r=>open=r));a.emit(reply('给 A'));b.emit(reply('给 B'));await tick();
- assert.deepEqual(b.bot.sent.map(s=>s.content),['给 B'],'B is not blocked by A');open();await tick();
+ let open;a.bot.gates.push(new Promise(r=>open=r));a.ev.reply('给 A');b.ev.reply('给 B');await tick();
+ assert.deepEqual(b.bot.sent.map(s=>s.content),['给 B'],'B is not blocked by A, although both events share Session id and seq');open();await tick();
  assert.deepEqual(a.bot.sent.map(s=>s.content),['给 A']);
  assert.throws(()=>gateway({io,appId:'app-a'}),/already registered/,'one active adapter per QQ application');
 });
@@ -134,11 +203,11 @@ test('a group Conversation maps to the QQ group scope and its own record',async(
  const r=await g.io.sendMessage({target:{platform:'qq-official',accountId:'app-a',conversation:{type:'group',id:'grp'}},origin:{sessionId:'s1'},message:{text:'群消息'}});
  assert.equal(r.status,'sent');assert.deepEqual(g.bot.sent,[{msgId:'g1',eventId:undefined,targetId:'grp',content:'群消息'}]);
  const wrong=await g.io.sendMessage({target:{platform:'qq-official',accountId:'app-a',conversation:{type:'direct',id:'grp'}},origin:{sessionId:'s1'},message:{text:'x'}});
- assert.equal(wrong.reason,'stale','a direct target never resolves to a group record');
+ assert.equal(wrong.reason,'unauthorized','a direct target never reaches a group: grp is not an admitted C2C peer');
 });
 test('delivery diagnostics carry the Session hash and part index, never text',async()=>{
  const rows=[],recorder={hash:v=>v===undefined?undefined:'c'.repeat(24),trace:(e,f)=>rows.push([e,f])};
- const g=gateway({recorder,limit:50});g.emit(reply('秘密'.repeat(30)));await tick(10);
+ const g=gateway({recorder,limit:50});g.ev.reply('秘密'.repeat(30));await tick(10);
  const requests=rows.filter(([e])=>e==='static-request').map(([,f])=>f);
  assert.deepEqual(requests.map(f=>[f.session,f.index]),[['c'.repeat(24),0],['c'.repeat(24),1]]);
  assert(!JSON.stringify(rows).includes('秘密'));assert(rows.some(([e])=>e==='static-receipt'));
@@ -148,9 +217,15 @@ test('QQ error classification only treats a 4xx refusal as not sent',()=>{
  assert.deepEqual([0,408,429,400,403,500,503,200].map(s=>[s,c(new ApiError(s)).outcome]),[[0,'unknown'],[408,'unknown'],[429,'not-sent'],[400,'not-sent'],[403,'not-sent'],[500,'unknown'],[503,'unknown'],[200,'unknown']]);
  assert.equal(c(new Error('socket hang up')).outcome,'unknown');assert.equal(c(undefined).outcome,'unknown');
 });
+test('the adapter refuses a Manager without the ownership check and mirrors the SDK access rules',()=>{
+ assert.throws(()=>adapterModule.createQQTextAdapter({accountId:'a',manager:{getSessionRecord(){}},send(){},split:t=>[t]}),/ownership check required/);
+ const allows=adapterModule.accessAllows;
+ assert.deepEqual([allows({c2cMode:'allowlist',c2cAllow:['u']},'c2c','u'),allows({c2cMode:'allowlist',c2cAllow:['u']},'c2c','v'),allows({c2cMode:'allowlist',c2cAllow:[]},'c2c','u'),allows({c2cMode:'allowlist',c2cAllow:['*']},'c2c','v'),allows({},'c2c','u'),allows({groupMode:'disabled'},'group','g'),allows({groupMode:'allowlist',groupAllow:['g']},'group','g'),allows({c2cMode:'bogus'},'c2c','u')],[true,false,false,true,true,false,true,false]);
+});
 test('the QQ plugin declares the agentIO service and the gateway refuses to start without it',()=>{
  assert.match(read('index.js'),/inject = \['agents', 'conversationManager', 'agentIO'\]/);
  assert.match(read('gateway/bootstrap.js'),/if \(!io\) throw new Error\('Install and configure dsh-agent-io before QQ'\)/);
+ assert.match(read('gateway/middleware-setup.js'),/manager\.cancelOutput\?\.\(record\)/,'/stop cancels unsent I/O output first');
  // The original router no longer holds a direct static sender.
  for(const file of ['transport/outbound.js','transport/outbound-buffer.js'])assert(!/\.sendMarkdown\(|chunkMarkdownText/.test(strip(read(file)).replace(/\/\*\*[\s\S]*?\*\//g,'')),file);
 });

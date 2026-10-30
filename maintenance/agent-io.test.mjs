@@ -42,8 +42,34 @@ test('the same logical message id is never sent twice, even while the first send
  await tick();g.resolve();const [a,b]=await Promise.all([first,again]);
  assert.equal(sent.length,1);assert.equal(a.status,'sent');assert.equal(b.status,'sent');assert.equal(b.duplicate,true);
  assert.equal((await io.sendMessage(msg('一次',{id:'bubble-1'}))).duplicate,true);assert.equal(sent.length,1);
- // Without an id each call is its own logical message.
- await io.sendMessage(msg('a'));await io.sendMessage(msg('a'));assert.equal(sent.length,3);
+ // Without an id each call is its own logical message, and no id is invented.
+ const [x,y]=[await io.sendMessage(msg('a')),await io.sendMessage(msg('a'))];assert.equal(sent.length,3);assert.equal(x.id,undefined);assert.equal(y.duplicate,undefined);
+ assert(!fs.readFileSync(new URL('../plugin-sources/dsh-agent-io/io.mjs',import.meta.url),'utf8').includes('randomUUID'));
+});
+test('a reused id with other text or another Conversation is a conflict and never the earlier success',async()=>{
+ const {io,sent,routes,gate}=setup();routes.set('other','s1');const g=gate();
+ const first=io.sendMessage(msg('原文',{id:'turn-1'}));
+ const inflight=await io.sendMessage(msg('改写',{id:'turn-1'}));
+ assert.deepEqual([inflight.status,inflight.reason,inflight.stage,inflight.duplicate],['not-sent','id-conflict','before-platform',undefined],'detected while the first is in flight');
+ g.resolve();assert.equal((await first).status,'sent');
+ assert.equal((await io.sendMessage({...msg('原文',{id:'turn-1'}),target:target('other')})).reason,'id-conflict');
+ assert.equal((await io.sendMessage(msg('原文',{id:'turn-1'}))).duplicate,true,'the real retry still gets the first result');
+ // Ids are scoped by platform account: another account may use the same id.
+ const b=fakeAdapter({accountId:'app-b'});b.routes.set('peer','s1');io.registerAdapter(b.adapter);
+ assert.equal((await io.sendMessage({...msg('别的账号',{id:'turn-1'}),target:target('peer','app-b')})).status,'sent');
+ assert.deepEqual(sent.map(s=>s.text),['原文']);assert.deepEqual(b.sent.map(s=>s.text),['别的账号']);
+});
+test('the bounded id memory forgets settled ids first and never an id still queued or in flight',async()=>{
+ const {io,sent,gate}=setup({rememberResults:2});const g=gate();
+ const held=io.sendMessage(msg('在途',{id:'held'}));await tick();
+ for(const id of ['a','b','c'])await Promise.race([io.sendMessage(msg(id,{id})),tick()]);
+ const again=await Promise.race([io.sendMessage(msg('在途',{id:'held'})).then(r=>r.duplicate),tick().then(()=>'pending-duplicate')]);
+ assert.equal(again,'pending-duplicate','the in-flight id was not evicted, so its duplicate waits for it');
+ g.resolve();await held;for(let i=0;i<5;i++)await tick();
+ assert.equal(sent.filter(s=>s.text==='在途').length,1);
+ // After settling, the oldest ids are forgotten: the same id is a new logical message again (documented limit).
+ await io.sendMessage(msg('d',{id:'d'}));await io.sendMessage(msg('e',{id:'e'}));
+ assert.equal((await io.sendMessage(msg('a',{id:'a'}))).duplicate,undefined);
 });
 test('an explicit platform rejection is not-sent and stops before later parts',async()=>{
  const {io,sent,gate}=setup({},{parts:t=>t.split('|'),classify:()=>({outcome:'not-sent',reason:'platform-rejected'})});

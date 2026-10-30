@@ -28,7 +28,7 @@ export class OutboundBuffer {
         return this.buffer;
     }
     /** 发送所有累积文本：流式优先，降级静态 */
-    async flush() {
+    async flush(origin) {
         if (this.flushing || !this.buffer.trim())
             return;
         this.flushing = true;
@@ -40,7 +40,8 @@ export class OutboundBuffer {
                     return;
             }
             // 降级：静态发送（writer 不存在 or 流式失败），整条交给 Unified Agent I/O
-            await this.bot.deliverText(this.record, this.buffer, 'flush');
+            // origin：触发本次输出的原生事件，与静态回复共用同一逻辑消息 ID
+            await this.bot.deliverText(this.record, this.buffer, 'flush', { ...origin, kind: 'assistant' });
         }
         catch (err) {
             this.logger.error(`im-qqbot: flush failed: ${err instanceof Error ? err.message : String(err)}`);

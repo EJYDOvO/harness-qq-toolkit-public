@@ -29,21 +29,31 @@ class OutboundRouter {
         const record = this.manager.findBySessionId(session.header.id);
         if (record === undefined)
             return;
+        // Trusted identity of the native event behind each logical message: its
+        // durable Session sequence and Turn. A repeated event keeps the same seq.
+        const origin = { seq: raw.seq, turn: raw.data?.turn };
         switch (event.type) {
             case 'assistant/chunk':
                 this.onChunk(session.header.id, record, event);
                 break;
             case 'assistant/message':
-                this.onMessage(session.header.id, record, event);
+                // A partial settled because the Turn was cancelled (/stop, removal)
+                // is not delivered: cancellation stops output that has not started.
+                if (raw.data?.interrupted === true) {
+                    this.buffers.get(session.header.id)?.cancel();
+                    this.buffers.delete(session.header.id);
+                    break;
+                }
+                this.onMessage(session.header.id, record, event, origin);
                 break;
             case 'tool/call':
                 this.onToolCall(event);
                 break;
             case 'tool/result':
-                this.onToolResult(record, event);
+                this.onToolResult(record, event, origin);
                 break;
             case 'turn/end':
-                this.onTurnEnd(session.header.id, record, event);
+                this.onTurnEnd(session.header.id, record, event, origin);
                 break;
         }
     }
@@ -63,10 +73,10 @@ class OutboundRouter {
             && !!record.replyTarget.msgId;
     }
     /** 完整 assistant 消息：有流式 buffer 则 flush，否则直接发送文本块 */
-    onMessage(sessionId, record, event) {
+    onMessage(sessionId, record, event, origin) {
         const buffer = this.buffers.get(sessionId);
         if (buffer !== undefined && buffer.text.trim()) {
-            void buffer.flush();
+            void buffer.flush(origin);
             this.buffers.delete(sessionId);
             return;
         }
@@ -78,7 +88,7 @@ class OutboundRouter {
         const fullText = textParts.join('\n');
         if (!fullText.trim())
             return;
-        void this.send(record, fullText, 'sendMarkdown');
+        void this.send(record, fullText, 'sendMarkdown', { ...origin, kind: 'assistant' });
         this.buffers.delete(sessionId);
     }
     /** 工具调用：仅记录，不发送（避免刷屏，等待结果） */
@@ -86,7 +96,7 @@ class OutboundRouter {
         this.toolCalls.set(event.callId, { name: event.name, args: event.arguments });
     }
     /** 工具结果：错误始终发送，成功结果按开关 */
-    onToolResult(record, event) {
+    onToolResult(record, event, origin) {
         const call = this.toolCalls.get(event.callId);
         this.toolCalls.delete(event.callId);
         if (call === undefined)
@@ -96,14 +106,16 @@ class OutboundRouter {
         const text = formatToolResult(call.name, call.args, event.raw, this.toolsRegistry, record.agent);
         if (!text)
             return;
-        void this.send(record, text, 'sendToolResult');
+        void this.send(record, text, 'sendToolResult', { ...origin, kind: 'tool' });
     }
     /** 轮次结束：清理 buffer，异常结束时告知用户 */
-    onTurnEnd(sessionId, record, event) {
+    onTurnEnd(sessionId, record, event, origin) {
         const buffer = this.buffers.get(sessionId);
+        // A cancelled Turn's unsent buffer is dropped, not flushed.
+        const cancelled = ['aborted', 'interrupted'].includes(event.reason?.kind);
         if (buffer !== undefined) {
-            if (buffer.text.trim()) {
-                void buffer.flush();
+            if (buffer.text.trim() && !cancelled) {
+                void buffer.flush(origin);
             }
             else {
                 buffer.cancel();
@@ -112,13 +124,13 @@ class OutboundRouter {
         }
         const failure = extractTurnError(event.reason);
         if (failure !== undefined && !SILENT_TURN_ERROR_CODES.has(failure.code)) {
-            void this.send(record, `⚠️ 本轮异常结束\n\`${failure.code}\`: ${failure.message}`, 'sendTurnEndError');
+            void this.send(record, `⚠️ 本轮异常结束\n\`${failure.code}\`: ${failure.message}`, 'sendTurnEndError', { ...origin, kind: 'turn-error' });
         }
         this.logger.debug(`im-qqbot: turn/end sessionId=${sessionId}`);
     }
-    /** 统一发送：整条逻辑消息交给 gateway 注入的 deliverText（Unified Agent I/O）；分片、限额与错误分类在 QQ 文本 Adapter */
-    send(record, text, tag) {
-        return this.bot.deliverText(record, text, tag);
+    /** 统一发送：整条逻辑消息连同原生事件身份（seq/turn/kind）交给 gateway 注入的 deliverText（Unified Agent I/O）；分片、限额与错误分类在 QQ 文本 Adapter */
+    send(record, text, tag, origin) {
+        return this.bot.deliverText(record, text, tag, origin);
     }
 }
 /**

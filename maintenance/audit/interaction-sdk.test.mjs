@@ -16,7 +16,7 @@ const source=fs.readFileSync(new URL('../qqbot-src/dist/gateway/bootstrap.js',im
 const targetSource=fs.readFileSync(path.join(qq,'transport/reply-target.js'),'utf8').replace(/^import .*;\r?\n/gm,'').replaceAll('export function','function');
 const {resolveReplyTarget,sendResolvedMarkdown}=vm.runInNewContext(targetSource+'\n;({resolveReplyTarget,sendResolvedMarkdown});',{getCachedReplyIds,MsgType:{MARKDOWN:2}});
 const makeSender=vm.runInNewContext('(function(bot,deliveryRecorder){'+source.slice(source.indexOf('    const replyLimiter ='),source.indexOf('    // Unified Agent I/O text adapter'))+'return {sender,replyLimiter};})',{ReplyLimiter,resolveReplyTarget,sendResolvedMarkdown,randomUUID:()=> 'fixture-stream-id'});
-const makeOutbound=vm.runInNewContext(source.slice(source.indexOf('export function createInteractionOutbound'),source.indexOf('export async function bootstrapGateway')).replace('export function','function')+';createInteractionOutbound;',{createOutboundHandler:()=>()=>{}});
+const makeOutbound=vm.runInNewContext(source.slice(source.indexOf('export function createInteractionOutbound'),source.indexOf('export async function bootstrapGateway')).replace('export function','function')+';createInteractionOutbound;',{AbortController,createOutboundHandler:()=>()=>{}});
 const micro=()=>new Promise(r=>setImmediate(r));
 function fixture(t,{streaming=false,rejectOver=Infinity,onRequest,diagnostics}={}){
  const payloads=[],bubbles=[],agent={session:{header:{id:'fixture'}},status:'running'},key={},timers=new Map();let timer=0;

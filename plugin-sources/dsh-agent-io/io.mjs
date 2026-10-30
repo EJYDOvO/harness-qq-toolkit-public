@@ -3,13 +3,16 @@
 // (targets, quota, chunking, API errors); this module owns the logical
 // message: validation, per-Conversation order, cancellation between parts,
 // duplicate suppression and an honest result. Nothing here is durable.
-import {randomUUID} from 'node:crypto';
+import {createHash} from 'node:crypto';
 
 const CODE=/^[a-z][a-z-]{0,39}$/;
 const code=(value,fallback)=>typeof value==='string'&&CODE.test(value)?value:fallback;
 const text=value=>typeof value==='string'&&value.length>0&&value.length<=256;
 const freeze=result=>Object.freeze({...result,parts:Object.freeze((result.parts??[]).map(p=>Object.freeze(p)))});
 const notSent=(id,reason,stage='before-platform',parts=[])=>freeze({id,status:'not-sent',reason,stage,parts});
+// What a logical message id stands for: its Conversation and text. The same id
+// with another fingerprint is a different message, never a retry of the first.
+const fingerprint=request=>createHash('sha256').update(JSON.stringify([request.target.conversation.type,request.target.conversation.id,request.message.text])).digest('hex');
 
 export function createAgentIO(options={}){
  const maxPerConversation=options.maxPendingPerConversation??32,maxPending=options.maxPending??512,maxConcurrent=options.maxConcurrent??8,maxText=options.maxTextLength??100_000,remember=options.rememberResults??1024;
@@ -43,22 +46,34 @@ export function createAgentIO(options={}){
  }
 
  function sendMessage(request){
-  const id=typeof request?.id==='string'?request.id:randomUUID();
+  // No id means no duplicate suppression; an id is never invented here.
+  const id=typeof request?.id==='string'?request.id:undefined;
   const invalid=validate(request);
   if(invalid)return Promise.resolve(report(request,notSent(id,invalid),now()));
   if(closed)return Promise.resolve(report(request,notSent(id,'closed'),now()));
   const {platform,accountId,conversation}=request.target;
   const key=JSON.stringify([platform,accountId,conversation.type,conversation.id]);
-  // A logical message is sent at most once per process: a repeated id (settlement,
-  // model retry, a second internal caller) gets the first send's result.
-  const known=request.id===undefined?undefined:results.get(key+'\n'+id);
-  if(known)return known.then(result=>freeze({...result,duplicate:true}));
+  // Ids are scoped to the platform account. Within it a logical message is handed
+  // over at most once per process: the same id with the same Conversation and
+  // text (repeated event, settlement, a second internal caller) gets the first
+  // result; the same id with another target or text is refused as a conflict.
+  const idKey=id===undefined?undefined:JSON.stringify([platform,accountId,id]),print=id===undefined?undefined:fingerprint(request);
+  const known=idKey===undefined?undefined:results.get(idKey);
+  if(known){
+   if(known.fingerprint!==print)return Promise.resolve(report(request,notSent(id,'id-conflict'),now()));
+   return known.promise.then(result=>freeze({...result,duplicate:true}));
+  }
   let conv=conversations.get(key);
   if(pending>=maxPending||(conv?(conv.jobs.length+(conv.running?1:0)):0)>=maxPerConversation)return Promise.resolve(report(request,notSent(id,'queue-full'),now()));
   if(!conv)conversations.set(key,conv={key,jobs:[],running:false,waiting:false});
   const job={id,request,adapterKey:adapterKey(platform,accountId),started:now()};
   const promise=new Promise(resolve=>{job.resolve=resolve;});
-  if(request.id!==undefined){results.set(key+'\n'+id,promise);while(results.size>remember)results.delete(results.keys().next().value);}
+  if(idKey!==undefined){
+   // Bounded: the oldest settled ids are forgotten first. An id still queued or
+   // in flight is never evicted, so it cannot be handed over twice at once.
+   const entry={fingerprint:print,promise,settled:false};results.set(idKey,entry);promise.then(()=>{entry.settled=true;});
+   for(const [k,e] of results){if(results.size<=remember)break;if(e.settled)results.delete(k);}
+  }
   pending++;conv.jobs.push(job);schedule(conv);
   return promise;
  }

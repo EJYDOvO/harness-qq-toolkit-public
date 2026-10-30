@@ -117,24 +117,48 @@ export function createInteractionOutbound(ctx, manager, sender, config, logger, 
             cancel(){cancelled=true;stream?.cancel?.();}
         };
     }
+    // Native Turn lifecycle per Session (bounded). Output not yet handed to the
+    // platform is cancelled by /stop, by a Turn that ends aborted/interrupted,
+    // and stays cancelled for late output of that Turn, without Session rotation.
+    const turns=new Map();
+    function turnControl(sessionId,turn){
+        if(!Number.isSafeInteger(turn))return undefined;
+        let session=turns.get(sessionId);
+        if(!session){session=new Map();turns.set(sessionId,session);while(turns.size>256)turns.delete(turns.keys().next().value);}
+        let control=session.get(turn);
+        if(!control){control=new AbortController();session.set(turn,control);while(session.size>8)session.delete(session.keys().next().value);}
+        return control;
+    }
+    function observeTurn(sessionId,event){
+        if(event?.type==='turn/start')turnControl(sessionId,event.data?.turn);
+        else if(event?.type==='turn/end'&&['aborted','interrupted'].includes(event.data?.reason?.kind))turnControl(sessionId,event.data?.turn)?.abort();
+    }
+    manager.cancelOutput=record=>{for(const control of turns.get(record?.sessionId)?.values()??[])control.abort();};
     // Static text of the original outbound router (replies without an Interaction
     // policy, tool results, turn errors). With a policy it stays on the policy's
     // ordered external channel; otherwise the whole logical message goes to the
     // Unified Agent I/O, which re-checks the route when it sends. The QQ text
     // adapter chunks it; there is no direct sendMarkdown path left here.
-    async function deliverText(record, text, tag) {
+    async function deliverText(record, text, tag, origin) {
         try {
             const policy = policyFor(record);
             if(policy===null)return;
             if(policy?.transport){for(const part of chunkMarkdownText(text, config.textChunkLimit ?? 4500))await policy.external(part, { kind: 'tool-or-error' });return;}
             if(!io){logger.error?.(`im-qqbot: ${tag} withheld: Unified Agent I/O unavailable`);return;}
-            const result=await io.sendMessage({target:{platform:QQ_OFFICIAL,accountId:config.appId,conversation:qqConversation(record)},origin:{sessionId:record.sessionId},message:{text}});
-            if(result.status!=='sent')logger.warn?.(`im-qqbot: ${tag} ${result.status}${result.reason?` (${result.reason})`:''}`);
+            // Logical id from the trusted native event (Session id + durable seq +
+            // kind): a repeated event or settlement maps to the same id, two
+            // legitimate messages with equal text never do. No id is invented.
+            const id=Number.isSafeInteger(origin?.seq)&&['assistant','tool','turn-error'].includes(origin.kind)?`qq:${record.sessionId}:${origin.seq}:${origin.kind}`:undefined;
+            const signal=turnControl(record.sessionId,origin?.turn)?.signal;
+            const result=await io.sendMessage({...(id?{id}:{}),target:{platform:QQ_OFFICIAL,accountId:config.appId,conversation:qqConversation(record)},origin:{sessionId:record.sessionId},message:{text},...(signal?{signal}:{})});
+            if(result.duplicate)logger.debug?.(`im-qqbot: ${tag} duplicate suppressed`);
+            else if(result.status!=='sent')logger.warn?.(`im-qqbot: ${tag} ${result.status}${result.reason?` (${result.reason})`:''}`);
         }
         catch { logger.error?.(`im-qqbot: ${tag} delivery failed`); }
     }
     const legacyOutbound = createOutboundHandler(manager, { openStream: (...args) => sender.openStream(...args), deliverText }, config, logger, toolsRegistry);
     const outboundHandler = (session, event) => {
+        observeTurn(session.header.id, event);
         const record = manager.findBySessionId(session.header.id);
         const policy = policyFor(record);
         if(policy===null)return;
@@ -246,7 +270,7 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
     // Unified Agent I/O text adapter for this application. It reuses the sender
     // above for reply targets, passive-reply quota and diagnostics.
     const releaseTextAdapter = io.registerAdapter(createQQTextAdapter({
-        accountId: config.appId, manager, limit: config.textChunkLimit ?? 4500,
+        accountId: config.appId, manager, access: config.access, limit: config.textChunkLimit ?? 4500,
         split: text => chunkMarkdownText(text, config.textChunkLimit ?? 4500),
         send: (target, text, info) => sender.sendMarkdown(target, text, { delivery: { session: diagnostics?.hash(info.sessionId), index: info.index } }),
     }));

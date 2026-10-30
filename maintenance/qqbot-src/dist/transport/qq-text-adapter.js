@@ -44,27 +44,48 @@ export function classifyQQError(error) {
     return { outcome: 'unknown', reason: 'invalid-response' };
 }
 /**
+ * The gateway's access configuration at send time (same rules as the SDK
+ * accessPolicy for C2C sender / group openid). A peer the configuration no
+ * longer admits is never written to, whatever an older record says.
+ */
+export function accessAllows(access, scope, peerId) {
+    const policy = scope === 'group' ? { mode: access?.groupMode, allow: access?.groupAllow } : { mode: access?.c2cMode, allow: access?.c2cAllow };
+    const mode = policy.mode ?? 'open';
+    if (mode === 'open') return true;
+    if (mode !== 'allowlist' || !Array.isArray(policy.allow)) return false;
+    return policy.allow.some(value => value === '*' || value === peerId);
+}
+/**
  * @param accountId QQ application id this gateway serves.
  * @param manager   the gateway's Conversation Manager handle (trusted routing).
+ * @param access    the gateway's access configuration (c2cMode/c2cAllow/groupMode/groupAllow).
  * @param send      (replyTarget, text, {index, sessionId}) → SDK result; resolves the
  *                  passive-reply target and applies the quota.
  * @param split     text → markdown-aware chunks.
  * @param limit     hard per-message character limit.
  */
-export function createQQTextAdapter({ accountId, manager, send, split, limit = 4500 }) {
+export function createQQTextAdapter({ accountId, manager, access, send, split, limit = 4500 }) {
+    // The Manager's own ownership check is required: without it a late reply
+    // could not be proven to belong to the current Session, so refuse to start.
+    if (typeof manager?.getSessionRecord !== 'function' || typeof manager.isCurrentSession !== 'function') throw new Error('Conversation Manager ownership check required');
     return {
         platform: QQ_OFFICIAL,
         accountId,
-        // Checked before every part: the origin Session must still be the current
-        // Session of exactly this Conversation, so rotation, removal or a late
-        // Turn from an older Session cannot reach the user.
+        // Checked before every part: the peer must still be admitted, and the
+        // origin Session must still be the Manager's current Session of exactly
+        // this Conversation with its live Agent, so rotation, removal, Agent
+        // disposal, revoked access or a late Turn from an older Session cannot
+        // reach the user. Only Host-filled evidence is compared; nothing here
+        // trusts model-supplied ids or platformData.
         resolve(target, origin) {
             const scope = scopes[target.conversation.type];
             if (!scope) return { ok: false, reason: 'invalid-target' };
             if (typeof origin?.sessionId !== 'string' || !origin.sessionId) return { ok: false, reason: 'unauthorized' };
+            if (!accessAllows(access, scope, target.conversation.id)) return { ok: false, reason: 'unauthorized' };
             const record = manager.getSessionRecord(scope, target.conversation.id);
-            if (!record) return { ok: false, reason: 'stale' };
-            if (record.sessionId !== origin.sessionId) return { ok: false, reason: 'stale' };
+            if (!record || record.sessionId !== origin.sessionId) return { ok: false, reason: 'stale' };
+            if (manager.isCurrentSession(record) !== true) return { ok: false, reason: 'stale' };
+            if (record.scope !== scope || record.peerId !== target.conversation.id) return { ok: false, reason: 'invalid-target' };
             const reply = record.replyTarget;
             if (!reply || reply.scope !== scope || reply.targetId !== target.conversation.id) return { ok: false, reason: 'invalid-target' };
             return { ok: true, route: { record } };

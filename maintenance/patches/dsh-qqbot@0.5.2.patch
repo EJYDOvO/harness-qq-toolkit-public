@@ -374,7 +374,7 @@ index dc2e41f..0757387 100644
                      // 同一题的选项共享分组：点一个后其余变灰（单选互斥）
                      group_id: `q-${question.id}`,
 diff --git a/dist/gateway/middleware-setup.js b/dist/gateway/middleware-setup.js
-index ca4b002..b49a385 100644
+index ca4b002..99882c6 100644
 --- a/dist/gateway/middleware-setup.js
 +++ b/dist/gateway/middleware-setup.js
 @@ -3,6 +3,7 @@ import { buildCommandList } from "../commands/index.js";
@@ -411,7 +411,7 @@ index ca4b002..b49a385 100644
      // 6. 内容清洗（去 @marker、表情标签、多余空白）
      bot.use(contentSanitizer({
          parseFaceTags: true,
-@@ -48,15 +54,48 @@ export function setupMiddlewares(bot, config, manager, logger) {
+@@ -48,15 +54,50 @@ export function setupMiddlewares(bot, config, manager, logger) {
      // 7. 三层限流（sender / group / global）
      bot.use(rateLimiter());
      // 8. 斜杠命令（在 concurrencyGuard 之前，命令匹配后不排队直接响应）
@@ -423,6 +423,8 @@ index ca4b002..b49a385 100644
 +            const msg = cmdCtx.message;
 +            const scope = msg.kind === 'group' ? 'group' : 'c2c';
 +            const record = manager.getSessionRecord(scope, scope === 'group' ? (msg.groupOpenid ?? msg.senderId) : msg.senderId);
++            // Unified Agent I/O output of this Session that has not reached QQ yet.
++            if (record) manager.cancelOutput?.(record);
 +            try {
 +                const service = record && manager.ctx.get('agentPresets')?.serviceFor?.(record.agent, 'interactionPolicy');
 +                service?.get(record.agent).stopOutput();
@@ -461,7 +463,7 @@ index ca4b002..b49a385 100644
      // 9. 并发串行 + 消息合并（同 peer 排队，避免 session 冲突）
      bot.use(concurrencyGuard({
          strategy: 'merge',
-@@ -79,4 +118,4 @@ export function setupMiddlewares(bot, config, manager, logger) {
+@@ -79,4 +120,4 @@ export function setupMiddlewares(bot, config, manager, logger) {
          includeSender: true,
      }));
  }
@@ -539,7 +541,7 @@ index c4998d0..71ed35a 100644
 \ No newline at end of file
 +//# sourceMappingURL=index.js.map
 diff --git a/dist/gateway/bootstrap.js b/dist/gateway/bootstrap.js
-index 070f21e..3e5f34b 100644
+index 070f21e..1fadc12 100644
 --- a/dist/gateway/bootstrap.js
 +++ b/dist/gateway/bootstrap.js
 @@ -1,6 +1,11 @@
@@ -600,7 +602,7 @@ index 070f21e..3e5f34b 100644
  /**
   * interaction 统一分发器：按 button_data 的顶层 `t` 判别字段，路由到对应
   * channel（question / approval）。QQ 只有一个 interaction 入口，集中路由
-@@ -30,8 +73,110 @@ function dispatchInteraction(event, manager) {
+@@ -30,8 +73,134 @@ function dispatchInteraction(event, manager) {
          return manager.approvalChannel?.handleInteraction(event) ?? false;
      return false;
  }
@@ -648,24 +650,48 @@ index 070f21e..3e5f34b 100644
 +            cancel(){cancelled=true;stream?.cancel?.();}
 +        };
 +    }
++    // Native Turn lifecycle per Session (bounded). Output not yet handed to the
++    // platform is cancelled by /stop, by a Turn that ends aborted/interrupted,
++    // and stays cancelled for late output of that Turn, without Session rotation.
++    const turns=new Map();
++    function turnControl(sessionId,turn){
++        if(!Number.isSafeInteger(turn))return undefined;
++        let session=turns.get(sessionId);
++        if(!session){session=new Map();turns.set(sessionId,session);while(turns.size>256)turns.delete(turns.keys().next().value);}
++        let control=session.get(turn);
++        if(!control){control=new AbortController();session.set(turn,control);while(session.size>8)session.delete(session.keys().next().value);}
++        return control;
++    }
++    function observeTurn(sessionId,event){
++        if(event?.type==='turn/start')turnControl(sessionId,event.data?.turn);
++        else if(event?.type==='turn/end'&&['aborted','interrupted'].includes(event.data?.reason?.kind))turnControl(sessionId,event.data?.turn)?.abort();
++    }
++    manager.cancelOutput=record=>{for(const control of turns.get(record?.sessionId)?.values()??[])control.abort();};
 +    // Static text of the original outbound router (replies without an Interaction
 +    // policy, tool results, turn errors). With a policy it stays on the policy's
 +    // ordered external channel; otherwise the whole logical message goes to the
 +    // Unified Agent I/O, which re-checks the route when it sends. The QQ text
 +    // adapter chunks it; there is no direct sendMarkdown path left here.
-+    async function deliverText(record, text, tag) {
++    async function deliverText(record, text, tag, origin) {
 +        try {
 +            const policy = policyFor(record);
 +            if(policy===null)return;
 +            if(policy?.transport){for(const part of chunkMarkdownText(text, config.textChunkLimit ?? 4500))await policy.external(part, { kind: 'tool-or-error' });return;}
 +            if(!io){logger.error?.(`im-qqbot: ${tag} withheld: Unified Agent I/O unavailable`);return;}
-+            const result=await io.sendMessage({target:{platform:QQ_OFFICIAL,accountId:config.appId,conversation:qqConversation(record)},origin:{sessionId:record.sessionId},message:{text}});
-+            if(result.status!=='sent')logger.warn?.(`im-qqbot: ${tag} ${result.status}${result.reason?` (${result.reason})`:''}`);
++            // Logical id from the trusted native event (Session id + durable seq +
++            // kind): a repeated event or settlement maps to the same id, two
++            // legitimate messages with equal text never do. No id is invented.
++            const id=Number.isSafeInteger(origin?.seq)&&['assistant','tool','turn-error'].includes(origin.kind)?`qq:${record.sessionId}:${origin.seq}:${origin.kind}`:undefined;
++            const signal=turnControl(record.sessionId,origin?.turn)?.signal;
++            const result=await io.sendMessage({...(id?{id}:{}),target:{platform:QQ_OFFICIAL,accountId:config.appId,conversation:qqConversation(record)},origin:{sessionId:record.sessionId},message:{text},...(signal?{signal}:{})});
++            if(result.duplicate)logger.debug?.(`im-qqbot: ${tag} duplicate suppressed`);
++            else if(result.status!=='sent')logger.warn?.(`im-qqbot: ${tag} ${result.status}${result.reason?` (${result.reason})`:''}`);
 +        }
 +        catch { logger.error?.(`im-qqbot: ${tag} delivery failed`); }
 +    }
 +    const legacyOutbound = createOutboundHandler(manager, { openStream: (...args) => sender.openStream(...args), deliverText }, config, logger, toolsRegistry);
 +    const outboundHandler = (session, event) => {
++        observeTurn(session.header.id, event);
 +        const record = manager.findBySessionId(session.header.id);
 +        const policy = policyFor(record);
 +        if(policy===null)return;
@@ -711,7 +737,7 @@ index 070f21e..3e5f34b 100644
      // ── 初始化 QQ Bot SDK ──
      const userAgent = buildUserAgent();
      const bot = new QQBot({
-@@ -68,17 +213,46 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+@@ -68,17 +237,46 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
      // 发送适配器：将 QQBot 实例适配为 QQBotSender（openStream 参数形态不同）。
      // sendMarkdown 统一做被动回复限额管控：同一 msgId 超限/过期时降级主动推送。
      const replyLimiter = new ReplyLimiter({ limit: 4 });
@@ -753,7 +779,7 @@ index 070f21e..3e5f34b 100644
 +    // Unified Agent I/O text adapter for this application. It reuses the sender
 +    // above for reply targets, passive-reply quota and diagnostics.
 +    const releaseTextAdapter = io.registerAdapter(createQQTextAdapter({
-+        accountId: config.appId, manager, limit: config.textChunkLimit ?? 4500,
++        accountId: config.appId, manager, access: config.access, limit: config.textChunkLimit ?? 4500,
 +        split: text => chunkMarkdownText(text, config.textChunkLimit ?? 4500),
 +        send: (target, text, info) => sender.sendMarkdown(target, text, { delivery: { session: diagnostics?.hash(info.sessionId), index: info.index } }),
 +    }));
@@ -763,7 +789,7 @@ index 070f21e..3e5f34b 100644
      ctx
          .on('session/event', outboundHandler);
      // ── 问答通道（ask_user_question → QQ 文本 + 按钮） ──
-@@ -89,6 +263,10 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+@@ -89,6 +287,10 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
      const approvalChannel = new ApprovalChannel(manager, sender, logger);
      manager.approvalChannel = approvalChannel;
      approvalChannel.install(ctx);
@@ -774,7 +800,7 @@ index 070f21e..3e5f34b 100644
      // ── 按钮点击回调（interaction）：统一分发到问答/审批通道 ──
      bot.on('interaction', async (_iCtx, event) => {
          // scope/targetId 推导对齐消息事件（inbound.ts）：按 scene 判定类型，群用 group_openid，私聊用 user_openid
-@@ -146,11 +324,12 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+@@ -146,11 +348,12 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
          bot.start().catch((err) => {
              logger.error(`Bot start failed: ${err instanceof Error ? err.message : String(err)}`);
          });
@@ -1600,7 +1626,7 @@ index cc39029..0259b71 100644
 \ No newline at end of file
 +//# sourceMappingURL=config.js.map
 diff --git a/dist/transport/outbound.js b/dist/transport/outbound.js
-index f50e4b2..74e33e0 100644
+index f50e4b2..587e63e 100644
 --- a/dist/transport/outbound.js
 +++ b/dist/transport/outbound.js
 @@ -1,4 +1,3 @@
@@ -1608,7 +1634,99 @@ index f50e4b2..74e33e0 100644
  import { OutboundBuffer } from "./outbound-buffer.js";
  import { formatToolResult } from "./tool-presenter.js";
  import { parseEvent, extractTurnError, } from "./events.js";
-@@ -117,17 +116,9 @@ class OutboundRouter {
+@@ -30,21 +29,31 @@ class OutboundRouter {
+         const record = this.manager.findBySessionId(session.header.id);
+         if (record === undefined)
+             return;
++        // Trusted identity of the native event behind each logical message: its
++        // durable Session sequence and Turn. A repeated event keeps the same seq.
++        const origin = { seq: raw.seq, turn: raw.data?.turn };
+         switch (event.type) {
+             case 'assistant/chunk':
+                 this.onChunk(session.header.id, record, event);
+                 break;
+             case 'assistant/message':
+-                this.onMessage(session.header.id, record, event);
++                // A partial settled because the Turn was cancelled (/stop, removal)
++                // is not delivered: cancellation stops output that has not started.
++                if (raw.data?.interrupted === true) {
++                    this.buffers.get(session.header.id)?.cancel();
++                    this.buffers.delete(session.header.id);
++                    break;
++                }
++                this.onMessage(session.header.id, record, event, origin);
+                 break;
+             case 'tool/call':
+                 this.onToolCall(event);
+                 break;
+             case 'tool/result':
+-                this.onToolResult(record, event);
++                this.onToolResult(record, event, origin);
+                 break;
+             case 'turn/end':
+-                this.onTurnEnd(session.header.id, record, event);
++                this.onTurnEnd(session.header.id, record, event, origin);
+                 break;
+         }
+     }
+@@ -64,10 +73,10 @@ class OutboundRouter {
+             && !!record.replyTarget.msgId;
+     }
+     /** 完整 assistant 消息：有流式 buffer 则 flush，否则直接发送文本块 */
+-    onMessage(sessionId, record, event) {
++    onMessage(sessionId, record, event, origin) {
+         const buffer = this.buffers.get(sessionId);
+         if (buffer !== undefined && buffer.text.trim()) {
+-            void buffer.flush();
++            void buffer.flush(origin);
+             this.buffers.delete(sessionId);
+             return;
+         }
+@@ -79,7 +88,7 @@ class OutboundRouter {
+         const fullText = textParts.join('\n');
+         if (!fullText.trim())
+             return;
+-        void this.send(record, fullText, 'sendMarkdown');
++        void this.send(record, fullText, 'sendMarkdown', { ...origin, kind: 'assistant' });
+         this.buffers.delete(sessionId);
+     }
+     /** 工具调用：仅记录，不发送（避免刷屏，等待结果） */
+@@ -87,7 +96,7 @@ class OutboundRouter {
+         this.toolCalls.set(event.callId, { name: event.name, args: event.arguments });
+     }
+     /** 工具结果：错误始终发送，成功结果按开关 */
+-    onToolResult(record, event) {
++    onToolResult(record, event, origin) {
+         const call = this.toolCalls.get(event.callId);
+         this.toolCalls.delete(event.callId);
+         if (call === undefined)
+@@ -97,14 +106,16 @@ class OutboundRouter {
+         const text = formatToolResult(call.name, call.args, event.raw, this.toolsRegistry, record.agent);
+         if (!text)
+             return;
+-        void this.send(record, text, 'sendToolResult');
++        void this.send(record, text, 'sendToolResult', { ...origin, kind: 'tool' });
+     }
+     /** 轮次结束：清理 buffer，异常结束时告知用户 */
+-    onTurnEnd(sessionId, record, event) {
++    onTurnEnd(sessionId, record, event, origin) {
+         const buffer = this.buffers.get(sessionId);
++        // A cancelled Turn's unsent buffer is dropped, not flushed.
++        const cancelled = ['aborted', 'interrupted'].includes(event.reason?.kind);
+         if (buffer !== undefined) {
+-            if (buffer.text.trim()) {
+-                void buffer.flush();
++            if (buffer.text.trim() && !cancelled) {
++                void buffer.flush(origin);
+             }
+             else {
+                 buffer.cancel();
+@@ -113,21 +124,13 @@ class OutboundRouter {
+         }
+         const failure = extractTurnError(event.reason);
+         if (failure !== undefined && !SILENT_TURN_ERROR_CODES.has(failure.code)) {
+-            void this.send(record, `⚠️ 本轮异常结束\n\`${failure.code}\`: ${failure.message}`, 'sendTurnEndError');
++            void this.send(record, `⚠️ 本轮异常结束\n\`${failure.code}\`: ${failure.message}`, 'sendTurnEndError', { ...origin, kind: 'turn-error' });
          }
          this.logger.debug(`im-qqbot: turn/end sessionId=${sessionId}`);
      }
@@ -1623,14 +1741,14 @@ index f50e4b2..74e33e0 100644
 -                this.logger.error(`im-qqbot: ${tag} failed: ${err instanceof Error ? err.message : String(err)}`);
 -            }
 -        }
-+    /** 统一发送：整条逻辑消息交给 gateway 注入的 deliverText（Unified Agent I/O）；分片、限额与错误分类在 QQ 文本 Adapter */
-+    send(record, text, tag) {
-+        return this.bot.deliverText(record, text, tag);
++    /** 统一发送：整条逻辑消息连同原生事件身份（seq/turn/kind）交给 gateway 注入的 deliverText（Unified Agent I/O）；分片、限额与错误分类在 QQ 文本 Adapter */
++    send(record, text, tag, origin) {
++        return this.bot.deliverText(record, text, tag, origin);
      }
  }
  /**
 diff --git a/dist/transport/outbound-buffer.js b/dist/transport/outbound-buffer.js
-index f69cedb..7fa53b9 100644
+index f69cedb..b5373b0 100644
 --- a/dist/transport/outbound-buffer.js
 +++ b/dist/transport/outbound-buffer.js
 @@ -1,4 +1,3 @@
@@ -1638,7 +1756,16 @@ index f69cedb..7fa53b9 100644
  import { StreamingWriter } from "./streaming-writer.js";
  /** 流式输出节流间隔(ms)：连续 chunk 累积后停顿该间隔才推送 */
  const STREAM_THROTTLE_MS = 200;
-@@ -40,11 +39,8 @@ export class OutboundBuffer {
+@@ -29,7 +28,7 @@ export class OutboundBuffer {
+         return this.buffer;
+     }
+     /** 发送所有累积文本：流式优先，降级静态 */
+-    async flush() {
++    async flush(origin) {
+         if (this.flushing || !this.buffer.trim())
+             return;
+         this.flushing = true;
+@@ -40,11 +39,9 @@ export class OutboundBuffer {
                  if (!this.writer.shouldFallback)
                      return;
              }
@@ -1648,16 +1775,17 @@ index f69cedb..7fa53b9 100644
 -                await this.bot.sendMarkdown(this.record.replyTarget, chunk);
 -            }
 +            // 降级：静态发送（writer 不存在 or 流式失败），整条交给 Unified Agent I/O
-+            await this.bot.deliverText(this.record, this.buffer, 'flush');
++            // origin：触发本次输出的原生事件，与静态回复共用同一逻辑消息 ID
++            await this.bot.deliverText(this.record, this.buffer, 'flush', { ...origin, kind: 'assistant' });
          }
          catch (err) {
              this.logger.error(`im-qqbot: flush failed: ${err instanceof Error ? err.message : String(err)}`);
 diff --git a/dist/transport/qq-text-adapter.js b/dist/transport/qq-text-adapter.js
 new file mode 100644
-index 0000000..db5ff2e
+index 0000000..cc273ae
 --- /dev/null
 +++ b/dist/transport/qq-text-adapter.js
-@@ -0,0 +1,79 @@
+@@ -0,0 +1,100 @@
 +/**
 + * QQ Official text adapter for the Unified Agent I/O (dsh-agent-io).
 + *
@@ -1704,27 +1832,48 @@ index 0000000..db5ff2e
 +    return { outcome: 'unknown', reason: 'invalid-response' };
 +}
 +/**
++ * The gateway's access configuration at send time (same rules as the SDK
++ * accessPolicy for C2C sender / group openid). A peer the configuration no
++ * longer admits is never written to, whatever an older record says.
++ */
++export function accessAllows(access, scope, peerId) {
++    const policy = scope === 'group' ? { mode: access?.groupMode, allow: access?.groupAllow } : { mode: access?.c2cMode, allow: access?.c2cAllow };
++    const mode = policy.mode ?? 'open';
++    if (mode === 'open') return true;
++    if (mode !== 'allowlist' || !Array.isArray(policy.allow)) return false;
++    return policy.allow.some(value => value === '*' || value === peerId);
++}
++/**
 + * @param accountId QQ application id this gateway serves.
 + * @param manager   the gateway's Conversation Manager handle (trusted routing).
++ * @param access    the gateway's access configuration (c2cMode/c2cAllow/groupMode/groupAllow).
 + * @param send      (replyTarget, text, {index, sessionId}) → SDK result; resolves the
 + *                  passive-reply target and applies the quota.
 + * @param split     text → markdown-aware chunks.
 + * @param limit     hard per-message character limit.
 + */
-+export function createQQTextAdapter({ accountId, manager, send, split, limit = 4500 }) {
++export function createQQTextAdapter({ accountId, manager, access, send, split, limit = 4500 }) {
++    // The Manager's own ownership check is required: without it a late reply
++    // could not be proven to belong to the current Session, so refuse to start.
++    if (typeof manager?.getSessionRecord !== 'function' || typeof manager.isCurrentSession !== 'function') throw new Error('Conversation Manager ownership check required');
 +    return {
 +        platform: QQ_OFFICIAL,
 +        accountId,
-+        // Checked before every part: the origin Session must still be the current
-+        // Session of exactly this Conversation, so rotation, removal or a late
-+        // Turn from an older Session cannot reach the user.
++        // Checked before every part: the peer must still be admitted, and the
++        // origin Session must still be the Manager's current Session of exactly
++        // this Conversation with its live Agent, so rotation, removal, Agent
++        // disposal, revoked access or a late Turn from an older Session cannot
++        // reach the user. Only Host-filled evidence is compared; nothing here
++        // trusts model-supplied ids or platformData.
 +        resolve(target, origin) {
 +            const scope = scopes[target.conversation.type];
 +            if (!scope) return { ok: false, reason: 'invalid-target' };
 +            if (typeof origin?.sessionId !== 'string' || !origin.sessionId) return { ok: false, reason: 'unauthorized' };
++            if (!accessAllows(access, scope, target.conversation.id)) return { ok: false, reason: 'unauthorized' };
 +            const record = manager.getSessionRecord(scope, target.conversation.id);
-+            if (!record) return { ok: false, reason: 'stale' };
-+            if (record.sessionId !== origin.sessionId) return { ok: false, reason: 'stale' };
++            if (!record || record.sessionId !== origin.sessionId) return { ok: false, reason: 'stale' };
++            if (manager.isCurrentSession(record) !== true) return { ok: false, reason: 'stale' };
++            if (record.scope !== scope || record.peerId !== target.conversation.id) return { ok: false, reason: 'invalid-target' };
 +            const reply = record.replyTarget;
 +            if (!reply || reply.scope !== scope || reply.targetId !== target.conversation.id) return { ok: false, reason: 'invalid-target' };
 +            return { ok: true, route: { record } };
