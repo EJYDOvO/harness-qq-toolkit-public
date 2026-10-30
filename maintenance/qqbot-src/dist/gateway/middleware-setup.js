@@ -62,6 +62,8 @@ export function setupMiddlewares(bot, config, manager, logger) {
             const msg = cmdCtx.message;
             const scope = msg.kind === 'group' ? 'group' : 'c2c';
             const record = manager.getSessionRecord(scope, scope === 'group' ? (msg.groupOpenid ?? msg.senderId) : msg.senderId);
+            // Unified Agent I/O output of this Session that has not reached QQ yet.
+            if (record) manager.cancelOutput?.(record);
             try {
                 const service = record && manager.ctx.get('agentPresets')?.serviceFor?.(record.agent, 'interactionPolicy');
                 service?.get(record.agent).stopOutput();

@@ -7,22 +7,26 @@ function outbound(policy,streaming=true,diagnostics){
  const start=source.indexOf('    const policyFor ='),end=source.indexOf('    return outboundHandler;',start);assert(start>=0&&end>start);
  const body=source.slice(start,end);
  assert(body.includes('const outboundHandler'));assert(!body.includes('bootstrapGateway'));
- const sent=[],legacy=[],record={sessionKey:'fixture',agent:{},replyTarget:{scope:'c2c',targetId:'owner',msgId:'m1'}};
+ const sent=[],legacy=[],delivered=[],record={sessionKey:'fixture',sessionId:'fixture',agent:{},replyTarget:{scope:'c2c',targetId:'owner',msgId:'m1'},scope:'c2c',peerId:'owner'};
  const manager={getSessionRecord:()=>record,findBySessionId:()=>record,approvalChannel:{pending:new Map()},questionChannel:{pending:new Map()}};
  const sender={sendMarkdown:async(t,s)=>sent.push([t,s]),openStream:()=>({update:async()=>{},complete:async()=>{}})};
+ const io={sendMessage:async request=>{delivered.push(request);return {status:'sent',parts:[]};}};
  const handler=vm.runInNewContext('(function(){'+body+';return outboundHandler;})()',{
-  ctx:{get:()=>({serviceFor:()=>policy?{get:a=>{assert.equal(a,record.agent);return policy;}}:undefined})},manager,sender,config:{streaming},logger:{},toolsRegistry:undefined,diagnostics,
-  createOutboundHandler:(_m,s)=>async(session,event)=>{legacy.push(event.type);if(event.type==='tool/result')await s.sendMarkdown(record.replyTarget,'tool error');}
+  ctx:{get:()=>({serviceFor:()=>policy?{get:a=>{assert.equal(a,record.agent);return policy;}}:undefined})},manager,sender,config:{streaming,appId:'app'},logger:{},toolsRegistry:undefined,diagnostics,io,
+  chunkMarkdownText:text=>[text],QQ_OFFICIAL:'qq-official',qqConversation:r=>({type:'direct',id:r.peerId}),
+  createOutboundHandler:(_m,s)=>async(session,event)=>{legacy.push(event.type);if(event.type==='tool/result')await s.deliverText(record,'tool error','sendToolResult');}
  });
- return {handler,sent,legacy,record,manager,session:{header:{id:'fixture'}}};
+ return {handler,sent,legacy,delivered,record,manager,session:{header:{id:'fixture'}}};
 }
-test('QQ bridge absent policy preserves original outbound path',async()=>{
- const f=outbound();await f.handler(f.session,{type:'assistant/message'});await f.handler(f.session,{type:'tool/result'});assert.deepEqual(f.legacy,['assistant/message','tool/result']);assert.equal(f.sent.length,1);
+test('QQ bridge absent policy keeps the original router, whose static text goes to the Unified I/O',async()=>{
+ const f=outbound();await f.handler(f.session,{type:'assistant/message'});await f.handler(f.session,{type:'tool/result'});assert.deepEqual(f.legacy,['assistant/message','tool/result']);
+ assert.equal(f.sent.length,0,'no direct sendMarkdown');assert.equal(f.delivered.length,1);
+ assert.deepEqual(JSON.parse(JSON.stringify(f.delivered[0])),{target:{platform:'qq-official',accountId:'app',conversation:{type:'direct',id:'owner'}},origin:{sessionId:'fixture'},message:{text:'tool error'}});
 });
 test('QQ bridge delegates policy output once, keeps tool errors on ordered external channel',async()=>{
  const events=[],external=[],p={bind(t){this.transport=t;},event:e=>events.push(e.type),external:async t=>external.push(t)};
  const f=outbound(p);for(const type of ['turn/start','assistant/chunk','assistant/message','tool/result','turn/end'])await f.handler(f.session,{type});
- assert.deepEqual(events,['turn/start','assistant/chunk','assistant/message','tool/result','turn/end']);assert.deepEqual(f.legacy,['turn/start','tool/result','turn/end']);assert.deepEqual(external,['tool error']);assert.equal(f.sent.length,0);assert.equal(typeof p.transport.openStream,'function');
+ assert.deepEqual(events,['turn/start','assistant/chunk','assistant/message','tool/result','turn/end']);assert.deepEqual(f.legacy,['turn/start','tool/result','turn/end']);assert.deepEqual(external,['tool error']);assert.equal(f.sent.length,0);assert.equal(f.delivered.length,0);assert.equal(typeof p.transport.openStream,'function');
  f.manager.approvalChannel.pending.set('fixture',{});assert(p.transport.waitingForUser());f.manager.approvalChannel.pending.clear();assert(!p.transport.waitingForUser());
 });
 test('QQ no-stream configuration does not accidentally open a stream',async()=>{

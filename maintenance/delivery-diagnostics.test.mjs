@@ -44,7 +44,7 @@ test('diagnostics record suppressed sources as a closed enum',async t=>{
  assert.deepEqual(rows.map(r=>r.source),['subagent-settled','schedule','web','other',undefined]);
 });
 test('a failed proactive stream fallback is traced and still rejects',async()=>{
- const begin=source.indexOf('    const sender = {'),stop=source.indexOf('    // Optional Agent policy.',begin);assert(begin>0&&stop>begin);
+ const begin=source.indexOf('    const sender = {'),stop=source.indexOf('    // Unified Agent I/O text adapter',begin);assert(begin>0&&stop>begin);
  const traces=[],diagnostics={hash:v=>v===undefined?undefined:'a'.repeat(24),trace:(e,f)=>traces.push([e,f])};
  const failure=Object.assign(new Error('rejected'),{httpStatus:403,bizCode:22009});
  const sender=vm.runInNewContext('(function(){'+source.slice(begin,stop)+';return sender;})()',{

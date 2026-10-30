@@ -8,13 +8,13 @@ QQTK 继续是独立插件与维护组件集合，不迁入 Character 仓库、�
 
 | 功能 | 旧前提 | 当前前提 |
 |---|---|---|
-| QQ 接入/Session/Sender/审批/问答 | 基础 QQ 强依赖 qqRemoteOps | 原生 Agent/Preset + Conversation Manager + QQ 0.5.2 配套补丁 |
+| QQ 接入/Session/Sender/审批/问答 | 基础 QQ 强依赖 qqRemoteOps | 原生 Agent/Preset + Conversation Manager + Agent I/O + QQ 0.5.2 配套补丁 |
 | `/ops` | 安装目录中私人维护脚本 | 独立插件，显式 Owner/stateDirectory；可选 qqMaintenance 服务 |
 | 旧 Windows 部署/恢复/守护 | 固定部署约定 | 保留在显式 root 后端，未改成跨平台工具 |
 | Character QQ | QQTK + Character 集成 | 不变；通用 QQ 不加载 Character |
 | 会话偏好 | QQ 私有路径推导 | Manager 显式绝对 stateFile；默认项目隔离 |
 
-普通项目安装 QQ Bot 和独立 `dsh-conversation-manager`，不需要 Remote Ops、旧项目记忆或任何 Character 包。两份补丁须配套：
+普通项目安装 QQ Bot、独立 `dsh-agent-io` 和 `dsh-conversation-manager`，不需要 Remote Ops、旧项目记忆或任何 Character 包。Agent I/O（本分支 Iteration 01 源码，未部署）的接口与语义见 [独立插件说明](../plugin-sources/dsh-agent-io/README.md)。两份补丁须配套：
 
 Profile 保留原生 base/web-app Bundle，`autoInstallPeers: false`，不要重复安装本体的服务包。将 `maintenance/patches/dsh-qqbot@0.5.2.patch` 放到 Profile 的 patches，配置：
 
@@ -33,6 +33,9 @@ overrides:
 ```yaml
 # cordis.patch.yml；占位符必须换成本机安全配置
 - insert:
+    - id: agent-io
+      name: dsh-agent-io
+      config: {}
     - id: conversation-manager
       name: dsh-conversation-manager
       config:
@@ -57,7 +60,8 @@ overrides:
 
 ## 单例、权限与生命周期
 
-- 基础 QQ 注入 agents/conversationManager；未安装 Remote Ops 时审批/问答仍注册。停用 Manager 会使依赖它的 QQ 停用，不另开旧 Session Manager。
+- 基础 QQ 注入 agents/conversationManager/agentIO；未安装 Remote Ops 时审批/问答仍注册。停用 Manager 或 Agent I/O 会使依赖它们的 QQ 停用，不另开旧 Session Manager，也不退回旧的直接发送路径。
+- 未绑定 Interaction 时，普通回复、Streaming 静态降级、工具错误与轮次错误提示经 Agent I/O 的 `sendMessage()` 发送：逻辑消息 ID 取自原生 Session ID 与事件 seq（重复事件只发一次）；每个分片前复核对端仍被访问配置准入、来源 Session 仍是 Manager `isCurrentSession` 认可的当前 Session；`/stop` 与 `aborted`/`interrupted` 结束的 Turn 取消尚未交给 QQ 的输出。明确拒绝、结果未知与部分发送分别记录且不重发；进程内去重不跨重启。SDK 流式输出、审批/问答与 Interaction 气泡仍走 Gateway Sender。
 - 进程共享 appId 租约拒绝重复 Gateway，卸载等待停止后释放；只构造一套 Sender、问答与审批通道。
 - 多进程使用同一凭据需外部单活管理；本机维护锁不能代表跨机器分布式锁。
 - 无效 Preset 不再退回其他 Agent 组合；已有 Session 继续按其原 Preset 恢复，缺失时拒绝。

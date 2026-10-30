@@ -63,7 +63,7 @@ DeployValidated 校验候选文件、当前 profile 和本体哈希；若准备�
 
 QQ 0.5.2 的上游审批代码仍读取旧的 `session.events`，本体当前使用 `seq/eventAt`。本地补丁保留随机 nonce、审批人匹配、超时、取消及卸载清理，并修复空白名单放行、目录链接越界发送、显式收件人绕过访问配置、提问发送期间取消挂起，以及旧提问回调删除新问题等情况。
 
-维护源码在 `maintenance/qqbot-src`，对应上游原文件及 SHA-256 清单在 `maintenance/qqbot-upstream-0.5.2`。编辑维护源码后运行 `node maintenance/build-qqbot-patch.cjs` 生成 `maintenance/patches/dsh-qqbot@0.5.2.patch`；Stage 会用 `--check` 核对可重建性。profile 的 `patchedDependencies` 和锁文件负责自动重装。旧 `qqbot-approval` 目录仅为首版兼容修复参考，不再作为新补丁来源。
+维护源码在 `maintenance/qqbot-src`，对应上游原文件及 SHA-256 清单在 `maintenance/qqbot-upstream-0.5.2`。编辑维护源码后运行 `node maintenance/build-qqbot-patch.cjs` 生成 `maintenance/patches/dsh-qqbot@0.5.2.patch`（清单 `added` 列出上游没有、由补丁新增的文件，如 QQ Official 文本 Adapter；`node maintenance/audit/verify-patches.cjs` 在新上游副本上应用并逐文件比对）；Stage 会用 `--check` 核对可重建性。profile 的 `patchedDependencies` 和锁文件负责自动重装。旧 `qqbot-approval` 目录仅为首版兼容修复参考，不再作为新补丁来源。
 
 升级 QQ 时不能只改包版本：检查新版是否已经合入修复，更新或删除补丁，并重跑 `node --test maintenance/approval.test.mjs maintenance/approval-timeout.test.mjs maintenance/qq-boundaries.test.mjs maintenance/maintenance.test.cjs`（默认针对候选 profile，实际部署复测设置环境变量 `QQBOT_TEST_PROFILE`）。脚本对未经审查的 QQ 版本直接报错，避免静默丢补丁。`autoInstallPeers: false` 保持由桌面本体提供核心组件，不在 profile 装第二份核心。现有 `plugin-sources/dsh-qqbot-0.5.0` 仅作为历史源码参考。
 
