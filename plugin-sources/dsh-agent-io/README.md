@@ -1,6 +1,6 @@
 # DSH Agent I/O（Unified Agent I/O）
 
-独立、平台无关的 Host 插件，提供统一聊天出站接口 `sendMessage()` 与入站通道 `openInbound()`。当前源码 `0.1.0-test.3`：架构路线的 **Iteration 01：普通文本出站**（已合并）与 **Iteration 02：普通聊天入站**（本分支，见 Character 仓库 `docs/architecture-planning/IMPLEMENTATION_ROADMAP.md`）。**未部署**；实例版本以仓库根 README 为准。验证基线为 DSH `0.2.1-rc.3`、Node 24。
+独立、平台无关的 Host 插件，提供统一聊天出站接口 `sendMessage()` 与入站通道 `openInbound()`。当前源码 `0.1.0-test.3`：架构路线的 **Iteration 01：普通文本出站**与 **Iteration 02：普通聊天入站**（见 Character 仓库 `docs/architecture-planning/IMPLEMENTATION_ROADMAP.md`）。已配套 Character test.24 在现有 rc.3 实例授权部署，真实 QQ/手机验收待完成；实例版本以仓库根 README 为准。验证基线为 DSH `0.2.1-rc.3`、Node 24。
 
 它只做逻辑消息的交接语义：出站的校验、同 Conversation 串行、取消与分片间复核、同一逻辑消息去重、诚实的结果；入站的标准消息交接、按平台消息范围去重与交接结果。平台协议（回复目标、限额、分片、API 错误、事件解析与标准化）由各平台 Adapter 负责；准入与权限仍属 Host；Session 与路由仍由原生 DSH 和 [Conversation Manager](../dsh-conversation-manager/README.md) 负责。不依赖 QQ SDK、Character 或 Interaction；不注册模型工具、RPC 或路由；不持久化任何状态。
 
