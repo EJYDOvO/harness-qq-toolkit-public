@@ -17,6 +17,11 @@
     "dist/transport/reply-target.js": "3c7bad103415f857177afd3444801cf4c25b4c6a2fcbd3d7be314d8dce3b5da4",
     "dist/transport/inbound.js": "5e7da8b6a8441d4d166bcb1129d61a7afd85d52f187b33f89edf27d354f080fe",
     "dist/config.js": "a52f0010155d57fda33c84c5345c6de49eeb3a6db7961b212555aff896a804c0",
-    "dist/session/idle-evictor.js": "a20dda7f1e2f06b7d1797f752fcb0774606021862da1757d0c11189b351b8385"
-  }
+    "dist/session/idle-evictor.js": "a20dda7f1e2f06b7d1797f752fcb0774606021862da1757d0c11189b351b8385",
+    "dist/transport/outbound.js": "b7be7e7d127a6c92abcf28e8bd5a70b4e69e28f819617cd5c333fe6c687d7963",
+    "dist/transport/outbound-buffer.js": "e2fc87dd048df2d82f945341f3d59d1ac86238e88d6f0365abb365026dcc8d5a"
+  },
+  "added": [
+    "dist/transport/qq-text-adapter.js"
+  ]
 }

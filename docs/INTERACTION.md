@@ -6,6 +6,8 @@ Conversation Manager `0.1.0-test.1` 已从 QQTK 抽离，配套 Character test.2
 
 最新源码配套 Interaction **0.1.0-test.7**、Character test.21、独立 Conversation Manager，已在授权后部署；旧版为 test.6 / test.20。本轮基线为 rc.3、QQ Bot 0.5.2、SDK 1.0.5。策略位于 [Character 仓库](https://github.com/EJYDOvO/character-agent-v1/tree/main/packages/interaction-policy)，不依赖 Character。停用 Interaction 保留普通 QQ 流程；Session 仍由同一个 Manager 管理。
 
+Iteration 01（本分支源码，未部署）不迁移 Interaction：`policy.bind` 的 `sendText`/可选 `openStream` 仍由 Gateway Sender 承担；绑定 Interaction 时工具错误/轮次错误提示仍走 `policy.external`。只有未绑定 Interaction 的普通静态文本改经 [Agent I/O](../plugin-sources/dsh-agent-io/README.md)；Interaction 改用 `sendMessage()` 属于后续切片。
+
 ## 契约
 
 gateway/bootstrap.js 用原生 agentPresets.serviceFor 获取当前 Agent 的策略；只转发可信 Session 事件和唯一 Sender，接管 assistant 后阻止旧出站重复发送。审批、问答、Remote Ops 与权限检查继续使用既有通道。

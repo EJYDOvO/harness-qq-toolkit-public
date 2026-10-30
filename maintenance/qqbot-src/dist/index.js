@@ -5,7 +5,7 @@ import { ensureCredentials, persistCredentialsToProfile, registerBoundCredential
 // ── Cordis 插件元数据 ──
 export const name = 'im-qqbot';
 // Harness 0.2 uses a service-name map/array, not upstream Cordis required/optional metadata.
-export const inject = ['agents', 'conversationManager'];
+export const inject = ['agents', 'conversationManager', 'agentIO'];
 export const Config = ConfigSchema;
 // ── 插件主体 ──
 export async function apply(ctx, config) {

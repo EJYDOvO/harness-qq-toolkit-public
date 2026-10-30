@@ -12,7 +12,7 @@ test('explicit Host state paths isolate preferences for the same application and
 
 test('QQ bridge declares real service names supported by bundled Cordis',()=>{
  const source=fs.readFileSync(new URL('./qqbot-src/dist/index.js',import.meta.url),'utf8');
- assert.match(source,/export const inject = \['agents', 'conversationManager'\]/);
+ assert.match(source,/export const inject = \['agents', 'conversationManager', 'agentIO'\]/);
  assert.doesNotMatch(source,/inject\s*=\s*\{\s*required:/);
 });
 

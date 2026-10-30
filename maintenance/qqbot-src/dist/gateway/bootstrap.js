@@ -4,7 +4,8 @@ import * as diagnosticFs from 'node:fs/promises';
 import { resolve as diagnosticPath } from 'node:path';
 import { homedir as diagnosticHome } from 'node:os';
 import { SessionManager } from "../session/index.js";
-import { handleInbound, createOutboundHandler } from "../transport/index.js";
+import { handleInbound, createOutboundHandler, chunkMarkdownText } from "../transport/index.js";
+import { QQ_OFFICIAL, qqConversation, createQQTextAdapter } from "../transport/qq-text-adapter.js";
 import { ReplyLimiter } from "../transport/reply-limiter.js";
 import { cacheMsgId, cacheEventId } from "../transport/msgid-cache.js";
 import { resolveReplyTarget, sendResolvedMarkdown } from "../transport/reply-target.js";
@@ -73,7 +74,7 @@ function dispatchInteraction(event, manager) {
     return false;
 }
 // Reusable transport wiring, separately testable without creating a QQ gateway.
-export function createInteractionOutbound(ctx, manager, sender, config, logger, toolsRegistry, diagnostics) {
+export function createInteractionOutbound(ctx, manager, sender, config, logger, toolsRegistry, diagnostics, io) {
     const policyFor = record => { try { return record && ctx.get('agentPresets')?.serviceFor?.(record.agent, 'interactionPolicy')?.get(record.agent); } catch { logger.warn?.('Interaction scope temporarily unavailable; withholding output');return null; } };
     // Reply targets stay on the QQ side: Interaction only names the native input id.
     const rememberTarget=(record,message)=>{
@@ -116,13 +117,23 @@ export function createInteractionOutbound(ctx, manager, sender, config, logger, 
             cancel(){cancelled=true;stream?.cancel?.();}
         };
     }
-    const presentationSender = { ...sender, sendMarkdown(target, text, opts) {
-        const record = manager.getSessionRecord(target.scope, target.targetId);
-        const policy = policyFor(record);
-        if(policy===null)return Promise.resolve();
-        return policy?.transport ? policy.external(text, { kind: 'tool-or-error' }) : sender.sendMarkdown(target, text, opts);
-    } };
-    const legacyOutbound = createOutboundHandler(manager, presentationSender, config, logger, toolsRegistry);
+    // Static text of the original outbound router (replies without an Interaction
+    // policy, tool results, turn errors). With a policy it stays on the policy's
+    // ordered external channel; otherwise the whole logical message goes to the
+    // Unified Agent I/O, which re-checks the route when it sends. The QQ text
+    // adapter chunks it; there is no direct sendMarkdown path left here.
+    async function deliverText(record, text, tag) {
+        try {
+            const policy = policyFor(record);
+            if(policy===null)return;
+            if(policy?.transport){for(const part of chunkMarkdownText(text, config.textChunkLimit ?? 4500))await policy.external(part, { kind: 'tool-or-error' });return;}
+            if(!io){logger.error?.(`im-qqbot: ${tag} withheld: Unified Agent I/O unavailable`);return;}
+            const result=await io.sendMessage({target:{platform:QQ_OFFICIAL,accountId:config.appId,conversation:qqConversation(record)},origin:{sessionId:record.sessionId},message:{text}});
+            if(result.status!=='sent')logger.warn?.(`im-qqbot: ${tag} ${result.status}${result.reason?` (${result.reason})`:''}`);
+        }
+        catch { logger.error?.(`im-qqbot: ${tag} delivery failed`); }
+    }
+    const legacyOutbound = createOutboundHandler(manager, { openStream: (...args) => sender.openStream(...args), deliverText }, config, logger, toolsRegistry);
     const outboundHandler = (session, event) => {
         const record = manager.findBySessionId(session.header.id);
         const policy = policyFor(record);
@@ -160,6 +171,8 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
     gatewayLeases.set(config.appId, lease);
     let shutdown;
     ctx.effect(() => async () => { await shutdown?.(); if (gatewayLeases.get(config.appId) === lease) gatewayLeases.delete(config.appId); });
+    const io = ctx.get('agentIO');
+    if (!io) throw new Error('Install and configure dsh-agent-io before QQ');
     const manager = new SessionManager(ctx, agents, config, logger);
     ctx.effect(()=>()=>manager.disposeAll()); // also release the adapter if SDK setup fails
     const deliveryRecorder=createDeliveryRecorder(config.deliveryDiagnostics,logger);
@@ -230,8 +243,16 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
             return stream;
         },
     };
+    // Unified Agent I/O text adapter for this application. It reuses the sender
+    // above for reply targets, passive-reply quota and diagnostics.
+    const releaseTextAdapter = io.registerAdapter(createQQTextAdapter({
+        accountId: config.appId, manager, limit: config.textChunkLimit ?? 4500,
+        split: text => chunkMarkdownText(text, config.textChunkLimit ?? 4500),
+        send: (target, text, info) => sender.sendMarkdown(target, text, { delivery: { session: diagnostics?.hash(info.sessionId), index: info.index } }),
+    }));
+    ctx.effect(() => releaseTextAdapter);
     // Optional Agent policy. No Character, Remote Ops or policy package dependency.
-    const outboundHandler = createInteractionOutbound(ctx, manager, sender, config, logger, toolsRegistry,deliveryRecorder);
+    const outboundHandler = createInteractionOutbound(ctx, manager, sender, config, logger, toolsRegistry,deliveryRecorder, io);
     ctx
         .on('session/event', outboundHandler);
     // ── 问答通道（ask_user_question → QQ 文本 + 按钮） ──

@@ -18,7 +18,15 @@ for (const [file,sha256] of Object.entries(manifest.files)) {
   patch += diff.stdout.replace(/^diff --git .*$/m,`diff --git a/${file} b/${file}`)
     .replace(/^--- .*$/m,`--- a/${file}`).replace(/^\+\+\+ .*$/m,`+++ b/${file}`);
 }
+// Reviewed files with no upstream counterpart are added by the patch.
+for (const file of manifest.added ?? []) {
+  assert(!(file in manifest.files),`Added file is also an upstream file: ${file}`);
+  const modified = path.join(__dirname,sdk?'sdk-src':'qqbot-src',file);
+  const diff=spawnSync('git',['-c','core.autocrlf=false','diff','--no-index','--no-ext-diff','--text','/dev/null',modified],{encoding:'utf8',windowsHide:true});
+  assert.equal(diff.status,1,diff.stderr || `Added file missing: ${file}`);
+  patch += diff.stdout.replace(/^diff --git .*$/m,`diff --git a/${file} b/${file}`).replace(/^\+\+\+ .*$/m,`+++ b/${file}`);
+}
 const target=path.join(__dirname,sdk?'patches/qqbot-nodejs@1.0.5.patch':'patches/dsh-qqbot@0.5.2.patch');
 if(process.argv.includes('--check')) assert.equal(fs.readFileSync(target,'utf8'),patch,'Rebuild the QQ patch');
 else fs.writeFileSync(target,patch);
-console.log(JSON.stringify({patch:target,files:Object.keys(manifest.files).length,checked:process.argv.includes('--check')}));
+console.log(JSON.stringify({patch:target,files:Object.keys(manifest.files).length,added:(manifest.added??[]).length,checked:process.argv.includes('--check')}));

@@ -2,6 +2,8 @@
 
 为 DeepSeek Harness 提供 **QQ 接入兼容补丁、可选 Remote Ops 插件和维护工具**。普通 DSH Agent 可以独立使用 QQ 接入，不需要 Character Agent、角色 Preset 或记忆插件。
 
+**Iteration 01（本分支源码，未部署）：** 新增独立 [Agent I/O](plugin-sources/dsh-agent-io/README.md) `0.1.0-test.1`，提供与 QQ SDK 解耦的 `sendMessage()`；未绑定 Interaction 时的普通文本出站（回复、工具错误、轮次错误提示）改经它交给 QQ Official 文本 Adapter。QQ 补丁原生依赖该服务，需与 Manager 成套安装；Interaction、审批/问答和通知的发送路径本轮未变。
+
 **当前源码配套 Character test.22 / Manager test.2：** 恢复只接受原生同 Session 的缺失错误；关闭等待旧句柄并显式报告失败。已配套 Character test.23 / Interaction test.8 在现有 rc.3 实例授权部署，单一 QQ Gateway 健康；手机验收仍待完成。 新增独立 [Conversation Manager](plugin-sources/dsh-conversation-manager/README.md) `0.1.0-test.1`。最新 QQ 补丁原生依赖该服务，必须成套安装；下面的 test.14～test.20 是历史部署记录。路由由 Host 显式配置 `stateFile`；上线前审查旧提醒、任务及通知账本，禁止用空文件静默替代旧路由。
 
 源码提供默认关闭的 [QQ 主 Session 生命周期](docs/GENERIC-INTEGRATION.md#可选主-session-生命周期)：真实 Host 重启或 12 小时无用户输入后，下次安全交互创建空白根 Session，不 Fork 聊天。繁忙、审批和已有提醒有保护，启动预热不算用户输入。test.13 首次部署并启用，test.14 保留；真实 QQ 收件与手机验收仍待完成。
@@ -20,12 +22,12 @@
 
 | 你需要什么 | 使用哪些部分 |
 |---|---|
-| QQ 对话、消息发送、审批与问答 | QQ Bot 0.5.2 + 配套补丁 + 独立 Conversation Manager；无需 Remote Ops |
+| QQ 对话、消息发送、审批与问答 | QQ Bot 0.5.2 + 配套补丁 + 独立 Conversation Manager + 独立 Agent I/O；无需 Remote Ops |
 | Owner 专属 `/ops`、任务观察、通知记录 | 在基础 QQ 上增加 `dsh-remote-ops-local`，配置 Owner 和状态目录 |
 | 远程备份、候选验证、部署、重启 | 再接入可信维护后端；仓库提供的是原 Windows 部署后端 |
 | Character 与分层长期记忆 | 使用独立的 [Character Agent](https://github.com/EJYDOvO/character-agent-v1) 项目；不是 QQTK 的安装前提 |
 
-QQ Gateway 负责连接、Sender、审批/问答展示；Conversation Manager 负责 Session 路由与生命周期。Remote Ops 接入同一套 Gateway，不创建第二条 QQ 连接；Identity 另行负责授权。
+QQ Gateway 负责连接、Sender、审批/问答展示，并注册 QQ Official 文本 Adapter；Conversation Manager 负责 Session 路由与生命周期；Agent I/O 负责逻辑消息的顺序、取消、去重和发送结果。Remote Ops 接入同一套 Gateway，不创建第二条 QQ 连接；Identity 另行负责授权。
 
 ## 仓库结构
 
@@ -37,6 +39,7 @@ maintenance/
   browser/0.0.83/            # 可选 Playwright MCP 的固定清单和配置
   *.ps1 / *.cjs / *.mjs      # Windows 维护后端、验证和测试
 plugin-sources/
+  dsh-agent-io/              # 独立、平台无关的统一出站 sendMessage() Host 插件
   dsh-conversation-manager/  # 独立、平台无关的路由/生命周期 Host 插件
   dsh-remote-ops/            # 独立运维插件，自带默认禁用的 Bundle
   dsh-task-memory/           # 旧项目记忆的适配源码，可选
@@ -62,7 +65,7 @@ licenses/                   # 第三方许可
 
 ## 接入方式
 
-**仅使用 QQ：** 安装固定版本 QQ Bot 和 `dsh-conversation-manager`，应用两份配套补丁，在 QQ 前声明 Manager，再配置唯一 QQ 条目与目标 Preset。完整示例见 [通用集成](docs/GENERIC-INTEGRATION.md)。
+**仅使用 QQ：** 安装固定版本 QQ Bot、`dsh-agent-io` 和 `dsh-conversation-manager`，应用两份配套补丁，在 QQ 前声明 Agent I/O 与 Manager，再配置唯一 QQ 条目与目标 Preset。完整示例见 [通用集成](docs/GENERIC-INTEGRATION.md)。
 
 - 保留由宿主提供的 DSH 核心依赖，使用 `autoInstallPeers: false`。
 - QQ 凭据与 Owner 白名单只保存在本机安全配置中；示例占位符不能直接使用。

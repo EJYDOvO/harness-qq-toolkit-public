@@ -6,6 +6,7 @@ for(const [upstream,source,patch]of [['qqbot-upstream-0.5.2','qqbot-src','dsh-qq
  for(const file of Object.keys(manifest.files)){fs.mkdirSync(path.dirname(path.join(dir,file)),{recursive:true});fs.copyFileSync(path.join(root,upstream,file),path.join(dir,file));}
  const git=(...args)=>{const r=spawnSync('git',['-c','core.autocrlf=false',...args],{cwd:dir,encoding:'utf8',windowsHide:true});assert.equal(r.status,0,r.stderr);};
  git('init','--quiet');git('apply','--check',path.join(root,'patches',patch));git('apply',path.join(root,'patches',patch));
- for(const file of Object.keys(manifest.files))assert(fs.readFileSync(path.join(dir,file)).equals(fs.readFileSync(path.join(root,source,file))),file);
- console.log(JSON.stringify({patch,applied:true,matchedFiles:Object.keys(manifest.files).length}));
+ const files=[...Object.keys(manifest.files),...(manifest.added??[])];
+ for(const file of files)assert(fs.readFileSync(path.join(dir,file)).equals(fs.readFileSync(path.join(root,source,file))),file);
+ console.log(JSON.stringify({patch,applied:true,matchedFiles:files.length}));
 }
