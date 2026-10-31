@@ -14,7 +14,7 @@ QQTK 继续是独立插件与维护组件集合，不迁入 Character 仓库、�
 | Character QQ | QQTK + Character 集成 | 不变；通用 QQ 不加载 Character |
 | 会话偏好 | QQ 私有路径推导 | Manager 显式绝对 stateFile；默认项目隔离 |
 
-普通项目安装 QQ Bot、独立 `dsh-agent-io` 和 `dsh-conversation-manager`，不需要 Remote Ops、旧项目记忆或任何 Character 包。Agent I/O（本分支 Iteration 01 源码，未部署）的接口与语义见 [独立插件说明](../plugin-sources/dsh-agent-io/README.md)。两份补丁须配套：
+普通项目安装 QQ Bot、独立 `dsh-agent-io` 和 `dsh-conversation-manager`，不需要 Remote Ops、旧项目记忆或任何 Character 包。Agent I/O 的接口与语义见 [独立插件说明](../plugin-sources/dsh-agent-io/README.md)；Iteration 05 的 QQ 补丁要求 `dsh-agent-io@0.1.0-test.5` 或更新（`openCommands()` 与附件），旧包会让 Gateway 启动即报错。两份补丁须配套：
 
 Profile 保留原生 base/web-app Bundle，`autoInstallPeers: false`，不要重复安装本体的服务包。将 `maintenance/patches/dsh-qqbot@0.5.2.patch` 放到 Profile 的 patches，配置：
 
@@ -62,7 +62,9 @@ overrides:
 
 - 基础 QQ 注入 agents/conversationManager/agentIO；未安装 Remote Ops 时审批/问答仍注册。停用 Manager 或 Agent I/O 会使依赖它们的 QQ 停用，不另开旧 Session Manager，也不退回旧的直接发送路径。
 - 所有 QQ 聊天输出经 Agent I/O 的 `sendMessage()` 发送（Iteration 04 起含 Interaction 气泡与等待提示，见 [Agent I/O](../plugin-sources/dsh-agent-io/README.md) 的“QQ Official 出站：Interaction 气泡”）；未绑定 Interaction 时普通回复、工具错误与轮次错误提示：逻辑消息 ID 取自原生 Session ID 与事件 seq（重复事件只发一次）；每个分片前复核对端仍被访问配置准入、来源 Session 仍是 Manager `isCurrentSession` 认可的当前 Session；`/stop` 与 `aborted`/`interrupted` 结束的 Turn 取消尚未交给 QQ 的输出。明确拒绝、结果未知与部分发送分别记录且不重发；进程内去重不跨重启。SDK 流式输出、审批/问答与 Interaction 气泡仍走 Gateway Sender。 旧配置项 `streaming` 已停用，QQ 聊天不再使用 SDK 流式消息。
-- 普通聊天入站（本分支 Iteration 02）：SDK 中间件链（白名单、群聊禁用、@ 门控、命令、问答、更正、合并、附件）不变，走到消息处理器的消息经 Agent I/O 入站通道去重后交给 QQ 会话入口，入口按同一访问配置复核，再经 Conversation Manager 创建原生输入；I/O 不授予任何权限。去重为进程内、有界，详见 [Agent I/O](../plugin-sources/dsh-agent-io/README.md)。
+- 斜杠命令（Iteration 05）：仍在并发合并之前处理，但识别、解析、一次性认领与路由由 Agent I/O 命令路由完成；命令的执行与授权（例如 Remote Ops `/ops` 的所有者检查）不变，未知命令仍作为普通聊天进入 Agent，命令消息不会再成为 Agent 输入。不再自动注册 SDK `/help`（`/bot-help` 保留）。
+- `qqbot_send_file`（Iteration 05）：只发往调用者 Agent 的当前会话，经 Agent I/O 作为附件消息发送；`target` 参数仅在与当前会话一致时接受。`sendFile.restrictPaths`/`extraRoots` 白名单不变并在发送时复核。
+- 普通聊天入站（Iteration 02 起）：SDK 中间件链（白名单、群聊禁用、@ 门控、命令、问答、更正、合并、附件下载）位置不变，附件与引用自 Iteration 05 起以标准附件描述随消息进入 I/O，走到消息处理器的消息经 Agent I/O 入站通道去重后交给 QQ 会话入口，入口按同一访问配置复核，再经 Conversation Manager 创建原生输入；I/O 不授予任何权限。去重为进程内、有界，详见 [Agent I/O](../plugin-sources/dsh-agent-io/README.md)。
 - 进程共享 appId 租约拒绝重复 Gateway，卸载等待停止后释放；只构造一套 Sender、问答与审批通道。
 - 多进程使用同一凭据需外部单活管理；本机维护锁不能代表跨机器分布式锁。
 - 无效 Preset 不再退回其他 Agent 组合；已有 Session 继续按其原 Preset 恢复，缺失时拒绝。

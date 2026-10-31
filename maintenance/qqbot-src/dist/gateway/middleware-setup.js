@@ -1,8 +1,82 @@
-import { errorHandler, messageFilter, accessPolicy, mentionGate, contentSanitizer, rateLimiter, slashCommand, concurrencyGuard, typingIndicator, quoteRef, historyBuffer, envelopeFormatter, } from '@tencent-connect/qqbot-nodejs';
+import { errorHandler, messageFilter, accessPolicy, mentionGate, contentSanitizer, rateLimiter, concurrencyGuard, typingIndicator, quoteRef, historyBuffer, envelopeFormatter, } from '@tencent-connect/qqbot-nodejs';
 import { buildCommandList } from "../commands/index.js";
-import { attachmentProcessor } from "../middleware/attachment.js";
+import { downloadMediaAttachments } from "../transport/attachment.js";
 import { questionAnswer } from "../middleware/question-answer.js";
 import { getHistoryStore, historyGroupKey } from "../features/history-store.js";
+/**
+ * A QQ command spec (SDK SlashCommand shape: name, scope, authorized, handler)
+ * as an Agent I/O command. The handler and its authorization run unchanged on
+ * the QQ middleware context, with the router's parsed command attached.
+ */
+export function qqCommand(cmd) {
+    const scopes = cmd.scope === 'c2c' ? ['direct'] : cmd.scope === 'group' ? ['group'] : undefined;
+    const qq = call => {
+        const ctx = call.context, command = { name: call.name, args: [...call.args], raw: call.raw };
+        ctx.state.command = command;
+        ctx.command = command;
+        return ctx;
+    };
+    return {
+        name: cmd.name, description: cmd.description, usage: cmd.usage, hidden: cmd.hidden, category: cmd.category, ...(scopes ? { scopes } : {}),
+        ...(cmd.authorized ? { authorize: call => cmd.authorized(qq(call)) } : {}),
+        execute: call => cmd.handler(qq(call)),
+    };
+}
+/**
+ * QQ protocol side of commands, at the former slashCommand position (before the
+ * merge guard, so /stop is never queued behind the running Turn): strip the
+ * server @ markers, require an @ in groups, then hand the standard candidate to
+ * the router. Anything but `pass` stops the chain: a command never becomes Agent
+ * input, and a re-delivered command is not executed again.
+ */
+export function commandGate(router) {
+    return async (ctx, next) => {
+        const msg = ctx.message;
+        const content = (msg.content ?? '').trim();
+        if (!content) return next();
+        const cleaned = content.replace(/<@!?[^>]+>\s*/g, '').trim();
+        if (msg.kind === 'group' && !(msg.rawEventType === 'GROUP_AT_MESSAGE_CREATE' || msg.mentions?.some(m => m.is_you))) return next();
+        const group = msg.kind === 'group';
+        const input = {
+            conversation: { type: group ? 'group' : 'direct', id: group ? (msg.groupOpenid ?? msg.senderId) : msg.senderId },
+            sender: { id: msg.senderId },
+            message: { ...(typeof msg.messageId === 'string' && msg.messageId ? { id: msg.messageId } : {}), text: cleaned },
+        };
+        const result = await router.dispatch(input, { context: ctx, reply: text => ctx.bot.sendText(ctx.replyTarget, text) });
+        if (result.status === 'pass') return next();
+        if (result.status === 'failed') ctx.log?.error?.(`[command] /${result.command} failed`);
+        ctx.stop(`command:${result.status}${result.command ? ':' + result.command : ''}`);
+    };
+}
+/**
+ * Attachment downloads (current message and quoted message) tagged with the
+ * index of the attachment they belong to, so each attachment gets its own file.
+ * The upstream attachmentProcessor returns downloads by file name only, which
+ * gave two attachments of one name (or quoted ones without a name, or a failed
+ * one and a later one of the same name) the same file. One download per
+ * attachment, in order; a skipped or failed one has no entry and only that one
+ * is lost.
+ */
+export function attachmentDownloads(config, logger) {
+    const each = async list => {
+        const out = [];
+        for (const [attachment, raw] of (list ?? []).entries()) {
+            try {
+                const [file] = await downloadMediaAttachments([raw], config.media, logger);
+                if (file) out.push({ ...file, attachment });
+            }
+            catch (err) { logger.warn(`im-qqbot: attachment download failed: ${err instanceof Error ? err.message : String(err)}`); }
+        }
+        return out;
+    };
+    return async (ctx, next) => {
+        ctx.state.downloadedFiles = await each(ctx.message.attachments?.map(a => ({ ...a, filename: a.filename ?? '' })));
+        // Quoted attachments in the raw attachment shape (voice and URL-less ones are skipped by the download).
+        const quoted = ctx.state.quote?.attachments;
+        if (quoted?.length) ctx.state.downloadedQuoteFiles = await each(quoted.map(a => ({ content_type: a.contentType ?? '', filename: a.filename ?? '', size: 0, url: a.url })));
+        await next();
+    };
+}
 export function setupMiddlewares(bot, config, manager, logger, conversation) {
     // 1. 错误兜底（最外层洋葱皮）
     bot.use(errorHandler());
@@ -52,7 +126,7 @@ export function setupMiddlewares(bot, config, manager, logger, conversation) {
     }));
     // 7. 三层限流（sender / group / global）
     bot.use(rateLimiter());
-    // 8. 斜杠命令（在 concurrencyGuard 之前，命令匹配后不排队直接响应）
+    // 8. 斜杠命令（在 concurrencyGuard 之前，命令匹配后不排队直接响应；识别/解析/路由由 Unified Agent I/O 完成）
     const commands = [...buildCommandList({ manager, config }), ...(manager.ctx?.get('qqRemoteOps')?.commands(manager) ?? [])];
     const stop = commands.find(c => c.name === 'stop');
     if (stop) {
@@ -71,13 +145,12 @@ export function setupMiddlewares(bot, config, manager, logger, conversation) {
             return nativeStop(cmdCtx);
         };
     }
-    const slash = slashCommand({
-        // 关闭 autoHelp：help 命令由 qqbot 注册为 /bot-help，
-        // 避免 SDK 再自动注册一个无前缀的 /help 造成重复
-        autoHelp: false,
-        commands,
-    });
-    bot.use(slash.middleware);
+    // Recognition, parsing, once-only claim and routing belong to the Unified
+    // Agent I/O command router; the QQ and Remote Ops commands keep executing and
+    // authorizing themselves. No SDK slashCommand and no automatic /help.
+    const router = conversation.openCommands({ prefixes: ['/'] });
+    for (const cmd of commands) router.register(qqCommand(cmd));
+    bot.use(commandGate(router));
     // 8.5. 待答问题截获（在 concurrencyGuard 之前，答案消息不排队直接作答）
     bot.use(questionAnswer(manager));
     // Explicit correction only, after access/question admission but before merge.
@@ -112,7 +185,7 @@ export function setupMiddlewares(bot, config, manager, logger, conversation) {
         preferMsgElements: true,
     }));
     // 11.5. 附件下载（file 附件下载到本地，供 @提及 / 工具访问）
-    bot.use(attachmentProcessor(config, logger));
+    bot.use(attachmentDownloads(config, logger));
     // 12. 上下文组装（将 history + quote + sender 组成 envelope）
     bot.use(envelopeFormatter({
         historyLimit: config.historyLimit,

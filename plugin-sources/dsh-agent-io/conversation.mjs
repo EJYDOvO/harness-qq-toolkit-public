@@ -10,6 +10,8 @@
 // One Conversation reference {platform, accountId, conversation:{type, id}} names
 // a Conversation everywhere; the adapter's scopes map it to the Manager's
 // existing (scope, peer) keys, so stored Session keys do not change.
+import {createCommandRouter} from './commands.mjs';
+
 const TYPES=['direct','group'];
 const text=value=>typeof value==='string'&&value.length>0&&value.length<=256;
 const CODE=/^[a-z][a-z-]{0,39}$/;
@@ -31,7 +33,7 @@ export function createConversations(io,host){
   }
   if(!scopes.size)throw Error('Conversation requires at least one scope');
   const onInput=typeof options.onInput==='function'?options.onInput:undefined;
-  let inbound,release,closed=false;
+  let inbound,release,commands,closed=false;
 
   const allowed=(scope,peer)=>{try{return admits(scope,peer)===true;}catch{return false;}};
   // undefined: no Interaction for this Agent. null: the lookup failed; callers
@@ -125,7 +127,24 @@ export function createConversations(io,host){
    if(inbound)throw Error('Inbound already open for this Conversation wiring');
    const channel=io.openInbound({platform,adapter,accountId,deliver});
    inbound=channel;
-   return Object.freeze({receive:channel.receive,close:()=>{channel.close();if(inbound===channel)inbound=undefined;}});
+   return Object.freeze({receive:channel.receive,claim:channel.claim,close:()=>{channel.close();if(inbound===channel)inbound=undefined;}});
+  }
+
+  /**
+   * The account's command router (Agent I/O commands module): recognition,
+   * parsing and routing with this wiring's admission, claiming each platform
+   * message in the inbound duplicate scope of this account. Commands are
+   * registered and executed by the Host or business plugins; the adapter calls
+   * dispatch() at its command position and keeps a non-pass result away from
+   * the Agent.
+   */
+  function openCommands(options={}){
+   if(closed)throw Error('Conversation closed');
+   if(commands)throw Error('Commands already open for this Conversation wiring');
+   commands=createCommandRouter({...options,
+    admits:(type,id)=>{const scope=scopes.get(type);return !closed&&!!scope&&allowed(scope,id);},
+    claim:input=>closed||!inbound?'unavailable':inbound.claim(input)});
+   return commands;
   }
 
   /**
@@ -133,7 +152,8 @@ export function createConversations(io,host){
    * adapter's own check(record, target) adds protocol conditions (e.g. a usable
    * reply target); only an explicit {ok:true} lets a part go out, anything else
    * (no answer, a malformed one, an exception) refuses it before send.
-   * send(route, text, info) receives route.record.
+   * send(route, text, info) and the optional accepts(attachment) /
+   * sendAttachment(route, attachment, info) receive route.record.
    */
   function registerAdapter(parts){
    if(closed)throw Error('Conversation closed');
@@ -141,6 +161,8 @@ export function createConversations(io,host){
    const check=typeof parts?.check==='function'?parts.check:undefined;
    const unregister=io.registerAdapter({
     platform,accountId,split:parts?.split,send:parts?.send,classify:parts?.classify,
+    // Basic media: optional; without sendAttachment the I/O refuses attachments.
+    ...(typeof parts?.sendAttachment==='function'?{sendAttachment:parts.sendAttachment,...(typeof parts.accepts==='function'?{accepts:parts.accepts}:{})}:{}),
     resolve(to,origin){
      const r=route(to,origin);if(!r.ok)return r;
      if(check){
@@ -155,9 +177,9 @@ export function createConversations(io,host){
   }
 
   function close(){
-   closed=true;inbound?.close();inbound=undefined;release?.();release=undefined;
+   closed=true;inbound?.close();inbound=undefined;release?.();release=undefined;commands=undefined;
   }
 
-  return Object.freeze({platform,adapter,accountId,target,policy,handoff,submit,route,openInbound,registerAdapter,close});
+  return Object.freeze({platform,adapter,accountId,target,policy,handoff,submit,route,openInbound,openCommands,registerAdapter,close});
  };
 }

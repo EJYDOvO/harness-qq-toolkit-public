@@ -10,7 +10,7 @@ import path from 'node:path';
 import vm from 'node:vm';
 import {fileURLToPath} from 'node:url';
 import {createAgentIO} from '../plugin-sources/dsh-agent-io/io.mjs';
-import {qqAdapter as adapterModule,qqConversation} from './qq-conversation-fixture.mjs';
+import {qqAdapter as adapterModule,qqConversation,createTurnControls} from './qq-conversation-fixture.mjs';
 
 const dist=new URL('./qqbot-src/dist/',import.meta.url);
 const read=file=>fs.readFileSync(new URL(file,dist),'utf8').replaceAll('\r\n','\n');
@@ -68,7 +68,7 @@ function gateway({io=createAgentIO(),appId='app-a',policy,streaming=false,limit=
  const {createOutboundHandler}=load('transport/outbound.js','createOutboundHandler',{formatToolResult:name=>`工具 ${name} 失败`,parseEvent,extractTurnError});
  const body=slice(source,'    const policyFor =','    return outboundHandler;');
  const handler=vm.runInNewContext('(function(){'+body+';return outboundHandler;})()',{
-  ctx,manager,sender,config,logger,toolsRegistry:undefined,diagnostics,io,conversation,createOutboundHandler,AbortController,AbortSignal,randomUUID:()=>'0123abcd-0000-4000-8000-000000000000'});
+  ctx,manager,sender,config,logger,toolsRegistry:undefined,diagnostics,io,conversation,createOutboundHandler,createTurnControls,AbortController,AbortSignal,randomUUID:()=>'0123abcd-0000-4000-8000-000000000000'});
  const registration=slice(source,'    // Unified Agent I/O text adapter',"    ctx\n        .on('session/event'");
  vm.runInNewContext('(function(){'+registration+'})()',{conversation,createQQTextAdapter:adapterModule.createQQTextAdapter,config,chunkMarkdownText,sender,diagnostics,outboundHandler:handler,ctx});
  // Native Session events as the Host emits them: durable seq, Turn in data.
@@ -122,6 +122,22 @@ test('/stop inside one Session cancels its queued output and late output of that
  assert.deepEqual(warns(g).map(([,m])=>m),['im-qqbot: sendMarkdown partial (cancelled)','im-qqbot: sendMarkdown not-sent (cancelled)','im-qqbot: sendToolResult not-sent (cancelled)']);
  g.ev.turn(2);g.ev.reply('第二轮',2);await tick();
  assert.deepEqual(g.bot.sent.map(s=>s.content),['一'.repeat(40),'第二轮'],'same Session, new Turn');
+});
+test('capacity overflow: output queued in an old Turn is still cancelled by /stop after many newer Turns',async()=>{
+ const g=gateway();let open;g.bot.gates.push(new Promise(r=>open=r));
+ g.ev.turn(1);g.ev.reply('先发',1);g.ev.reply('旧轮排队',1);await tick();
+ // Aborted Turns stay as tombstones: real pressure on the per-Session capacity.
+ for(let turn=2;turn<=20;turn++){g.ev.turn(turn);g.ev.end({kind:turn%2?'aborted':'completed'},turn);}
+ g.manager.cancelOutput(g.record);open();await tick(10);
+ assert.deepEqual(g.bot.sent.map(s=>s.content),['先发'],'the queued Turn 1 message is not sent although 19 Turns followed');
+ g.ev.turn(21);g.ev.reply('新一轮',21);await tick();
+ assert.deepEqual(g.bot.sent.map(s=>s.content),['先发','新一轮']);
+});
+test('Session release (rotation, removal, disposal) cancels and forgets its queued output',async()=>{
+ const g=gateway();let open;g.bot.gates.push(new Promise(r=>open=r));
+ g.ev.turn(1);g.ev.reply('第一条',1);g.ev.reply('释放后不发',1);await tick();
+ g.manager.releaseOutput(g.record);open();await tick(10);
+ assert.deepEqual(g.bot.sent.map(s=>s.content),['第一条']);
 });
 test('a Turn that ends aborted cancels its queued output without /stop and without Session rotation',async()=>{
  const g=gateway();let open;g.bot.gates.push(new Promise(r=>open=r));

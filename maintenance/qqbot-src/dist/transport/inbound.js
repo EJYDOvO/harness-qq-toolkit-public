@@ -1,6 +1,47 @@
-import { classifyContentType, isVoiceContentType, } from "./attachment.js";
+import { classifyContentType, } from "./attachment.js";
 import { clearGroupHistory } from "../features/history-store.js";
 import { QQ_SCOPES } from "./qq-text-adapter.js";
+// ── 基础 Media：QQ 附件 → Unified Agent I/O 附件描述 ──
+const short = value => typeof value === 'string' && value.length > 0 && value.length <= 256 ? value : undefined;
+const ref = value => typeof value === 'string' && value.length > 0 && value.length <= 4096 && !/[\u0000-\u001f]/.test(value) ? value : undefined;
+/**
+ * 一个 QQ 附件的描述：类型、名称、大小，语音的 ASR 文本（模型可见内容的来源），
+ * 以及可信资源引用——附件中间件下载到 media 目录的本地文件，否则是 QQ 事件给出的
+ * 平台 URL。资源引用只来自 QQ 事件与本 Adapter 的下载，不来自模型。
+ */
+function qqAttachment({ contentType, filename, size, url, asr }, downloaded) {
+    const kind = classifyContentType(contentType);
+    const local = kind === 'voice' ? undefined : ref(downloaded?.localPath);
+    const remote = ref(url);
+    return {
+        kind,
+        ...(short(filename) ? { name: filename } : {}),
+        ...(short(contentType) ? { contentType } : {}),
+        ...(Number.isSafeInteger(size) && size >= 0 ? { size } : {}),
+        ...(typeof asr === 'string' && asr.trim() ? { transcript: asr.trim() } : {}),
+        ...(local ? { resource: { type: 'local', path: local } } : remote ? { resource: { type: 'remote', url: remote } } : {}),
+    };
+}
+// 下载结果按所属附件的序号关联（attachmentDownloads 标注），不按文件名：同名或无名的
+// 附件各自对应自己的文件；没有序号的下载结果不关联。
+function byIndex(downloads) {
+    const map = new Map();
+    for (const d of downloads ?? []) if (Number.isSafeInteger(d?.attachment) && !map.has(d.attachment)) map.set(d.attachment, d);
+    return map;
+}
+function qqAttachments(attachments, downloads) {
+    const found = byIndex(downloads);
+    return (attachments ?? []).slice(0, 20).map((a, i) => qqAttachment({ contentType: a.content_type, filename: a.filename, size: a.size, url: a.url, asr: a.asr_refer_text }, found.get(i)));
+}
+/** 引用消息：被引用原文与其附件（与当前消息附件分开，带各自的下载结果）。 */
+function qqQuote(quote, downloads) {
+    if (!quote) return undefined;
+    const text = quote.text || quote.entry?.content;
+    const found = byIndex(downloads);
+    const attachments = (quote.attachments ?? []).slice(0, 20).map((a, i) => qqAttachment({ contentType: a.contentType, filename: a.filename, url: a.url, asr: a.asrText }, found.get(i)));
+    if (!text && !attachments.length) return undefined;
+    return { ...(typeof text === 'string' && text ? { text } : {}), ...(attachments.length ? { attachments } : {}) };
+}
 // ── 主处理函数 ──
 /**
  * QQ Official Adapter 侧标准化：已过 SDK 中间件链（访问控制、@ 门控、命令、
@@ -11,9 +52,11 @@ import { QQ_SCOPES } from "./qq-text-adapter.js";
 export function normalizeQQMessage(ctx) {
     const msg = ctx.message;
     const group = msg.kind === 'group';
+    const attachments = qqAttachments(msg.attachments, ctx.state?.downloadedFiles);
+    const quote = qqQuote(ctx.state?.quote, ctx.state?.downloadedQuoteFiles);
     return {
         conversation: { type: group ? 'group' : 'direct', id: group ? (msg.groupOpenid ?? msg.senderId) : msg.senderId },
-        message: { ...(typeof msg.messageId === 'string' && msg.messageId ? { id: msg.messageId } : {}), text: msg.content ?? '' },
+        message: { ...(typeof msg.messageId === 'string' && msg.messageId ? { id: msg.messageId } : {}), text: msg.content ?? '', ...(attachments.length ? { attachments } : {}), ...(quote ? { quote } : {}) },
         sender: { id: msg.senderId, ...(typeof msg.senderName === 'string' && msg.senderName ? { displayName: msg.senderName } : {}) },
         ...(msg.timestamp === undefined ? {} : { timestamp: msg.timestamp }),
         platformData: { context: ctx },
@@ -76,7 +119,7 @@ export async function deliverInbound(standard, conversation, config, logger) {
     };
     // ── 组装 agentBody（下载结果经 mwState.downloadedFiles 提供），准入之后才组装 ──
     const agentBody = () => {
-        const body = assembleAgentBody(msg, mwState, scope, logger);
+        const body = assembleAgentBody(standard.message, msg, mwState, scope);
         if (body)
             logger.info(`Processing: scope=${scope} length=${body.length}`);
         return body;
@@ -126,15 +169,16 @@ export async function deliverInbound(standard, conversation, config, logger) {
 /**
  * 组装 agentBody — AI 实际看到的完整上下文
  */
-function assembleAgentBody(msg, state, scope, logger) {
+function assembleAgentBody(message, msg, state, scope) {
     const isGroup = scope === 'group';
     const wasMentioned = state.mention?.wasMentioned ?? false;
-    const userContent = buildUserContent(msg, state, logger);
-    if (isEmptyMessage(userContent, msg.attachments, isGroup, wasMentioned))
+    const attachments = message.attachments ?? [];
+    const userContent = buildUserContent(message.text, attachments);
+    if (isEmptyMessage(userContent, attachments, isGroup, wasMentioned))
         return null;
-    const quotePart = buildQuotePart(state.quote);
+    const quotePart = buildQuotePart(message.quote);
     const userMessage = buildUserMessage(userContent, quotePart, msg.senderId, msg.senderName, isGroup, wasMentioned);
-    const dynamicCtx = buildDynamicCtx(msg, state);
+    const dynamicCtx = buildDynamicCtx(attachments, message.quote);
     const base = dynamicCtx ? `${dynamicCtx}${userMessage}` : userMessage;
     const agentBody = buildAgentBody(base, state.history, isGroup, wasMentioned);
     return agentBody;
@@ -155,21 +199,17 @@ function isEmptyMessage(userContent, attachments, isGroup, wasMentioned) {
 /**
  * Layer 1: 用户文本内容 + 语音转录 + 附件类型标签（媒体路径由 buildDynamicCtx 提供）
  */
-function buildUserContent(msg, state, logger) {
+function buildUserContent(content, attachments) {
     const parts = [];
-    const text = (msg.content ?? '').trim();
+    const text = (content ?? '').trim();
     if (text) {
         parts.push(text);
     }
-    const voiceTexts = extractVoiceTexts(msg.attachments, state.processedAttachments, logger);
-    if (voiceTexts.length > 0) {
-        for (const vt of voiceTexts) {
-            const durationTag = vt.duration ? ` (${vt.duration}s)` : '';
-            parts.push(`[Voice message${durationTag}] ${vt.text}`);
-        }
+    for (const voice of attachments.filter(a => a.kind === 'voice' && a.transcript)) {
+        parts.push(`[Voice message] ${voice.transcript}`);
     }
     // 附件类型标签（媒体路径由 buildDynamicCtx 提供，这里只提示「带了什么」）
-    const attachmentTags = buildAttachmentTags(msg.attachments);
+    const attachmentTags = buildAttachmentTags(attachments);
     if (attachmentTags) {
         parts.push(attachmentTags);
     }
@@ -179,9 +219,9 @@ function buildUserContent(msg, state, logger) {
  * Layer 2: 引用消息块
  */
 function buildQuotePart(quote) {
-    if (!quote?.text && !quote?.entry?.content)
+    if (!quote?.text)
         return '';
-    const quoteText = quote.text || quote.entry?.content || 'Original content unavailable';
+    const quoteText = quote.text;
     return `[Quoted message begins]\n${quoteText}\n[Quoted message ends]\n[Current message]\n`;
 }
 /**
@@ -199,48 +239,44 @@ function buildUserMessage(userContent, quotePart, senderId, senderName, isGroup,
 /**
  * Layer 4: 媒体元数据上下文（图片/视频/文件本地路径 + 语音 ASR + 引用附件）
  */
-function buildDynamicCtx(msg, state) {
+const localOf = a => a.resource?.type === 'local' ? a.resource.path : undefined;
+const urlOf = a => a.resource?.type === 'remote' ? a.resource.url : undefined;
+function buildDynamicCtx(attachments, quote) {
     const lines = [];
-    if (msg.attachments && msg.attachments.length > 0) {
-        const downloadedByFilename = new Map((state.downloadedFiles ?? []).map(d => [d.filename, d]));
+    if (attachments.length > 0) {
         const voices = [];
         // 一次遍历归类 + 生成媒体行
-        for (const att of msg.attachments) {
-            const kind = classifyContentType(att.content_type);
-            if (kind === 'voice') {
+        for (const att of attachments) {
+            if (att.kind === 'voice') {
                 voices.push(att);
                 continue;
             }
-            const d = downloadedByFilename.get(att.filename);
-            lines.push(`- ${renderMediaLine(kind, att.filename, d?.localPath, att.url, att.size)}`);
+            lines.push(`- ${renderMediaLine(att.kind, att.name, localOf(att), urlOf(att), att.size)}`);
         }
         // 语音：有 ASR 文本才带文本，否则只带链接（纯文本模型无法消费音频）
         if (voices.length > 0) {
-            const asrTexts = voices.map(a => a.asr_refer_text).filter(Boolean);
+            const asrTexts = voices.map(a => a.transcript).filter(Boolean);
             if (asrTexts.length > 0) {
                 lines.push(`- ASR: ${asrTexts.join(' | ')}`);
             }
             else {
-                const urls = voices.map(a => a.url).filter(Boolean);
+                const urls = voices.map(urlOf).filter(Boolean);
                 if (urls.length > 0)
                     lines.push(`- Voice: ${urls.join(', ')}`);
             }
         }
     }
     // 引用消息的附件（独立于当前消息媒体，不受上一步为空影响）
-    const quoteAttachments = state.quote?.attachments;
+    const quoteAttachments = quote?.attachments;
     if (quoteAttachments && quoteAttachments.length > 0) {
-        const downloadedQuote = new Map((state.downloadedQuoteFiles ?? []).map(d => [d.filename, d]));
         lines.push('[Reference attachments]');
         for (const qa of quoteAttachments) {
-            const kind = classifyContentType(qa.contentType);
-            const d = downloadedQuote.get(qa.filename ?? '');
-            if (kind === 'voice') {
-                if (qa.asrText)
-                    lines.push(`  - Voice: ${qa.asrText}`);
+            if (qa.kind === 'voice') {
+                if (qa.transcript)
+                    lines.push(`  - Voice: ${qa.transcript}`);
                 continue;
             }
-            lines.push(`  - ${renderMediaLine(kind, qa.filename, d?.localPath, qa.url, undefined)}`);
+            lines.push(`  - ${renderMediaLine(qa.kind, qa.name, localOf(qa), urlOf(qa), undefined)}`);
         }
     }
     return lines.length > 0 ? lines.join('\n') + '\n\n' : '';
@@ -285,31 +321,6 @@ function buildAgentBody(base, history, isGroup, wasMentioned) {
         base,
     ].join('\n');
 }
-function extractVoiceTexts(attachments, processed, _logger) {
-    const results = [];
-    if (processed) {
-        for (const pa of processed) {
-            if (pa.type === 'voice' && pa.voiceText) {
-                results.push({
-                    text: pa.voiceText,
-                    duration: pa.duration,
-                    source: pa.voiceSource ?? 'stt',
-                });
-            }
-        }
-    }
-    if (results.length === 0 && attachments) {
-        for (const att of attachments) {
-            if (isVoiceContentType(att.content_type) && att.asr_refer_text) {
-                results.push({
-                    text: att.asr_refer_text.trim(),
-                    source: 'asr',
-                });
-            }
-        }
-    }
-    return results;
-}
 /**
  * 附件类型标签（Layer 1 用户消息主体里的轻量提示）。
  * 只标注「带了什么类型的附件」，去重；媒体本地路径在 buildDynamicCtx 提供。
@@ -325,7 +336,7 @@ function buildAttachmentTags(attachments) {
     const seen = new Set();
     const tags = [];
     for (const att of attachments) {
-        const kind = classifyContentType(att.content_type);
+        const kind = att.kind;
         if (kind === 'voice' || seen.has(kind))
             continue;
         seen.add(kind);

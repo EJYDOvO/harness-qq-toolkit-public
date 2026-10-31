@@ -1,7 +1,8 @@
 import {createUserMessage} from '@deepseek-ai/dsh-llm';
 import {createAgentIO} from './io.mjs';
 import {createConversations} from './conversation.mjs';
-export {createAgentIO,createConversations};
+import {createCommandRouter} from './commands.mjs';
+export {createAgentIO,createConversations,createCommandRouter};
 export const name='agent-io';
 export const inject=[];
 // Trusted Host service: no model tool, RPC or route. Platform plugins open one

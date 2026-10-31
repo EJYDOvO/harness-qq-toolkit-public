@@ -374,19 +374,97 @@ index dc2e41f..0757387 100644
                      // 同一题的选项共享分组：点一个后其余变灰（单选互斥）
                      group_id: `q-${question.id}`,
 diff --git a/dist/gateway/middleware-setup.js b/dist/gateway/middleware-setup.js
-index ca4b002..9976cd0 100644
+index ca4b002..ea7991b 100644
 --- a/dist/gateway/middleware-setup.js
 +++ b/dist/gateway/middleware-setup.js
-@@ -3,7 +3,7 @@ import { buildCommandList } from "../commands/index.js";
- import { attachmentProcessor } from "../middleware/attachment.js";
+@@ -1,9 +1,83 @@
+-import { errorHandler, messageFilter, accessPolicy, mentionGate, contentSanitizer, rateLimiter, slashCommand, concurrencyGuard, typingIndicator, quoteRef, historyBuffer, envelopeFormatter, } from '@tencent-connect/qqbot-nodejs';
++import { errorHandler, messageFilter, accessPolicy, mentionGate, contentSanitizer, rateLimiter, concurrencyGuard, typingIndicator, quoteRef, historyBuffer, envelopeFormatter, } from '@tencent-connect/qqbot-nodejs';
+ import { buildCommandList } from "../commands/index.js";
+-import { attachmentProcessor } from "../middleware/attachment.js";
++import { downloadMediaAttachments } from "../transport/attachment.js";
  import { questionAnswer } from "../middleware/question-answer.js";
  import { getHistoryStore, historyGroupKey } from "../features/history-store.js";
 -export function setupMiddlewares(bot, config, manager, logger) {
++/**
++ * A QQ command spec (SDK SlashCommand shape: name, scope, authorized, handler)
++ * as an Agent I/O command. The handler and its authorization run unchanged on
++ * the QQ middleware context, with the router's parsed command attached.
++ */
++export function qqCommand(cmd) {
++    const scopes = cmd.scope === 'c2c' ? ['direct'] : cmd.scope === 'group' ? ['group'] : undefined;
++    const qq = call => {
++        const ctx = call.context, command = { name: call.name, args: [...call.args], raw: call.raw };
++        ctx.state.command = command;
++        ctx.command = command;
++        return ctx;
++    };
++    return {
++        name: cmd.name, description: cmd.description, usage: cmd.usage, hidden: cmd.hidden, category: cmd.category, ...(scopes ? { scopes } : {}),
++        ...(cmd.authorized ? { authorize: call => cmd.authorized(qq(call)) } : {}),
++        execute: call => cmd.handler(qq(call)),
++    };
++}
++/**
++ * QQ protocol side of commands, at the former slashCommand position (before the
++ * merge guard, so /stop is never queued behind the running Turn): strip the
++ * server @ markers, require an @ in groups, then hand the standard candidate to
++ * the router. Anything but `pass` stops the chain: a command never becomes Agent
++ * input, and a re-delivered command is not executed again.
++ */
++export function commandGate(router) {
++    return async (ctx, next) => {
++        const msg = ctx.message;
++        const content = (msg.content ?? '').trim();
++        if (!content) return next();
++        const cleaned = content.replace(/<@!?[^>]+>\s*/g, '').trim();
++        if (msg.kind === 'group' && !(msg.rawEventType === 'GROUP_AT_MESSAGE_CREATE' || msg.mentions?.some(m => m.is_you))) return next();
++        const group = msg.kind === 'group';
++        const input = {
++            conversation: { type: group ? 'group' : 'direct', id: group ? (msg.groupOpenid ?? msg.senderId) : msg.senderId },
++            sender: { id: msg.senderId },
++            message: { ...(typeof msg.messageId === 'string' && msg.messageId ? { id: msg.messageId } : {}), text: cleaned },
++        };
++        const result = await router.dispatch(input, { context: ctx, reply: text => ctx.bot.sendText(ctx.replyTarget, text) });
++        if (result.status === 'pass') return next();
++        if (result.status === 'failed') ctx.log?.error?.(`[command] /${result.command} failed`);
++        ctx.stop(`command:${result.status}${result.command ? ':' + result.command : ''}`);
++    };
++}
++/**
++ * Attachment downloads (current message and quoted message) tagged with the
++ * index of the attachment they belong to, so each attachment gets its own file.
++ * The upstream attachmentProcessor returns downloads by file name only, which
++ * gave two attachments of one name (or quoted ones without a name, or a failed
++ * one and a later one of the same name) the same file. One download per
++ * attachment, in order; a skipped or failed one has no entry and only that one
++ * is lost.
++ */
++export function attachmentDownloads(config, logger) {
++    const each = async list => {
++        const out = [];
++        for (const [attachment, raw] of (list ?? []).entries()) {
++            try {
++                const [file] = await downloadMediaAttachments([raw], config.media, logger);
++                if (file) out.push({ ...file, attachment });
++            }
++            catch (err) { logger.warn(`im-qqbot: attachment download failed: ${err instanceof Error ? err.message : String(err)}`); }
++        }
++        return out;
++    };
++    return async (ctx, next) => {
++        ctx.state.downloadedFiles = await each(ctx.message.attachments?.map(a => ({ ...a, filename: a.filename ?? '' })));
++        // Quoted attachments in the raw attachment shape (voice and URL-less ones are skipped by the download).
++        const quoted = ctx.state.quote?.attachments;
++        if (quoted?.length) ctx.state.downloadedQuoteFiles = await each(quoted.map(a => ({ content_type: a.contentType ?? '', filename: a.filename ?? '', size: 0, url: a.url })));
++        await next();
++    };
++}
 +export function setupMiddlewares(bot, config, manager, logger, conversation) {
      // 1. 错误兜底（最外层洋葱皮）
      bot.use(errorHandler());
      // 2. 消息过滤：bot 回声 + 消息去重
-@@ -12,11 +12,11 @@ export function setupMiddlewares(bot, config, manager, logger) {
+@@ -12,11 +86,11 @@ export function setupMiddlewares(bot, config, manager, logger) {
      bot.use(accessPolicy({
          c2c: {
              mode: config.access.c2cMode,
@@ -400,7 +478,7 @@ index ca4b002..9976cd0 100644
          },
          onBlock: (_mCtx, reason) => {
              if (config.debug) {
-@@ -41,6 +41,11 @@ export function setupMiddlewares(bot, config, manager, logger) {
+@@ -41,22 +115,62 @@ export function setupMiddlewares(bot, config, manager, logger) {
      bot.use(mentionGate({
          requireMentionInGroup: config.requireMention,
      }));
@@ -412,10 +490,18 @@ index ca4b002..9976cd0 100644
      // 6. 内容清洗（去 @marker、表情标签、多余空白）
      bot.use(contentSanitizer({
          parseFaceTags: true,
-@@ -48,15 +53,51 @@ export function setupMiddlewares(bot, config, manager, logger) {
+     }));
      // 7. 三层限流（sender / group / global）
      bot.use(rateLimiter());
-     // 8. 斜杠命令（在 concurrencyGuard 之前，命令匹配后不排队直接响应）
+-    // 8. 斜杠命令（在 concurrencyGuard 之前，命令匹配后不排队直接响应）
+-    const slash = slashCommand({
+-        // 关闭 autoHelp：help 命令由 qqbot 注册为 /bot-help，
+-        // 避免 SDK 再自动注册一个无前缀的 /help 造成重复
+-        autoHelp: false,
+-        commands: buildCommandList({ manager, config }),
+-    });
+-    bot.use(slash.middleware);
++    // 8. 斜杠命令（在 concurrencyGuard 之前，命令匹配后不排队直接响应；识别/解析/路由由 Unified Agent I/O 完成）
 +    const commands = [...buildCommandList({ manager, config }), ...(manager.ctx?.get('qqRemoteOps')?.commands(manager) ?? [])];
 +    const stop = commands.find(c => c.name === 'stop');
 +    if (stop) {
@@ -434,14 +520,12 @@ index ca4b002..9976cd0 100644
 +            return nativeStop(cmdCtx);
 +        };
 +    }
-     const slash = slashCommand({
-         // 关闭 autoHelp：help 命令由 qqbot 注册为 /bot-help，
-         // 避免 SDK 再自动注册一个无前缀的 /help 造成重复
-         autoHelp: false,
--        commands: buildCommandList({ manager, config }),
-+        commands,
-     });
-     bot.use(slash.middleware);
++    // Recognition, parsing, once-only claim and routing belong to the Unified
++    // Agent I/O command router; the QQ and Remote Ops commands keep executing and
++    // authorizing themselves. No SDK slashCommand and no automatic /help.
++    const router = conversation.openCommands({ prefixes: ['/'] });
++    for (const cmd of commands) router.register(qqCommand(cmd));
++    bot.use(commandGate(router));
      // 8.5. 待答问题截获（在 concurrencyGuard 之前，答案消息不排队直接作答）
      bot.use(questionAnswer(manager));
 +    // Explicit correction only, after access/question admission but before merge.
@@ -465,7 +549,16 @@ index ca4b002..9976cd0 100644
      // 9. 并发串行 + 消息合并（同 peer 排队，避免 session 冲突）
      bot.use(concurrencyGuard({
          strategy: 'merge',
-@@ -79,4 +120,4 @@ export function setupMiddlewares(bot, config, manager, logger) {
+@@ -71,7 +185,7 @@ export function setupMiddlewares(bot, config, manager, logger) {
+         preferMsgElements: true,
+     }));
+     // 11.5. 附件下载（file 附件下载到本地，供 @提及 / 工具访问）
+-    bot.use(attachmentProcessor(config, logger));
++    bot.use(attachmentDownloads(config, logger));
+     // 12. 上下文组装（将 history + quote + sender 组成 envelope）
+     bot.use(envelopeFormatter({
+         historyLimit: config.historyLimit,
+@@ -79,4 +193,4 @@ export function setupMiddlewares(bot, config, manager, logger) {
          includeSender: true,
      }));
  }
@@ -473,19 +566,44 @@ index ca4b002..9976cd0 100644
 \ No newline at end of file
 +//# sourceMappingURL=middleware-setup.js.map
 diff --git a/dist/media/send-file-tool.js b/dist/media/send-file-tool.js
-index 553fd46..785c954 100644
+index 553fd46..1f88852 100644
 --- a/dist/media/send-file-tool.js
 +++ b/dist/media/send-file-tool.js
-@@ -7,7 +7,7 @@
-  *   - 路径白名单：默认只允许访问 media 目录 + agent cwd，可开关 + 扩展白名单。
+@@ -1,13 +1,14 @@
+ /**
+- * 内置 qqbot_send_file 工具 — 将本地文件发送给 QQ 用户或群。
++ * 内置 qqbot_send_file 工具 — 将本地文件发送给当前 QQ 会话（用户或群）。
+  *
+- *   - 发送目标默认自动定位（exec.agent → SessionManager.findByAgent → replyTarget），
+- *     无需模型手动传 openid；显式 target 参数作为覆盖。
+- *   - 按扩展名分发到 SDK 的 sendImage / sendVideo / sendVoice / sendFile。
+- *   - 路径白名单：默认只允许访问 media 目录 + agent cwd，可开关 + 扩展白名单。
++ *   - 发送目标只能是调用工具的 Agent 所在的当前会话（exec.agent → SessionManager.findByAgent）；
++ *     显式 target 仅为兼容保留，且必须与当前会话一致，模型不能借它改发给其他 openid。
++ *   - 文件作为一条附件消息交给 Unified Agent I/O：同会话顺序、逻辑 ID 去重、取消、
++ *     每个分片前的会话/访问复核与诚实结果；QQ Adapter 负责上传和媒体消息。
++ *   - 路径白名单：默认只允许访问 media 目录 + agent cwd，可开关 + 扩展白名单；发送前再复核。
   */
- import { existsSync } from 'node:fs';
+-import { existsSync } from 'node:fs';
 -import { stat } from 'node:fs/promises';
 +import { stat, realpath } from 'node:fs/promises';
++import { createHash } from 'node:crypto';
  import { basename, isAbsolute, relative, resolve } from 'node:path';
  import { MEDIA_ROOT } from "./media-cleaner.js";
  /** 工具名（qqbot 前缀避免与其他通道的同名工具冲突） */
-@@ -36,11 +36,15 @@ function isWithinRoot(filePath, root) {
+@@ -19,6 +20,11 @@ const DESCRIPTION = 'Send a local file (image, video, voice, or generic file) to
+ const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp']);
+ const VIDEO_EXTS = new Set(['.mp4', '.mov', '.avi', '.mkv', '.webm']);
+ const VOICE_EXTS = new Set(['.mp3', '.wav', '.ogg', '.aac', '.silk', '.amr']);
++/** 按扩展名归类为 Unified Agent I/O 附件类型 */
++export function attachmentKind(filePath) {
++    const ext = filePath.slice(filePath.lastIndexOf('.')).toLowerCase();
++    return IMAGE_EXTS.has(ext) ? 'image' : VIDEO_EXTS.has(ext) ? 'video' : VOICE_EXTS.has(ext) ? 'voice' : 'file';
++}
+ /** 解析显式 target（"c2c:openid" / "group:openid"），非法返回 undefined */
+ function parseTarget(input) {
+     const idx = input.indexOf(':');
+@@ -36,20 +42,43 @@ function isWithinRoot(filePath, root) {
      return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
  }
  /** 路径白名单校验：restrictPaths 关闭时放行任意路径，否则限定 media + cwd + extraRoots */
@@ -500,27 +618,152 @@ index 553fd46..785c954 100644
 +        catch (error) { if (error.code !== 'ENOENT') throw error; }
 +    }
 +    return false;
++}
++/**
++ * 可信本地文件：解析符号链接后的真实路径在白名单内，且是普通文件。
++ * expectReal 为发送前复核：资源路径必须仍是自身的真实路径（中途被换成指向别处的
++ * 符号链接、删除或替换为目录都会被拒绝）。返回 {path, size}，否则抛出带原因的错误。
++ */
++export async function verifyLocalFile(filePath, sendFile, cwd, { expectReal = false } = {}) {
++    if (typeof filePath !== 'string' || !filePath) throw Object.assign(new Error('empty path'), { reason: 'invalid-path' });
++    let real;
++    try { real = await realpath(resolve(filePath)); }
++    catch { throw Object.assign(new Error('file does not exist'), { reason: 'missing' }); }
++    if (expectReal && real !== filePath) throw Object.assign(new Error('resource changed since it was checked'), { reason: 'changed' });
++    if (!await isPathAllowed(real, sendFile, cwd)) throw Object.assign(new Error('path outside the allowed directories'), { reason: 'outside-roots', path: real });
++    const info = await stat(real);
++    if (!info.isFile()) throw Object.assign(new Error('not a regular file'), { reason: 'not-file', path: real });
++    return { path: real, size: info.size };
  }
  /** 注册 qqbot_send_file 工具（tools 服务缺失时优雅降级，不阻断插件启动） */
- export function registerSendFileTool(ctx, bot, manager, config, logger) {
-@@ -105,9 +109,15 @@ export function registerSendFileTool(ctx, bot, manager, config, logger) {
-             if (replyTarget === undefined) {
-                 throw new Error('qqbot_send_file: 无法确定发送目标，请显式传 target 参数');
+-export function registerSendFileTool(ctx, bot, manager, config, logger) {
++export function registerSendFileTool(ctx, _bot, manager, config, logger) {
+     const tools = ctx.get('tools');
+     if (!tools?.register) {
+         logger.warn('im-qqbot: tools 服务不可用，qqbot_send_file 工具未注册');
+         return;
+     }
+     const cwd = config.cwd || process.cwd();
++    // A provably unsent file (refused, upload failed) may be tried again under a
++    // new logical id; an unknown or sent one keeps its id, so it is never resent.
++    const retries = new Map();
+     const definition = {
+         name: SEND_FILE_TOOL_NAME,
+         description: DESCRIPTION,
+@@ -62,7 +91,7 @@ export function registerSendFileTool(ctx, bot, manager, config, logger) {
+                 },
+                 target: {
+                     type: 'string',
+-                    description: 'Optional send target as "c2c:openid" or "group:openid". Omit to send to the current conversation.',
++                    description: 'Optional; only the current conversation ("c2c:openid" or "group:openid") is accepted. Omit it.',
+                 },
+             },
+             required: ['file_path'],
+@@ -91,60 +120,58 @@ export function registerSendFileTool(ctx, bot, manager, config, logger) {
+             if (typeof file_path !== 'string' || file_path.length === 0) {
+                 throw new Error('qqbot_send_file: `file_path` must be a non-empty string');
              }
-+            const access = config.access;
-+            const mode = replyTarget.scope === 'c2c' ? access.c2cMode : access.groupMode;
-+            const allow = replyTarget.scope === 'c2c' ? access.c2cAllow : access.groupAllow;
-+            if (mode !== 'open' && !(mode === 'allowlist' && allow.includes(replyTarget.targetId))) {
-+                throw new Error('qqbot_send_file: recipient is not allowed by the access policy');
+-            // 1. 解析发送目标：显式 target > 当前会话（exec.agent → SessionRecord）
+-            let replyTarget;
++            // 1. 发送目标：只取调用者 Agent 的当前会话；模型给出的 target 不能扩大范围
++            const record = exec.agent !== undefined ? manager.findByAgent(exec.agent) : undefined;
++            if (record === undefined || typeof manager.submitOutput !== 'function') {
++                throw new Error('qqbot_send_file: 当前 Agent 没有 QQ 会话，无法发送');
 +            }
-             // 2. 校验文件 + 路径白名单
+             if (target !== undefined && target !== '') {
+-                replyTarget = parseTarget(target);
+-                if (replyTarget === undefined) {
+-                    throw new Error(`qqbot_send_file: target 格式错误，需要 c2c:openid 或 group:openid，收到: ${target}`);
++                const named = parseTarget(target);
++                if (named === undefined) {
++                    throw new Error(`qqbot_send_file: target 格式错误，需要 c2c:openid 或 group:openid`);
++                }
++                if (named.scope !== record.scope || named.targetId !== record.peerId) {
++                    throw new Error('qqbot_send_file: target must be the current conversation; files are only sent there');
+                 }
+             }
+-            else if (exec.agent !== undefined) {
+-                replyTarget = manager.findByAgent(exec.agent)?.replyTarget;
+-            }
+-            if (replyTarget === undefined) {
+-                throw new Error('qqbot_send_file: 无法确定发送目标，请显式传 target 参数');
+-            }
+-            // 2. 校验文件 + 路径白名单
 -            const absPath = resolve(file_path);
 -            if (!isPathAllowed(absPath, config.sendFile, cwd)) {
-+            const absPath = await realpath(resolve(file_path));
-+            if (!await isPathAllowed(absPath, config.sendFile, cwd)) {
-                 throw new Error(`qqbot_send_file: file_path 不在允许的目录内: ${absPath}`);
+-                throw new Error(`qqbot_send_file: file_path 不在允许的目录内: ${absPath}`);
+-            }
+-            if (!existsSync(absPath)) {
+-                throw new Error(`qqbot_send_file: 文件不存在: ${absPath}`);
+-            }
+-            const info = await stat(absPath);
+-            if (!info.isFile()) {
+-                throw new Error(`qqbot_send_file: 路径不是普通文件: ${absPath}`);
+-            }
+-            // 3. 按扩展名分类发送
+-            const fileName = basename(absPath);
+-            const ext = absPath.slice(absPath.lastIndexOf('.')).toLowerCase();
+-            const source = { localPath: absPath };
+-            let result;
+-            if (IMAGE_EXTS.has(ext)) {
+-                result = await bot.sendImage(replyTarget, source);
++            // 2. 校验文件 + 路径白名单（真实路径；发送前 Adapter 再复核一次）
++            let file;
++            try { file = await verifyLocalFile(file_path, config.sendFile, cwd); }
++            catch (error) {
++                if (error.reason === 'outside-roots') throw new Error(`qqbot_send_file: file_path 不在允许的目录内: ${error.path}`);
++                if (error.reason === 'not-file') throw new Error(`qqbot_send_file: 路径不是普通文件: ${error.path}`);
++                throw new Error(`qqbot_send_file: 文件不存在: ${resolve(file_path)}`);
              }
-             if (!existsSync(absPath)) {
+-            else if (VIDEO_EXTS.has(ext)) {
+-                result = await bot.sendVideo(replyTarget, source);
++            const fileName = basename(file.path);
++            // 3. 一条附件消息交给 Unified Agent I/O。逻辑 ID 由会话、轮次与真实路径决定：
++            //    同一轮内对同一文件的重复调用（含结果未知后的重试）得到第一次的结果，不会再发。
++            const turn = manager.latestTurn?.(record);
++            const base = `qq:${record.sessionId}:${Number.isSafeInteger(turn) ? turn : '-'}:file:${createHash('sha256').update(file.path).digest('hex').slice(0, 16)}`;
++            const attempt = retries.get(base) ?? 0, id = attempt ? `${base}:${attempt}` : base;
++            const result = await manager.submitOutput(record, { attachments: [{ kind: attachmentKind(file.path), name: fileName, size: file.size, resource: { type: 'local', path: file.path } }] },
++                { id, turn, signal: exec.signal instanceof AbortSignal ? exec.signal : undefined, delivery: { kind: 'tool-or-error' } });
++            const part = result.parts?.find(p => p.attachment === 0);
++            if (result.status === 'not-sent') {
++                retries.delete(base); retries.set(base, attempt + 1);
++                while (retries.size > 256) retries.delete(retries.keys().next().value);
+             }
+-            else if (VOICE_EXTS.has(ext)) {
+-                result = await bot.sendVoice(replyTarget, source);
++            if (result.status === 'sent') {
++                logger.info(`im-qqbot: qqbot_send_file 发送 ${attachmentKind(file.path)} (${file.size} bytes)${result.duplicate ? ' (duplicate, not resent)' : ''}`);
++                return {
++                    fileName,
++                    fileSize: file.size,
++                    target: `${record.scope}:${record.peerId}`,
++                    fileUuid: part?.uploaded ?? '',
++                    ...(part?.receipt !== undefined ? { messageId: part.receipt } : {}),
++                };
+             }
+-            else {
+-                result = await bot.sendFile(replyTarget, source, { fileName });
++            if (result.status === 'unknown') {
++                throw new Error(`qqbot_send_file: 发送结果未知（${result.reason ?? 'unknown'}），文件可能已到达 QQ，不会自动重发`);
+             }
+-            logger.info(`im-qqbot: qqbot_send_file 发送 ${fileName} (${info.size} bytes) → ${replyTarget.scope}:${replyTarget.targetId}`);
+-            return {
+-                fileName,
+-                fileSize: info.size,
+-                target: `${replyTarget.scope}:${replyTarget.targetId}`,
+-                fileUuid: result.upload.file_uuid,
+-                ...(result.message?.id !== undefined ? { messageId: result.message.id } : {}),
+-            };
++            throw new Error(`qqbot_send_file: 未发送（${result.reason ?? result.status}）`);
+         },
+     };
+     tools.register(definition);
+     logger.info('im-qqbot: qqbot_send_file 工具已注册');
+ }
+-//# sourceMappingURL=send-file-tool.js.map
+\ No newline at end of file
++//# sourceMappingURL=send-file-tool.js.map
 diff --git a/dist/index.js b/dist/index.js
 index c4998d0..71ed35a 100644
 --- a/dist/index.js
@@ -543,11 +786,12 @@ index c4998d0..71ed35a 100644
 \ No newline at end of file
 +//# sourceMappingURL=index.js.map
 diff --git a/dist/gateway/bootstrap.js b/dist/gateway/bootstrap.js
-index 070f21e..8df31d2 100644
+index 070f21e..ce934a8 100644
 --- a/dist/gateway/bootstrap.js
 +++ b/dist/gateway/bootstrap.js
 @@ -1,6 +1,12 @@
- import { QQBot } from '@tencent-connect/qqbot-nodejs';
+-import { QQBot } from '@tencent-connect/qqbot-nodejs';
++import { QQBot, MediaFileType } from '@tencent-connect/qqbot-nodejs';
 +import { createHmac, randomBytes, randomUUID } from 'node:crypto';
 +import * as diagnosticFs from 'node:fs/promises';
 +import { resolve as diagnosticPath } from 'node:path';
@@ -560,10 +804,12 @@ index 070f21e..8df31d2 100644
  import { ReplyLimiter } from "../transport/reply-limiter.js";
  import { cacheMsgId, cacheEventId } from "../transport/msgid-cache.js";
  import { resolveReplyTarget, sendResolvedMarkdown } from "../transport/reply-target.js";
-@@ -12,6 +18,44 @@ import { setupMiddlewares } from "./middleware-setup.js";
+@@ -11,7 +17,45 @@ import { buildUserAgent } from "../shared/index.js";
+ import { setupMiddlewares } from "./middleware-setup.js";
  import { startMediaCleanup } from "../media/media-cleaner.js";
  import { ensureVisionInputModal, registerDescribeImageTool } from "../media/vision-tool.js";
- import { registerSendFileTool } from "../media/send-file-tool.js";
+-import { registerSendFileTool } from "../media/send-file-tool.js";
++import { registerSendFileTool, verifyLocalFile } from "../media/send-file-tool.js";
 +// Shared across duplicate module copies in the same Host process.
 +const gatewayLeases = globalThis[Symbol.for('dsh.qqGateway.leases.v1')] ??= new Map();
 +// Opt-in bounded local diagnostics. HMAC keys live only in this Gateway instance;
@@ -605,10 +851,100 @@ index 070f21e..8df31d2 100644
  /**
   * interaction 统一分发器：按 button_data 的顶层 `t` 判别字段，路由到对应
   * channel（question / approval）。QQ 只有一个 interaction 入口，集中路由
-@@ -30,8 +74,143 @@ function dispatchInteraction(event, manager) {
+@@ -30,8 +74,262 @@ function dispatchInteraction(event, manager) {
          return manager.approvalChannel?.handleInteraction(event) ?? false;
      return false;
  }
++/**
++ * Cancellation controllers of native Turns, per Session. A controller leased by
++ * a submission still in the Unified Agent I/O is never evicted, so /stop always
++ * reaches queued output; idle ones are bounded per Session and overall (leased
++ * ones are bounded by the I/O queue limits). A completed Turn's idle controller
++ * is dropped at turn/end; an aborted one stays as a tombstone (within the
++ * bounds) so late output of that Turn remains cancelled. Output without a Turn
++ * shares one Session controller that /stop replaces after aborting it.
++ */
++export function createTurnControls({ maxTurns = 8, maxSessions = 256 } = {}) {
++    const sessions = new Map();
++    const ANY = '*';
++    let closed = false;
++    const held = session => [...session.values()].some(c => c.refs > 0);
++    // `keep`: the controller just created, not yet leased by its caller; pruning
++    // it would detach it from /stop, release and close.
++    function prune(session, keep) {
++        for (const [turn, c] of session) {
++            if (session.size <= maxTurns) break;
++            if (c.refs === 0 && c !== keep) session.delete(turn);
++        }
++        for (const [id, s] of sessions) {
++            if (sessions.size <= maxSessions) break;
++            if (s !== session && !held(s)) sessions.delete(id);
++        }
++    }
++    function control(sessionId, turn) {
++        if (typeof sessionId !== 'string' || !sessionId) return undefined;
++        const key = Number.isSafeInteger(turn) ? turn : ANY;
++        let session = sessions.get(sessionId);
++        if (!session) { session = new Map(); sessions.set(sessionId, session); }
++        let c = session.get(key);
++        if (!c) { c = { controller: new AbortController(), refs: 0 }; session.set(key, c); prune(session, c); }
++        return c;
++    }
++    function abortAll(session) { for (const c of session.values()) c.controller.abort(); }
++    return {
++        start(sessionId, turn) { if (!closed && Number.isSafeInteger(turn)) control(sessionId, turn); },
++        end(sessionId, turn, aborted) {
++            if (closed || !Number.isSafeInteger(turn)) return;
++            if (aborted) { control(sessionId, turn)?.controller.abort(); return; }
++            const session = sessions.get(sessionId), c = session?.get(turn);
++            if (!c) return;
++            c.ended = true;
++            if (c.refs === 0 && !c.controller.signal.aborted) session.delete(turn);
++            if (!session.size) sessions.delete(sessionId);
++        },
++        /** → {signal, release()}; the signal is aborted once the Gateway closed. */
++        acquire(sessionId, turn) {
++            if (closed) return { signal: AbortSignal.abort(), release() { } };
++            const c = control(sessionId, turn);
++            if (!c) return { signal: undefined, release() { } };
++            c.refs++;
++            let released = false;
++            return {
++                signal: c.controller.signal,
++                release() {
++                    if (released) return;
++                    released = true; c.refs--;
++                    const session = sessions.get(sessionId), key = Number.isSafeInteger(turn) ? turn : ANY;
++                    if (session?.get(key) !== c) return;
++                    // A completed Turn's last lease: nothing can cancel it any more.
++                    if (c.refs === 0 && c.ended && !c.controller.signal.aborted) session.delete(key);
++                    prune(session);
++                    if (!session.size) sessions.delete(sessionId);
++                },
++            };
++        },
++        /** /stop: every leased and remembered controller of the Session. */
++        cancel(sessionId) {
++            const session = sessions.get(sessionId);
++            if (!session) return;
++            abortAll(session);
++            session.delete(ANY);
++        },
++        /** Session release (rotation, removal, disposal): abort and forget. */
++        release(sessionId) {
++            const session = sessions.get(sessionId);
++            if (!session) return;
++            abortAll(session); sessions.delete(sessionId);
++        },
++        latest(sessionId) {
++            let last;
++            for (const key of sessions.get(sessionId)?.keys() ?? []) if (Number.isSafeInteger(key) && (last === undefined || key > last)) last = key;
++            return last;
++        },
++        close() { closed = true; for (const session of sessions.values()) abortAll(session); sessions.clear(); },
++        size() { let n = 0; for (const s of sessions.values()) n += s.size; return { sessions: sessions.size, controllers: n }; },
++    };
++}
 +// Reusable transport wiring, separately testable without creating a QQ gateway.
 +// Every QQ chat message (Interaction bubbles and hang-on lines, plain replies,
 +// tool results, turn errors) is one logical message for the Unified Agent I/O,
@@ -628,34 +964,34 @@ index 070f21e..8df31d2 100644
 +    // QQ side of an admitted Interaction input (the shared handoff calls the
 +    // policy itself): resume output and remember the input's reply target.
 +    manager.trackInteractionInput=(record,message)=>{record.interactionSuppressed=false;rememberTarget(record,message);};
-+    // Native Turn lifecycle per Session (bounded). Output not yet handed to the
-+    // platform is cancelled by /stop, by a Turn that ends aborted/interrupted,
-+    // and stays cancelled for late output of that Turn, without Session rotation.
-+    const turns=new Map();
-+    function turnControl(sessionId,turn){
-+        if(!Number.isSafeInteger(turn))return undefined;
-+        let session=turns.get(sessionId);
-+        if(!session){session=new Map();turns.set(sessionId,session);while(turns.size>256)turns.delete(turns.keys().next().value);}
-+        let control=session.get(turn);
-+        if(!control){control=new AbortController();session.set(turn,control);while(session.size>8)session.delete(session.keys().next().value);}
-+        return control;
-+    }
++    // Native Turn lifecycle per Session. Output not yet handed to the platform is
++    // cancelled by /stop, by a Turn that ends aborted/interrupted (and stays
++    // cancelled for late output of that Turn), by Session release and by Gateway
++    // close, without Session rotation.
++    const turns=createTurnControls();
 +    function observeTurn(sessionId,event){
-+        if(event?.type==='turn/start')turnControl(sessionId,event.data?.turn);
-+        else if(event?.type==='turn/end'&&['aborted','interrupted'].includes(event.data?.reason?.kind))turnControl(sessionId,event.data?.turn)?.abort();
++        if(event?.type==='turn/start')turns.start(sessionId,event.data?.turn);
++        else if(event?.type==='turn/end')turns.end(sessionId,event.data?.turn,['aborted','interrupted'].includes(event.data?.reason?.kind));
 +    }
-+    manager.cancelOutput=record=>{for(const control of turns.get(record?.sessionId)?.values()??[])control.abort();};
++    manager.cancelOutput=record=>turns.cancel(record?.sessionId);
++    manager.releaseOutput=record=>turns.release(record?.sessionId);
++    manager.latestTurn=record=>turns.latest(record?.sessionId);
++    ctx.effect?.(()=>()=>turns.close());
 +    // Logical messages being handed over, by id: the QQ text adapter reads the
 +    // reply target of the input a bubble answers and its diagnostic fields.
 +    const deliveries=new Map();
 +    async function submit(record,text,{id,input,turn,signal,delivery}){
 +        if(!io){logger.error?.('im-qqbot: output withheld: Unified Agent I/O unavailable');return {id,status:'not-sent',reason:'adapter-unavailable',parts:[]};}
-+        const signals=[turnControl(record.sessionId,turn)?.signal,signal].filter(s=>s instanceof AbortSignal);
++        // The lease keeps this Turn's controller (and so /stop) reachable until the
++        // I/O has settled the message; capacity never evicts a held controller.
++        const lease=turns.acquire(record.sessionId,turn);
++        const signals=[lease.signal,signal].filter(s=>s instanceof AbortSignal);
 +        const own=typeof input==='string'?record.interactionTargets?.get(input):undefined;
 +        const mine=id!==undefined&&!deliveries.has(id);if(mine)deliveries.set(id,{target:own&&{...own},input:typeof input==='string'?input:undefined,delivery});
-+        try{return await io.sendMessage({...(id?{id}:{}),target:conversation.target(record),origin:{sessionId:record.sessionId},message:{text},...(signals.length?{signal:signals.length>1?AbortSignal.any(signals):signals[0]}:{})});}
-+        finally{if(mine)deliveries.delete(id);}
++        try{return await io.sendMessage({...(id?{id}:{}),target:conversation.target(record),origin:{sessionId:record.sessionId},message:typeof text==='string'?{text}:text,...(signals.length?{signal:signals.length>1?AbortSignal.any(signals):signals[0]}:{})});}
++        finally{lease.release();if(mine)deliveries.delete(id);}
 +    }
++    manager.submitOutput=submit;
 +    // Logical id of an Interaction message: the native Session and Turn, the
 +    // policy instance, its reply and bubble numbers and the kind. A repeated
 +    // submission of one bubble maps to the same id; two bubbles never do.
@@ -726,6 +1062,34 @@ index 070f21e..8df31d2 100644
 +    outboundHandler.delivery=id=>typeof id==='string'?deliveries.get(id):undefined;
 +    return outboundHandler;
 +}
++const MEDIA_TYPES = { image: 'IMAGE', video: 'VIDEO', voice: 'VOICE', file: 'FILE' };
++/**
++ * One trusted local attachment → QQ media message, in two stages so a failure
++ * is classified honestly: the resource is re-checked first (still its own real
++ * path, inside the allowed roots, a regular file), then uploaded without sending
++ * (the SDK retries uploads; an upload alone is invisible to the user), then the
++ * media message is sent. Passive-reply quota as for files before (no event_id).
++ */
++export async function sendMedia(bot, replyLimiter, config, target, attachment) {
++    let file;
++    try { file = await verifyLocalFile(attachment?.resource?.path, config.sendFile, config.cwd || process.cwd(), { expectReal: true }); }
++    catch (error) { throw Object.assign(new Error('QQ media resource refused'), { qqStage: 'resource', reason: error?.reason }); }
++    const resolved = resolveReplyTarget(target, replyLimiter, false);
++    const fileType = MediaFileType[MEDIA_TYPES[attachment.kind]];
++    if (typeof bot.uploadMedia !== 'function' || typeof bot.mediaApi?.sendMediaMessage !== 'function') {
++        // An SDK without the two public stages: one combined call, classified as a message request.
++        try { const r = await bot.sendMedia({ target: resolved, fileType, localPath: file.path, ...(attachment.kind === 'file' ? { fileName: attachment.name } : {}) }); return { id: r?.message?.id, uploaded: r?.upload?.file_uuid }; }
++        catch (error) { throw Object.assign(new Error('QQ media message failed'), { qqStage: 'message', cause: error }); }
++    }
++    let upload;
++    try { upload = await bot.uploadMedia({ target: resolved, fileType, localPath: file.path, srvSendMsg: false, ...(attachment.kind === 'file' ? { fileName: attachment.name } : {}) }); }
++    catch (error) { throw Object.assign(new Error('QQ media upload failed'), { qqStage: 'upload', cause: error }); }
++    try {
++        const message = await bot.mediaApi.sendMediaMessage(resolved.scope, resolved.targetId, upload.file_info, bot.creds, { msgId: resolved.msgId });
++        return { id: message?.id, uploaded: upload.file_uuid };
++    }
++    catch (error) { throw Object.assign(new Error('QQ media message failed'), { qqStage: 'message', cause: error }); }
++}
  export async function bootstrapGateway(ctx, agents, config, logger) {
 +    if (gatewayLeases.has(config.appId)) throw new Error('Duplicate QQ Gateway for this application');
 +    const lease = {};
@@ -744,12 +1108,13 @@ index 070f21e..8df31d2 100644
 +        admits: (scope, peer) => accessAllows(config.access, scope, peer),
 +        onInput: (record, message, policy) => { if (policy) manager.trackInteractionInput?.(record, message); } });
 +    ctx.effect(() => conversation.close);
++    if (typeof conversation.openCommands !== 'function') throw new Error('dsh-agent-io 0.1.0-test.5 or later (commands and attachments) is required before QQ');
 +    const deliveryRecorder=createDeliveryRecorder(config.deliveryDiagnostics,logger);
 +    ctx.effect(()=>()=>deliveryRecorder?.close());
      // ── 初始化 QQ Bot SDK ──
      const userAgent = buildUserAgent();
      const bot = new QQBot({
-@@ -45,8 +224,10 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+@@ -45,8 +343,10 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
      });
      logger.info(`QQBot SDK initialized (UA: ${userAgent})`);
      // ── 中间件链 ──
@@ -762,7 +1127,7 @@ index 070f21e..8df31d2 100644
      bot.on('message', async (mCtx) => {
          const msg = mCtx.message;
          // 记录最近 msgId，供无上下文的出站发送（文件发送显式 target、主动推送等）获取被动回复目标
-@@ -54,7 +235,7 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+@@ -54,7 +354,7 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
          if (config.debug) {
              logger.debug(`← message (post-middleware): ${JSON.stringify(msg, null, 2).slice(0, 500)}`);
          }
@@ -771,7 +1136,7 @@ index 070f21e..8df31d2 100644
      });
      // ── 出站：dsh session/event → QQ 消息 ──
      // 获取 tools 服务（工具结果结构化展示），可选
-@@ -65,20 +246,31 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+@@ -65,20 +365,32 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
      catch {
          toolsRegistry = undefined;
      }
@@ -808,12 +1173,13 @@ index 070f21e..8df31d2 100644
 +        split: text => chunkMarkdownText(text, config.textChunkLimit ?? 4500),
 +        replyTarget: (_record, messageId) => outboundHandler.delivery(messageId)?.target,
 +        send: (target, text, info) => sender.sendMarkdown(target, text, { delivery: { ...outboundHandler.delivery(info.messageId)?.delivery, session: diagnostics?.hash(info.sessionId), index: info.index } }),
++        sendMedia: (target, attachment) => sendMedia(bot, replyLimiter, config, target, attachment),
 +    }));
 +    ctx.effect(() => releaseTextAdapter);
      ctx
          .on('session/event', outboundHandler);
      // ── 问答通道（ask_user_question → QQ 文本 + 按钮） ──
-@@ -89,6 +281,10 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+@@ -89,6 +401,10 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
      const approvalChannel = new ApprovalChannel(manager, sender, logger);
      manager.approvalChannel = approvalChannel;
      approvalChannel.install(ctx);
@@ -824,7 +1190,26 @@ index 070f21e..8df31d2 100644
      // ── 按钮点击回调（interaction）：统一分发到问答/审批通道 ──
      bot.on('interaction', async (_iCtx, event) => {
          // scope/targetId 推导对齐消息事件（inbound.ts）：按 scene 判定类型，群用 group_openid，私聊用 user_openid
-@@ -146,11 +342,12 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+@@ -130,15 +446,9 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+     ensureVisionInputModal(config.vision, logger);
+     registerDescribeImageTool(ctx, config.vision, logger);
+     // ── 附件发送工具注册（qqbot_send_file） ──
+-    // 包装 bot：让文件发送也走 msgId 兜底 + 被动回复限额管控。
+-    // 注意：SDK 文件发送暂不支持 event_id，故 allowEvent=false，跳过 event 候选。
+-    const mediaSender = {
+-        sendImage: (target, source) => bot.sendImage(resolveReplyTarget(target, replyLimiter, false), source),
+-        sendVideo: (target, source) => bot.sendVideo(resolveReplyTarget(target, replyLimiter, false), source),
+-        sendVoice: (target, source) => bot.sendVoice(resolveReplyTarget(target, replyLimiter, false), source),
+-        sendFile: (target, source, opts) => bot.sendFile(resolveReplyTarget(target, replyLimiter, false), source, opts),
+-    };
+-    registerSendFileTool(ctx, mediaSender, manager, config, logger);
++    // 文件作为附件消息交给 Unified Agent I/O，经上面的 QQ Adapter（sendMedia）上传发送；
++    // 不再有直接调用 bot.sendImage/sendFile 的路径。
++    registerSendFileTool(ctx, null, manager, config, logger);
+     // ── 生命周期 ──
+     ctx
+         .effect(() => {
+@@ -146,11 +456,12 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
          bot.start().catch((err) => {
              logger.error(`Bot start failed: ${err instanceof Error ? err.message : String(err)}`);
          });
@@ -844,7 +1229,7 @@ index 070f21e..8df31d2 100644
 \ No newline at end of file
 +//# sourceMappingURL=bootstrap.js.map
 diff --git a/dist/session/session-manager.js b/dist/session/session-manager.js
-index 5eae070..7198e23 100644
+index 5eae070..7f782d1 100644
 --- a/dist/session/session-manager.js
 +++ b/dist/session/session-manager.js
 @@ -1,536 +1,18 @@
@@ -1381,7 +1766,7 @@ index 5eae070..7198e23 100644
 +   waitingForUser:record=>!!(manager.questionChannel?.pending.has(record.sessionKey)||manager.approvalChannel?.pending.has(record.sessionKey)),
 +   cancelPending(record){manager.questionChannel?.cancelPending(record.sessionKey);manager.approvalChannel?.cancelPending(record.sessionKey);},
 +   prompt:record=>record.scope==='group'?config.groupPrompt:config.directPrompt,
-+   release(record){if(record.typingKeepAlive){clearInterval(record.typingKeepAlive);record.typingKeepAlive=undefined;}},
++   release(record){if(record.typingKeepAlive){clearInterval(record.typingKeepAlive);record.typingKeepAlive=undefined;}manager.releaseOutput?.(record);},
 +  }});
 +  return manager;
 + }
@@ -1571,14 +1956,56 @@ index 36a81a2..4970410 100644
              continue;
          if (limiter.checkLimit(c.id).allowed) {
 diff --git a/dist/transport/inbound.js b/dist/transport/inbound.js
-index 1006265..b4f9629 100644
+index 1006265..62963ce 100644
 --- a/dist/transport/inbound.js
 +++ b/dist/transport/inbound.js
-@@ -1,32 +1,89 @@
+@@ -1,32 +1,132 @@
 -import { createUserMessage } from '@deepseek-ai/dsh-llm';
- import { classifyContentType, isVoiceContentType, } from "./attachment.js";
+-import { classifyContentType, isVoiceContentType, } from "./attachment.js";
++import { classifyContentType, } from "./attachment.js";
  import { clearGroupHistory } from "../features/history-store.js";
 +import { QQ_SCOPES } from "./qq-text-adapter.js";
++// ── 基础 Media：QQ 附件 → Unified Agent I/O 附件描述 ──
++const short = value => typeof value === 'string' && value.length > 0 && value.length <= 256 ? value : undefined;
++const ref = value => typeof value === 'string' && value.length > 0 && value.length <= 4096 && !/[\u0000-\u001f]/.test(value) ? value : undefined;
++/**
++ * 一个 QQ 附件的描述：类型、名称、大小，语音的 ASR 文本（模型可见内容的来源），
++ * 以及可信资源引用——附件中间件下载到 media 目录的本地文件，否则是 QQ 事件给出的
++ * 平台 URL。资源引用只来自 QQ 事件与本 Adapter 的下载，不来自模型。
++ */
++function qqAttachment({ contentType, filename, size, url, asr }, downloaded) {
++    const kind = classifyContentType(contentType);
++    const local = kind === 'voice' ? undefined : ref(downloaded?.localPath);
++    const remote = ref(url);
++    return {
++        kind,
++        ...(short(filename) ? { name: filename } : {}),
++        ...(short(contentType) ? { contentType } : {}),
++        ...(Number.isSafeInteger(size) && size >= 0 ? { size } : {}),
++        ...(typeof asr === 'string' && asr.trim() ? { transcript: asr.trim() } : {}),
++        ...(local ? { resource: { type: 'local', path: local } } : remote ? { resource: { type: 'remote', url: remote } } : {}),
++    };
++}
++// 下载结果按所属附件的序号关联（attachmentDownloads 标注），不按文件名：同名或无名的
++// 附件各自对应自己的文件；没有序号的下载结果不关联。
++function byIndex(downloads) {
++    const map = new Map();
++    for (const d of downloads ?? []) if (Number.isSafeInteger(d?.attachment) && !map.has(d.attachment)) map.set(d.attachment, d);
++    return map;
++}
++function qqAttachments(attachments, downloads) {
++    const found = byIndex(downloads);
++    return (attachments ?? []).slice(0, 20).map((a, i) => qqAttachment({ contentType: a.content_type, filename: a.filename, size: a.size, url: a.url, asr: a.asr_refer_text }, found.get(i)));
++}
++/** 引用消息：被引用原文与其附件（与当前消息附件分开，带各自的下载结果）。 */
++function qqQuote(quote, downloads) {
++    if (!quote) return undefined;
++    const text = quote.text || quote.entry?.content;
++    const found = byIndex(downloads);
++    const attachments = (quote.attachments ?? []).slice(0, 20).map((a, i) => qqAttachment({ contentType: a.contentType, filename: a.filename, url: a.url, asr: a.asrText }, found.get(i)));
++    if (!text && !attachments.length) return undefined;
++    return { ...(typeof text === 'string' && text ? { text } : {}), ...(attachments.length ? { attachments } : {}) };
++}
  // ── 主处理函数 ──
  /**
 - * 处理 QQ 入站消息（已经过 SDK 中间件链）
@@ -1586,14 +2013,15 @@ index 1006265..b4f9629 100644
 + * 问答截获、合并、引用、附件）的普通聊天消息 → Unified Agent I/O 标准入站消息。
 + * 平台、Adapter 与账号由入站通道固定，不取自消息；platformData 只交回本
 + * Adapter 的会话入口，不会自动成为模型可见内容。
-  */
--export async function handleInbound(ctx, manager, config, logger) {
++ */
 +export function normalizeQQMessage(ctx) {
 +    const msg = ctx.message;
 +    const group = msg.kind === 'group';
++    const attachments = qqAttachments(msg.attachments, ctx.state?.downloadedFiles);
++    const quote = qqQuote(ctx.state?.quote, ctx.state?.downloadedQuoteFiles);
 +    return {
 +        conversation: { type: group ? 'group' : 'direct', id: group ? (msg.groupOpenid ?? msg.senderId) : msg.senderId },
-+        message: { ...(typeof msg.messageId === 'string' && msg.messageId ? { id: msg.messageId } : {}), text: msg.content ?? '' },
++        message: { ...(typeof msg.messageId === 'string' && msg.messageId ? { id: msg.messageId } : {}), text: msg.content ?? '', ...(attachments.length ? { attachments } : {}), ...(quote ? { quote } : {}) },
 +        sender: { id: msg.senderId, ...(typeof msg.senderName === 'string' && msg.senderName ? { displayName: msg.senderName } : {}) },
 +        ...(msg.timestamp === undefined ? {} : { timestamp: msg.timestamp }),
 +        platformData: { context: ctx },
@@ -1637,7 +2065,8 @@ index 1006265..b4f9629 100644
 + * 回复目标、模型可见正文组装、兜底提示、群历史、typing 与等待本轮结束。
 + * 返回交接结果：accepted＝已创建 Agent 输入；rejected＝准入拒绝；
 + * not-delivered＝未创建输入。
-+ */
+  */
+-export async function handleInbound(ctx, manager, config, logger) {
 +export async function deliverInbound(standard, conversation, config, logger) {
 +    const ctx = standard.platformData?.context, hold = standard.platformData?.hold ?? {};
      const msg = ctx.message;
@@ -1670,7 +2099,7 @@ index 1006265..b4f9629 100644
 -    catch (err) {
 +    // ── 组装 agentBody（下载结果经 mwState.downloadedFiles 提供），准入之后才组装 ──
 +    const agentBody = () => {
-+        const body = assembleAgentBody(msg, mwState, scope, logger);
++        const body = assembleAgentBody(standard.message, msg, mwState, scope);
 +        if (body)
 +            logger.info(`Processing: scope=${scope} length=${body.length}`);
 +        return body;
@@ -1681,7 +2110,7 @@ index 1006265..b4f9629 100644
          logger.error(`ERROR creating session: ${err instanceof Error ? err.message : String(err)}`);
          // 兜底回复：会话创建失败时告知用户，避免静默无响应
          try {
-@@ -35,27 +92,33 @@ export async function handleInbound(ctx, manager, config, logger) {
+@@ -35,27 +135,33 @@ export async function handleInbound(ctx, manager, config, logger) {
          catch (sendErr) {
              logger.error(`fallback reply failed: ${sendErr instanceof Error ? sendErr.message : String(sendErr)}`);
          }
@@ -1705,12 +2134,12 @@ index 1006265..b4f9629 100644
      // 群消息回复后清空历史缓存（避免下次 @ 时重复组包）
      if (scope === 'group') {
 -        clearGroupHistory(config.appId, msg.groupOpenid ?? msg.senderId);
-+        clearGroupHistory(config.appId, peerId);
-     }
+-    }
 -    // 阻塞等待本轮 turn 收敛，避免后续消息在 turn 运行期间被 followup 打断
 -    try {
 -        await record.agent.whenIdle();
--    }
++        clearGroupHistory(config.appId, peerId);
+     }
 -    catch (err) {
 -        logger.warn(`whenIdle rejected: ${err instanceof Error ? err.message : String(err)}`);
 +    if(result.interactive){
@@ -1731,7 +2160,172 @@ index 1006265..b4f9629 100644
  }
  // ══════════════════════════════════════════════════════════════
  // Body Assembly（5 层组装）
-@@ -285,4 +348,4 @@ const SENDER_SHORT_ID_LEN = 8;
+@@ -63,15 +169,16 @@ export async function handleInbound(ctx, manager, config, logger) {
+ /**
+  * 组装 agentBody — AI 实际看到的完整上下文
+  */
+-function assembleAgentBody(msg, state, scope, logger) {
++function assembleAgentBody(message, msg, state, scope) {
+     const isGroup = scope === 'group';
+     const wasMentioned = state.mention?.wasMentioned ?? false;
+-    const userContent = buildUserContent(msg, state, logger);
+-    if (isEmptyMessage(userContent, msg.attachments, isGroup, wasMentioned))
++    const attachments = message.attachments ?? [];
++    const userContent = buildUserContent(message.text, attachments);
++    if (isEmptyMessage(userContent, attachments, isGroup, wasMentioned))
+         return null;
+-    const quotePart = buildQuotePart(state.quote);
++    const quotePart = buildQuotePart(message.quote);
+     const userMessage = buildUserMessage(userContent, quotePart, msg.senderId, msg.senderName, isGroup, wasMentioned);
+-    const dynamicCtx = buildDynamicCtx(msg, state);
++    const dynamicCtx = buildDynamicCtx(attachments, message.quote);
+     const base = dynamicCtx ? `${dynamicCtx}${userMessage}` : userMessage;
+     const agentBody = buildAgentBody(base, state.history, isGroup, wasMentioned);
+     return agentBody;
+@@ -92,21 +199,17 @@ function isEmptyMessage(userContent, attachments, isGroup, wasMentioned) {
+ /**
+  * Layer 1: 用户文本内容 + 语音转录 + 附件类型标签（媒体路径由 buildDynamicCtx 提供）
+  */
+-function buildUserContent(msg, state, logger) {
++function buildUserContent(content, attachments) {
+     const parts = [];
+-    const text = (msg.content ?? '').trim();
++    const text = (content ?? '').trim();
+     if (text) {
+         parts.push(text);
+     }
+-    const voiceTexts = extractVoiceTexts(msg.attachments, state.processedAttachments, logger);
+-    if (voiceTexts.length > 0) {
+-        for (const vt of voiceTexts) {
+-            const durationTag = vt.duration ? ` (${vt.duration}s)` : '';
+-            parts.push(`[Voice message${durationTag}] ${vt.text}`);
+-        }
++    for (const voice of attachments.filter(a => a.kind === 'voice' && a.transcript)) {
++        parts.push(`[Voice message] ${voice.transcript}`);
+     }
+     // 附件类型标签（媒体路径由 buildDynamicCtx 提供，这里只提示「带了什么」）
+-    const attachmentTags = buildAttachmentTags(msg.attachments);
++    const attachmentTags = buildAttachmentTags(attachments);
+     if (attachmentTags) {
+         parts.push(attachmentTags);
+     }
+@@ -116,9 +219,9 @@ function buildUserContent(msg, state, logger) {
+  * Layer 2: 引用消息块
+  */
+ function buildQuotePart(quote) {
+-    if (!quote?.text && !quote?.entry?.content)
++    if (!quote?.text)
+         return '';
+-    const quoteText = quote.text || quote.entry?.content || 'Original content unavailable';
++    const quoteText = quote.text;
+     return `[Quoted message begins]\n${quoteText}\n[Quoted message ends]\n[Current message]\n`;
+ }
+ /**
+@@ -136,48 +239,44 @@ function buildUserMessage(userContent, quotePart, senderId, senderName, isGroup,
+ /**
+  * Layer 4: 媒体元数据上下文（图片/视频/文件本地路径 + 语音 ASR + 引用附件）
+  */
+-function buildDynamicCtx(msg, state) {
++const localOf = a => a.resource?.type === 'local' ? a.resource.path : undefined;
++const urlOf = a => a.resource?.type === 'remote' ? a.resource.url : undefined;
++function buildDynamicCtx(attachments, quote) {
+     const lines = [];
+-    if (msg.attachments && msg.attachments.length > 0) {
+-        const downloadedByFilename = new Map((state.downloadedFiles ?? []).map(d => [d.filename, d]));
++    if (attachments.length > 0) {
+         const voices = [];
+         // 一次遍历归类 + 生成媒体行
+-        for (const att of msg.attachments) {
+-            const kind = classifyContentType(att.content_type);
+-            if (kind === 'voice') {
++        for (const att of attachments) {
++            if (att.kind === 'voice') {
+                 voices.push(att);
+                 continue;
+             }
+-            const d = downloadedByFilename.get(att.filename);
+-            lines.push(`- ${renderMediaLine(kind, att.filename, d?.localPath, att.url, att.size)}`);
++            lines.push(`- ${renderMediaLine(att.kind, att.name, localOf(att), urlOf(att), att.size)}`);
+         }
+         // 语音：有 ASR 文本才带文本，否则只带链接（纯文本模型无法消费音频）
+         if (voices.length > 0) {
+-            const asrTexts = voices.map(a => a.asr_refer_text).filter(Boolean);
++            const asrTexts = voices.map(a => a.transcript).filter(Boolean);
+             if (asrTexts.length > 0) {
+                 lines.push(`- ASR: ${asrTexts.join(' | ')}`);
+             }
+             else {
+-                const urls = voices.map(a => a.url).filter(Boolean);
++                const urls = voices.map(urlOf).filter(Boolean);
+                 if (urls.length > 0)
+                     lines.push(`- Voice: ${urls.join(', ')}`);
+             }
+         }
+     }
+     // 引用消息的附件（独立于当前消息媒体，不受上一步为空影响）
+-    const quoteAttachments = state.quote?.attachments;
++    const quoteAttachments = quote?.attachments;
+     if (quoteAttachments && quoteAttachments.length > 0) {
+-        const downloadedQuote = new Map((state.downloadedQuoteFiles ?? []).map(d => [d.filename, d]));
+         lines.push('[Reference attachments]');
+         for (const qa of quoteAttachments) {
+-            const kind = classifyContentType(qa.contentType);
+-            const d = downloadedQuote.get(qa.filename ?? '');
+-            if (kind === 'voice') {
+-                if (qa.asrText)
+-                    lines.push(`  - Voice: ${qa.asrText}`);
++            if (qa.kind === 'voice') {
++                if (qa.transcript)
++                    lines.push(`  - Voice: ${qa.transcript}`);
+                 continue;
+             }
+-            lines.push(`  - ${renderMediaLine(kind, qa.filename, d?.localPath, qa.url, undefined)}`);
++            lines.push(`  - ${renderMediaLine(qa.kind, qa.name, localOf(qa), urlOf(qa), undefined)}`);
+         }
+     }
+     return lines.length > 0 ? lines.join('\n') + '\n\n' : '';
+@@ -222,31 +321,6 @@ function buildAgentBody(base, history, isGroup, wasMentioned) {
+         base,
+     ].join('\n');
+ }
+-function extractVoiceTexts(attachments, processed, _logger) {
+-    const results = [];
+-    if (processed) {
+-        for (const pa of processed) {
+-            if (pa.type === 'voice' && pa.voiceText) {
+-                results.push({
+-                    text: pa.voiceText,
+-                    duration: pa.duration,
+-                    source: pa.voiceSource ?? 'stt',
+-                });
+-            }
+-        }
+-    }
+-    if (results.length === 0 && attachments) {
+-        for (const att of attachments) {
+-            if (isVoiceContentType(att.content_type) && att.asr_refer_text) {
+-                results.push({
+-                    text: att.asr_refer_text.trim(),
+-                    source: 'asr',
+-                });
+-            }
+-        }
+-    }
+-    return results;
+-}
+ /**
+  * 附件类型标签（Layer 1 用户消息主体里的轻量提示）。
+  * 只标注「带了什么类型的附件」，去重；媒体本地路径在 buildDynamicCtx 提供。
+@@ -262,7 +336,7 @@ function buildAttachmentTags(attachments) {
+     const seen = new Set();
+     const tags = [];
+     for (const att of attachments) {
+-        const kind = classifyContentType(att.content_type);
++        const kind = att.kind;
+         if (kind === 'voice' || seen.has(kind))
+             continue;
+         seen.add(kind);
+@@ -285,4 +359,4 @@ const SENDER_SHORT_ID_LEN = 8;
  function shortSenderId(senderId) {
      return senderId.slice(0, SENDER_SHORT_ID_LEN);
  }
@@ -1996,16 +2590,17 @@ index f69cedb..6ff2378 100644
 +//# sourceMappingURL=outbound-buffer.js.map
 diff --git a/dist/transport/qq-text-adapter.js b/dist/transport/qq-text-adapter.js
 new file mode 100644
-index 0000000..6f88fd2
+index 0000000..883dbd3
 --- /dev/null
 +++ b/dist/transport/qq-text-adapter.js
-@@ -0,0 +1,86 @@
+@@ -0,0 +1,116 @@
 +/**
-+ * QQ Official text adapter for the Unified Agent I/O (dsh-agent-io).
++ * QQ Official text and basic media adapter for the Unified Agent I/O (dsh-agent-io).
 + *
 + * Owns only QQ protocol: the reply target of the trusted Conversation Manager
 + * record, passive-reply quota and diagnostics (reused from the gateway sender),
-+ * platform chunking, and QQ API error classification. The route itself (access,
++ * platform chunking, media upload/send of trusted local resources, and QQ API
++ * error classification. The route itself (access,
 + * current Session of exactly this Conversation) is the shared Conversation
 + * wiring's; ordering, cancellation and duplicate suppression belong to the I/O
 + * core. No SDK import: the gateway injects the send and split functions.
@@ -2044,6 +2639,20 @@ index 0000000..6f88fd2
 +    return { outcome: 'unknown', reason: 'invalid-response' };
 +}
 +/**
++ * Media parts fail at a known stage. `resource`: the trusted file no longer
++ * passes the send-time check (nothing was read or uploaded). `upload`: the QQ
++ * upload step (its own retries included) failed, and an upload alone never
++ * shows anything to the user, so the part is provably not sent. Only a failure
++ * of the media message request itself is classified like a text part.
++ */
++export function classifyQQPartError(error) {
++    if (error?.qqStage === 'resource') return { outcome: 'not-sent', reason: 'invalid-resource', stage: 'before-platform' };
++    if (error?.qqStage === 'upload') return { outcome: 'not-sent', reason: 'upload-failed', stage: 'platform' };
++    return classifyQQError(error?.qqStage === 'message' ? error.cause : error);
++}
++/** Attachment kinds QQ can send as media messages, all from a trusted local file. */
++export const QQ_MEDIA_KINDS = Object.freeze(['image', 'video', 'voice', 'file']);
++/**
 + * The gateway's access configuration at send time (same rules as the SDK
 + * accessPolicy for C2C sender / group openid). A peer the configuration no
 + * longer admits is never written to, whatever an older record says.
@@ -2064,8 +2673,16 @@ index 0000000..6f88fd2
 + * @param replyTarget  optional (record, messageId) → the reply target of the input a
 + *                     logical message answers (Interaction bubbles); used only while
 + *                     it names this record's Conversation, otherwise the record's latest.
++ * @param sendMedia    optional (replyTarget, attachment, info) → {id?, uploaded?}: uploads
++ *                     and sends one trusted local attachment; without it, attachments are
++ *                     refused before any part is sent.
 + */
-+export function createQQTextAdapter({ send, split, limit = 4500, replyTarget }) {
++export function createQQTextAdapter({ send, split, limit = 4500, replyTarget, sendMedia }) {
++    const targetFor = (record, messageId) => {
++        let own;
++        try { own = typeof replyTarget === 'function' ? replyTarget(record, messageId) : undefined; } catch { own = undefined; }
++        return own && own.scope === record.scope && own.targetId === record.peerId ? own : record.replyTarget;
++    };
 +    return {
 +        // After the shared route check, before every part: the record's reply
 +        // target must still point at exactly this Conversation.
@@ -2077,12 +2694,19 @@ index 0000000..6f88fd2
 +        split: text => hardLimit(split(text), limit),
 +        async send(route, text, info) {
 +            const record = route.record;
-+            let own;
-+            try { own = typeof replyTarget === 'function' ? replyTarget(record, info.messageId) : undefined; } catch { own = undefined; }
-+            const target = own && own.scope === record.scope && own.targetId === record.peerId ? own : record.replyTarget;
-+            const result = await send({ ...target }, text, { index: info.index, sessionId: record.sessionId, messageId: info.messageId });
++            const result = await send({ ...targetFor(record, info.messageId) }, text, { index: info.index, sessionId: record.sessionId, messageId: info.messageId });
 +            return { receipt: typeof result?.id === 'string' ? result.id : undefined };
 +        },
-+        classify: classifyQQError,
++        // Only trusted local resources: a remote URL would let a caller make QQ
++        // fetch an arbitrary address on its behalf.
++        ...(typeof sendMedia === 'function' ? {
++            accepts: attachment => QQ_MEDIA_KINDS.includes(attachment?.kind) && attachment.resource?.type === 'local',
++            async sendAttachment(route, attachment, info) {
++                const record = route.record;
++                const result = await sendMedia({ ...targetFor(record, info.messageId) }, attachment, { index: info.index, sessionId: record.sessionId, messageId: info.messageId });
++                return { receipt: typeof result?.id === 'string' ? result.id : undefined, uploaded: typeof result?.uploaded === 'string' && result.uploaded ? result.uploaded : undefined };
++            },
++        } : {}),
++        classify: classifyQQPartError,
 +    };
 +}

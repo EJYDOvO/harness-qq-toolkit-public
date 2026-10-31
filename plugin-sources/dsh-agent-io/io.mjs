@@ -12,14 +12,41 @@ const code=(value,fallback)=>typeof value==='string'&&CODE.test(value)?value:fal
 const text=value=>typeof value==='string'&&value.length>0&&value.length<=256;
 const freeze=result=>Object.freeze({...result,parts:Object.freeze((result.parts??[]).map(p=>Object.freeze(p)))});
 const notSent=(id,reason,stage='before-platform',parts=[])=>freeze({id,status:'not-sent',reason,stage,parts});
-// What a logical message id stands for: its Conversation and text. The same id
-// with another fingerprint is a different message, never a retry of the first.
-const fingerprint=request=>createHash('sha256').update(JSON.stringify([request.target.conversation.type,request.target.conversation.id,request.message.text])).digest('hex');
+// What a logical message id stands for: its Conversation, text and attachments.
+// The same id with another fingerprint is a different message, never a retry.
+const fingerprint=request=>createHash('sha256').update(JSON.stringify([request.target.conversation.type,request.target.conversation.id,request.message.text??'',
+ (request.message.attachments??[]).map(a=>[a.kind,a.name??'',a.resource.type,a.resource.path??a.resource.url])])).digest('hex');
 
 const INBOUND_KEYS=new Set(['conversation','message','sender','timestamp','platformData']);
+// Basic media (ADR-057): an attachment is a descriptor. `resource` is the trusted
+// reference a Host-side caller or the platform adapter filled in (a checked local
+// file or the platform's own URL); it is never model output and never becomes
+// model-visible by itself. The adapter maps descriptors to platform upload and
+// download; this core only checks their shape.
+export const ATTACHMENT_KINDS=Object.freeze(['image','voice','video','file']);
+const OUTBOUND_ATTACHMENT_KEYS=new Set(['kind','name','contentType','size','resource']);
+const INBOUND_ATTACHMENT_KEYS=new Set([...OUTBOUND_ATTACHMENT_KEYS,'transcript']);
+const reference=value=>typeof value==='string'&&value.length>0&&value.length<=4096&&!/[\u0000-\u001f]/.test(value);
+function attachmentProblem(a,keys,{required,maxText}){
+ if(!a||typeof a!=='object'||Array.isArray(a))return 'invalid-message';
+ if(Object.keys(a).some(k=>!keys.has(k)))return 'unsupported';
+ if(!ATTACHMENT_KINDS.includes(a.kind))return 'unsupported';
+ if(a.name!==undefined&&!text(a.name))return 'invalid-message';
+ if(a.contentType!==undefined&&!text(a.contentType))return 'invalid-message';
+ if(a.size!==undefined&&!(Number.isSafeInteger(a.size)&&a.size>=0))return 'invalid-message';
+ if(a.transcript!==undefined&&(typeof a.transcript!=='string'||a.transcript.length>maxText))return 'invalid-message';
+ const r=a.resource;
+ if(r===undefined)return required?'invalid-message':null;
+ if(!r||typeof r!=='object'||Object.keys(r).length!==2)return 'invalid-message';
+ if(r.type==='local')return reference(r.path)?null:'invalid-message';
+ if(r.type==='remote')return reference(r.url)?null:'invalid-message';
+ return 'unsupported';
+}
+const frozenAttachment=a=>Object.freeze({...a,...(a.resource?{resource:Object.freeze({...a.resource})}:{})});
 
 export function createAgentIO(options={}){
  const maxPerConversation=options.maxPendingPerConversation??32,maxPending=options.maxPending??512,maxConcurrent=options.maxConcurrent??8,maxText=options.maxTextLength??100_000,remember=options.rememberResults??1024;
+ const maxAttachments=options.maxAttachments??10,maxInboundAttachments=options.maxInboundAttachments??20;
  const now=options.now??Date.now,onEvent=typeof options.onEvent==='function'?options.onEvent:undefined;
  const adapters=new Map(),conversations=new Map(),results=new Map(),ready=[];
  let pending=0,active=0,closed=false;const running=new Set();
@@ -43,9 +70,17 @@ export function createAgentIO(options={}){
   if(!target||!text(target.platform)||!text(target.accountId)||!conversation||!['direct','group'].includes(conversation.type)||!text(conversation.id))return 'invalid-target';
   if(!request.origin||typeof request.origin!=='object')return 'unauthorized';
   if(!message||typeof message!=='object')return 'invalid-message';
-  if(Object.keys(message).some(k=>k!=='text'))return 'unsupported';
-  if(typeof message.text!=='string'||!message.text.trim())return 'invalid-message';
-  if(message.text.length>maxText)return 'too-large';
+  if(Object.keys(message).some(k=>k!=='text'&&k!=='attachments'))return 'unsupported';
+  const attachments=message.attachments;
+  if(attachments!==undefined){
+   if(!Array.isArray(attachments)||!attachments.length)return 'invalid-message';
+   if(attachments.length>maxAttachments)return 'too-large';
+   for(const a of attachments){const problem=attachmentProblem(a,OUTBOUND_ATTACHMENT_KEYS,{required:true,maxText});if(problem)return problem;}
+  }
+  // Text alone, attachments alone, or a caption with attachments.
+  if(message.text!==undefined&&typeof message.text!=='string')return 'invalid-message';
+  if(!attachments&&!message.text?.trim())return 'invalid-message';
+  if((message.text?.length??0)>maxText)return 'too-large';
   if(request.id!==undefined&&!text(request.id))return 'invalid-message';
   return null;
  }
@@ -103,8 +138,20 @@ export function createAgentIO(options={}){
    return resolved?.ok===true?{adapter:entry.adapter,route:resolved.route}:{reason:code(resolved?.reason,'unauthorized')};
   };
   let current=check();if(current.reason)return notSent(id,current.reason);
-  let parts;try{parts=current.adapter.split(request.message.text);}catch{parts=null;}
-  if(!Array.isArray(parts)||!parts.length||parts.some(p=>typeof p!=='string'||!p))return notSent(id,'adapter-error');
+  // Parts in order: the text chunks (if any), then one part per attachment.
+  const body=request.message.text?.trim()?request.message.text:undefined,attachments=request.message.attachments??[];
+  let texts=[];
+  if(body!==undefined){
+   try{texts=current.adapter.split(body);}catch{texts=null;}
+   if(!Array.isArray(texts)||!texts.length||texts.some(p=>typeof p!=='string'||!p))return notSent(id,'adapter-error');
+  }
+  // Every attachment must be accepted before anything is sent, so an
+  // unsupported kind or resource never leaves a partial message behind.
+  if(attachments.length){
+   if(typeof current.adapter.sendAttachment!=='function')return notSent(id,'unsupported');
+   for(const a of attachments){let ok;try{ok=current.adapter.accepts?current.adapter.accepts(a)===true:true;}catch{ok=false;}if(!ok)return notSent(id,'unsupported');}
+  }
+  const parts=[...texts.map(value=>({text:value})),...attachments.map((attachment,n)=>({attachment,n}))];
   const done=[];let failure;
   for(let index=0;index<parts.length;index++){
    if(index>0){
@@ -113,18 +160,20 @@ export function createAgentIO(options={}){
     const stop=closed?'closed':cancelled()?'cancelled':(current=check()).reason;
     if(stop){failure={status:'skipped',reason:stop};break;}
    }
+   const part=parts[index],media=part.attachment?{attachment:part.n}:{};
    try{
-    const receipt=await current.adapter.send(current.route,parts[index],{messageId:id,index,count:parts.length});
-    done.push({index,status:'sent',...(text(receipt?.receipt)?{receipt:receipt.receipt}:{})});
+    const info={messageId:id,index,count:parts.length};
+    const receipt=part.attachment?await current.adapter.sendAttachment(current.route,part.attachment,info):await current.adapter.send(current.route,part.text,info);
+    done.push({index,status:'sent',...media,...(text(receipt?.receipt)?{receipt:receipt.receipt}:{}),...(text(receipt?.uploaded)?{uploaded:receipt.uploaded}:{})});
    }catch(error){
     let c;try{c=current.adapter.classify?.(error);}catch{}
     const outcome=c?.outcome==='not-sent'?'not-sent':'unknown';
     failure={status:outcome,reason:code(c?.reason,outcome==='unknown'?'unknown-outcome':'platform-rejected'),stage:c?.stage==='before-platform'?'before-platform':'platform'};
-    done.push({index,status:outcome,reason:failure.reason});
+    done.push({index,status:outcome,...media,reason:failure.reason});
     break;
    }
   }
-  for(let index=done.length;index<parts.length;index++)done.push({index,status:'skipped'});
+  for(let index=done.length;index<parts.length;index++)done.push({index,status:'skipped',...(parts[index].attachment?{attachment:parts[index].n}:{})});
   if(!failure)return freeze({id,status:'sent',parts:done});
   const sent=done.some(p=>p.status==='sent');
   // An unknown part makes the whole message unknown: it must not be resent.
@@ -147,7 +196,27 @@ export function createAgentIO(options={}){
   if(channels.has(key))throw Error('An inbound channel is already open for this platform account');
   const entry={channel,open:true};channels.set(key,entry);
   const close=()=>{entry.open=false;if(channels.get(key)===entry)channels.delete(key);};
-  return Object.freeze({receive:message=>receive(entry,message),close});
+  return Object.freeze({receive:message=>receive(entry,message),claim:message=>claim(entry,message),close});
+ }
+
+ // Marks one platform message as consumed in the same duplicate scope as
+ // receive(), without delivering it: a command handled by the I/O command
+ // router can then neither run twice nor reach the Agent through receive().
+ //   claimed      first sighting (also for a message without a platform id)
+ //   duplicate    in flight or already settled within the window
+ //   unavailable  channel closed or invalid shape
+ function claim(entry,message){
+  if(closed||!entry.open)return 'unavailable';
+  const conversation=message?.conversation,id=message?.message?.id;
+  if(!conversation||!['direct','group'].includes(conversation.type)||!text(conversation.id))return 'unavailable';
+  if(id===undefined)return 'claimed';
+  if(!text(id))return 'unavailable';
+  const {platform,accountId}=entry.channel,at=now(),key=JSON.stringify([platform,accountId,conversation.type,conversation.id,id]);
+  const known=received.get(key);
+  if(known&&(!known.settled||at-known.at<inboundWindow))return 'duplicate';
+  received.delete(key);received.set(key,{settled:true,at});
+  for(const [k,e] of received){if(received.size<=rememberInbound)break;if(e.settled)received.delete(k);}
+  return 'claimed';
  }
 
  function validateInbound(message){
@@ -156,11 +225,33 @@ export function createAgentIO(options={}){
   if(!conversation||!['direct','group'].includes(conversation.type)||!text(conversation.id))return 'invalid-target';
   if(!sender||!text(sender.id))return 'unauthorized';
   if(!body||typeof body!=='object')return 'invalid-message';
-  if(Object.keys(body).some(k=>k!=='id'&&k!=='text'))return 'unsupported';
+  if(Object.keys(body).some(k=>!['id','text','attachments','quote'].includes(k)))return 'unsupported';
   if(body.id!==undefined&&!text(body.id))return 'invalid-message';
   if(typeof body.text!=='string')return 'invalid-message';
   if(body.text.length>maxText)return 'too-large';
+  const list=value=>{
+   if(value===undefined)return null;
+   if(!Array.isArray(value))return 'invalid-message';
+   if(value.length>maxInboundAttachments)return 'too-large';
+   for(const a of value){const problem=attachmentProblem(a,INBOUND_ATTACHMENT_KEYS,{required:false,maxText});if(problem)return problem;}
+   return null;
+  };
+  const own=list(body.attachments);if(own)return own;
+  // A quoted (replied-to) message the platform resolved: what it said and carried.
+  const quote=body.quote;
+  if(quote!==undefined){
+   if(!quote||typeof quote!=='object'||Object.keys(quote).some(k=>!['id','text','attachments'].includes(k)))return 'invalid-message';
+   if(quote.id!==undefined&&!text(quote.id))return 'invalid-message';
+   if(quote.text!==undefined&&(typeof quote.text!=='string'||quote.text.length>maxText))return 'invalid-message';
+   const quoted=list(quote.attachments);if(quoted)return quoted;
+  }
   return null;
+ }
+ function frozenBody(body){
+  const out={...body};
+  if(body.attachments)out.attachments=Object.freeze(body.attachments.map(frozenAttachment));
+  if(body.quote)out.quote=Object.freeze({...body.quote,...(body.quote.attachments?{attachments:Object.freeze(body.quote.attachments.map(frozenAttachment))}:{})});
+  return Object.freeze(out);
  }
 
  // One platform message is handed to the Agent at most once per process within
@@ -186,7 +277,7 @@ export function createAgentIO(options={}){
    // Bounded: the oldest settled entries go first; in-flight ones never.
    for(const [k,e] of received){if(received.size<=rememberInbound)break;if(e.settled)received.delete(k);}
   }
-  const standard=Object.freeze({platform,adapter:entry.channel.adapter,accountId,conversation:Object.freeze({...message.conversation}),message:Object.freeze({...message.message}),sender:Object.freeze({...message.sender}),timestamp:message.timestamp,platformData:message.platformData});
+  const standard=Object.freeze({platform,adapter:entry.channel.adapter,accountId,conversation:Object.freeze({...message.conversation}),message:frozenBody(message.message),sender:Object.freeze({...message.sender}),timestamp:message.timestamp,platformData:message.platformData});
   let result;
   try{
    const outcome=await entry.channel.deliver(standard);

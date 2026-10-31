@@ -1,10 +1,11 @@
 // Uses an explicit code-only SDK/QQ fixture; never instantiates QQBot or contacts QQ.
 // Assertions describe release requirements and intentionally remain red on test.10.
 // Iteration 04: all chat output goes through the Unified Agent I/O; no SDK stream path.
-import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import vm from 'node:vm';import path from 'node:path';import {pathToFileURL} from 'node:url';
+import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import vm from 'node:vm';import path from 'node:path';import {pathToFileURL} from 'node:url';import os from 'node:os';
 import {Interaction} from '../../../character-agent-v1/packages/interaction-policy/policy.mjs';
 import {createConversations} from '../../plugin-sources/dsh-agent-io/conversation.mjs';
 import {createAgentIO} from '../../plugin-sources/dsh-agent-io/io.mjs';
+import {createTurnControls} from '../qq-conversation-fixture.mjs';
 const sdk=process.env.QQBOT_AUDIT_SDK_DIR,qq=process.env.QQBOT_AUDIT_DIST;
 assert(sdk&&qq,'Set QQBOT_AUDIT_SDK_DIR and QQBOT_AUDIT_DIST to isolated code-only fixture directories');
 const {StreamSession}=await import(pathToFileURL(path.join(sdk,'streaming.js')));
@@ -22,7 +23,7 @@ const targetSource=fs.readFileSync(path.join(qq,'transport/reply-target.js'),'ut
 const {resolveReplyTarget,sendResolvedMarkdown}=vm.runInNewContext(targetSource+'\n;({resolveReplyTarget,sendResolvedMarkdown});',{getCachedReplyIds,MsgType:{MARKDOWN:2}});
 const slice=(start,end)=>{const a=source.indexOf(start),b=source.indexOf(end,a);assert(a>=0&&b>a,start);return source.slice(a,b);};
 const makeSender=vm.runInNewContext('(function(bot,deliveryRecorder){'+slice('    const replyLimiter =','    // Optional Agent policy')+'return {sender,replyLimiter};})',{ReplyLimiter,resolveReplyTarget,sendResolvedMarkdown});
-const makeOutbound=vm.runInNewContext(slice('export function createInteractionOutbound','export async function bootstrapGateway').replace('export function','function')+';createInteractionOutbound;',{AbortController,AbortSignal,randomUUID:()=> 'fixture-0000-4000',createOutboundHandler:()=>()=>{}});
+const makeOutbound=vm.runInNewContext(slice('export function createInteractionOutbound','export async function bootstrapGateway').replace(/^export (async )?function/gm,'$1function')+';createInteractionOutbound;',{AbortController,AbortSignal,createTurnControls,randomUUID:()=> 'fixture-0000-4000',createOutboundHandler:()=>()=>{}});
 // The gateway's own Unified Agent I/O adapter registration (the only chat output path).
 const registerAdapter=vm.runInNewContext('(function(conversation,config,chunkMarkdownText,sender,diagnostics,outboundHandler,ctx){'+slice('    // Unified Agent I/O text adapter',"    ctx\n        .on('session/event'")+'})',{createQQTextAdapter});
 const micro=()=>new Promise(r=>setImmediate(r));
@@ -200,4 +201,47 @@ test('QQ lifecycle configuration parses through the installed Host schema and re
  const legacy=ConfigSchema({});assert.deepEqual(legacy.sessionLifecycle,{enabled:false,freshOnHostRestart:true,inactivityMs:43200000});
  const enabled=ConfigSchema({sessionLifecycle:{enabled:true}});assert.equal(enabled.sessionLifecycle.inactivityMs,43200000);assert.equal(enabled.sessionLifecycle.freshOnHostRestart,true);
  assert.throws(()=>ConfigSchema({sessionLifecycle:{enabled:true,inactivityMs:0}}));
+});
+
+// ── Iteration 05 basic media on the real SDK MediaApi (synthetic HTTP client, no network) ──
+const {MediaApi}=await import(pathToFileURL(path.join(sdk,'protocol/api/media.js')));
+const {verifyLocalFile}=await import(pathToFileURL(path.join(qq,'media/send-file-tool.js')));
+const {sendMedia}=vm.runInNewContext(slice('const MEDIA_TYPES','export async function bootstrapGateway').replace(/^export (async )?function/gm,'$1function')+';({sendMedia});',{verifyLocalFile,resolveReplyTarget,MediaFileType:{IMAGE:1,VIDEO:2,VOICE:3,FILE:4},process});
+function mediaFixture(t,{fail}={}){
+ const dir=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'qq-audit-media-')));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+ const requests=[],creds={appId:'fixture',clientSecret:'dummy'};
+ const client={async request(_token,method,route,body){requests.push({method,route,body:structuredClone(body)});const f=fail?.(route,requests.length);if(f)throw f;return route.endsWith('/files')?{file_uuid:'synthetic-uuid',file_info:'synthetic-info',ttl:0}:{id:'synthetic-media-receipt'};}};
+ const mediaApi=new MediaApi(client,{getAccessToken:async()=> 'synthetic-token'},{});
+ const bot={creds,mediaApi,uploadMedia:o=>mediaApi.uploadMedia(o.target.scope,o.target.targetId,o.fileType,creds,{localPath:o.localPath,srvSendMsg:o.srvSendMsg,fileName:o.fileName}),sendMarkdown:async()=>({id:'text'})};
+ const config={textChunkLimit:4500,sendFile:{restrictPaths:true,extraRoots:[dir]},cwd:dir};
+ const record={agent:{status:'idle'},sessionKey:'fixture',sessionId:'fixture',scope:'c2c',peerId:'fixture-owner',replyTarget:{scope:'c2c',targetId:'fixture-owner',msgId:'fixture-message'}};
+ const manager={getOrCreate:async()=>record,getSessionRecord:()=>record,isCurrentSession:r=>r===record};
+ const io=createAgentIO(),limiter=new ReplyLimiter({limit:4});
+ const conversation=createConversations(io,{createInput:m=>m,interactionPolicy:()=>undefined})({platform:'qq-official',adapter:'qq-official-gateway',accountId:'fixture',manager,scopes:{direct:'c2c',group:'group'},admits:()=>true});
+ conversation.registerAdapter(createQQTextAdapter({send:async()=>({id:'text'}),split:t=>[t],sendMedia:(target,a)=>sendMedia(bot,limiter,config,target,a)}));
+ const send=(attachments,id)=>io.sendMessage({...(id?{id}:{}),target:conversation.target(record),origin:{sessionId:'fixture'},message:{attachments}});
+ const fileAt=(name,body='synthetic')=>{const p=path.join(dir,name);fs.writeFileSync(p,body);return p;};
+ return {requests,send,fileAt,dir};
+}
+test('Q20 a file attachment is uploaded without sending, then sent as one media message replying to the input',async t=>{
+ const f=mediaFixture(t),doc=f.fileAt('report.pdf','PDF');
+ const r=await f.send([{kind:'file',name:'report.pdf',resource:{type:'local',path:doc}}],'qq:fixture:1:file:x');
+ assert.equal(r.status,'sent');assert.deepEqual({...r.parts[0]},{index:0,status:'sent',attachment:0,receipt:'synthetic-media-receipt',uploaded:'synthetic-uuid'});
+ const [upload,message]=f.requests;
+ assert.equal(upload.route,'/v2/users/fixture-owner/files');assert.equal(upload.body.srv_send_msg,false);assert.equal(upload.body.file_type,4);assert.equal(upload.body.file_name,'report.pdf');assert.equal(Buffer.from(upload.body.file_data,'base64').toString(),'PDF');
+ assert.equal(message.route,'/v2/users/fixture-owner/messages');assert.equal(message.body.msg_type,7);assert.deepEqual(message.body.media,{file_info:'synthetic-info'});assert.equal(message.body.msg_id,'fixture-message');
+ const again=await f.send([{kind:'file',name:'report.pdf',resource:{type:'local',path:doc}}],'qq:fixture:1:file:x');
+ assert.equal(again.duplicate,true);assert.equal(f.requests.length,2,'the same logical message is not uploaded again');
+});
+test('Q21 real SDK errors: a refused upload is not-sent, a timed-out media message is unknown and not retried',async t=>{
+ const refused=mediaFixture(t,{fail:route=>route.endsWith('/files')?new ApiError('API Error 400 Invalid file',400,route):undefined});
+ const r=await refused.send([{kind:'image',resource:{type:'local',path:refused.fileAt('a.png')}}]);
+ assert.deepEqual([r.status,r.reason],['not-sent','upload-failed']);assert(refused.requests.every(x=>x.route.endsWith('/files')),'no media message after a failed upload');
+ const timeout=mediaFixture(t,{fail:route=>route.endsWith('/messages')?new ApiError('timeout',0,route):undefined});
+ const u=await timeout.send([{kind:'image',resource:{type:'local',path:timeout.fileAt('b.png')}}]);
+ assert.deepEqual([u.status,u.reason],['unknown','timeout-or-network']);assert.equal(timeout.requests.filter(x=>x.route.endsWith('/messages')).length,1,'the message request is never repeated');
+ const outside=mediaFixture(t),elsewhere=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'qq-audit-out-')));t.after(()=>fs.rmSync(elsewhere,{recursive:true,force:true}));
+ fs.writeFileSync(path.join(elsewhere,'x.txt'),'secret');
+ const o=await outside.send([{kind:'file',resource:{type:'local',path:path.join(elsewhere,'x.txt')}}]);
+ assert.deepEqual([o.status,o.reason,o.stage],['not-sent','invalid-resource','before-platform']);assert.equal(outside.requests.length,0,'nothing read or uploaded');
 });
