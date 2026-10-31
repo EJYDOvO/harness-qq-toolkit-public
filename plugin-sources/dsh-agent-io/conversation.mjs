@@ -11,12 +11,14 @@
 // a Conversation everywhere; the adapter's scopes map it to the Manager's
 // existing (scope, peer) keys, so stored Session keys do not change.
 import {createCommandRouter} from './commands.mjs';
+import {createHITLBridge} from './hitl.mjs';
 
 const TYPES=['direct','group'];
 const text=value=>typeof value==='string'&&value.length>0&&value.length<=256;
 const CODE=/^[a-z][a-z-]{0,39}$/;
 
-// host: {createInput(spec) → native UserMessage, interactionPolicy(agent) → policy|undefined}
+// host: {createInput(spec) → native UserMessage, interactionPolicy(agent) → policy|undefined,
+//        hitl?: {register(bridge) → unregister}: the one install of the native HITL listeners}
 export function createConversations(io,host){
  return function openConversation(options){
   const {platform,adapter,accountId,manager,admits}=options??{};
@@ -33,7 +35,7 @@ export function createConversations(io,host){
   }
   if(!scopes.size)throw Error('Conversation requires at least one scope');
   const onInput=typeof options.onInput==='function'?options.onInput:undefined;
-  let inbound,release,commands,closed=false;
+  let inbound,release,commands,hitl,closed=false;
 
   const allowed=(scope,peer)=>{try{return admits(scope,peer)===true;}catch{return false;}};
   // undefined: no Interaction for this Agent. null: the lookup failed; callers
@@ -148,6 +150,29 @@ export function createConversations(io,host){
   }
 
   /**
+   * The account's HITL Bridge (Agent I/O hitl module, optional): native Approval
+   * and userQuestions requests of this account's current Sessions are shown in
+   * their Conversation through sendMessage() and answered only by the expected
+   * person there. The adapter passes its button events to respond() and, at its
+   * answer position, text messages to answer(); its Conversation Manager hooks
+   * use waiting() and cancel(). Without an open Bridge the native answerers
+   * (Web/Desktop) receive every request unchanged.
+   */
+  function openHITL(options={}){
+   if(closed)throw Error('Conversation closed');
+   if(hitl)throw Error('HITL already open for this Conversation wiring');
+   if(typeof host.hitl?.register!=='function')throw Error('HITL is unavailable in this Agent I/O host');
+   if(typeof manager.findBySessionId!=='function')throw Error('HITL requires the Manager Session lookup');
+   const bridge=createHITLBridge({...options,io,manager,wiring:{target,current,
+    allowed:record=>types.has(record?.scope)&&allowed(record.scope,record.peerId),
+    claim:input=>closed||!inbound?'unavailable':inbound.claim(input)}});
+   const unregister=host.hitl.register(bridge);
+   const handle={bridge,unregister};hitl=handle;
+   const stop=()=>{bridge.close();unregister();if(hitl===handle)hitl=undefined;};
+   return Object.freeze({respond:bridge.respond,answer:bridge.answer,waiting:bridge.waiting,cancel:bridge.cancel,size:bridge.size,close:stop});
+  }
+
+  /**
    * The account's outbound adapter. The route check above runs first; the
    * adapter's own check(record, target) adds protocol conditions (e.g. a usable
    * reply target); only an explicit {ok:true} lets a part go out, anything else
@@ -161,6 +186,8 @@ export function createConversations(io,host){
    const check=typeof parts?.check==='function'?parts.check:undefined;
    const unregister=io.registerAdapter({
     platform,accountId,split:parts?.split,send:parts?.send,classify:parts?.classify,
+    // HITL actions: optional; without acceptsActions the I/O refuses them.
+    ...(typeof parts?.acceptsActions==='function'?{acceptsActions:parts.acceptsActions}:{}),
     // Basic media: optional; without sendAttachment the I/O refuses attachments.
     ...(typeof parts?.sendAttachment==='function'?{sendAttachment:parts.sendAttachment,...(typeof parts.accepts==='function'?{accepts:parts.accepts}:{})}:{}),
     resolve(to,origin){
@@ -177,9 +204,9 @@ export function createConversations(io,host){
   }
 
   function close(){
-   closed=true;inbound?.close();inbound=undefined;release?.();release=undefined;commands=undefined;
+   closed=true;if(hitl){hitl.bridge.close();hitl.unregister();hitl=undefined;}inbound?.close();inbound=undefined;release?.();release=undefined;commands=undefined;
   }
 
-  return Object.freeze({platform,adapter,accountId,target,policy,handoff,submit,route,openInbound,openCommands,registerAdapter,close});
+  return Object.freeze({platform,adapter,accountId,target,policy,handoff,submit,route,openInbound,openCommands,openHITL,registerAdapter,close});
  };
 }

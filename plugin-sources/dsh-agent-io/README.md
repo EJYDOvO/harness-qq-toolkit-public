@@ -1,6 +1,6 @@
 # DSH Agent I/O（Unified Agent I/O）
 
-独立、平台无关的 Host 插件，提供统一聊天出站接口 `sendMessage()`、入站通道 `openInbound()`、连接 Conversation Manager 的 `openConversation()`，以及其内部的命令路由与基础附件契约。当前源码 `0.1.0-test.5`：架构路线的 **Iteration 01：普通文本出站**、**Iteration 02：普通聊天入站**、**Iteration 03：Conversation Manager 统一 I/O 接线**与 **Iteration 05：Commands / 基础 Media**（见 Character 仓库 `docs/architecture-planning/IMPLEMENTATION_ROADMAP.md`）。运行实例为随 Iteration 04 授权部署的 `0.1.0-test.4`；test.5 仅源码与隔离验证，**未部署**，真实 QQ/手机验收待完成；实例版本以仓库根 README 为准。验证基线为 DSH `0.2.1-rc.3`、Node 24。
+独立、平台无关的 Host 插件，提供统一聊天出站接口 `sendMessage()`、入站通道 `openInbound()`、连接 Conversation Manager 的 `openConversation()`，以及其内部的命令路由、基础附件契约与 HITL Bridge。当前源码 `0.1.0-test.6`：架构路线的 **Iteration 01：普通文本出站**、**Iteration 02：普通聊天入站**、**Iteration 03：Conversation Manager 统一 I/O 接线**、**Iteration 05：Commands / 基础 Media** 与 **Iteration 06：HITL Bridge**（见 Character 仓库 `docs/architecture-planning/IMPLEMENTATION_ROADMAP.md`）。运行实例为随 Iteration 05 授权部署的 `0.1.0-test.5`；test.6 仅源码与隔离验证，**未部署**，真实 QQ 按钮/手机验收待完成；实例版本以仓库根 README 为准。验证基线为 DSH `0.2.1-rc.3`、Node 24。
 
 它只做逻辑消息的交接语义：出站的校验、同 Conversation 串行、取消与分片间复核、同一逻辑消息去重、诚实的结果；入站的标准消息交接、按平台消息范围去重与交接结果；以及平台无关的 Session 接线（Manager 取得/校验当前 Session、原生 `UserMessage`、Interaction 交接、出站可信路由）。平台协议（回复目标、限额、分片、API 错误、事件解析与标准化）由各平台 Adapter 负责；准入与权限仍属 Host；Session 与路由仍由原生 DSH 和 [Conversation Manager](../dsh-conversation-manager/README.md) 负责。不依赖 QQ SDK、Character、Interaction 或 Conversation Manager 包（只使用平台传入的 Manager 句柄），原生消息构造取自 Host 提供的 `@deepseek-ai/dsh-llm`；不注册模型工具、RPC 或路由；不持久化任何状态。
 
@@ -36,7 +36,7 @@ const result = await ctx.get('agentIO').sendMessage({
     conversation: { type: 'direct', id: '<PEER_ID>' },   // direct | group
   },
   origin: { sessionId: '<DSH_SESSION_ID>' },  // 可信来源证据，由 Host 代码填写，Adapter 发送时复核
-  message: { text: '你好' },        // 文本、附件，或带说明文字的附件（见“基础 Media”）；replyTo 等其他字段返回 not-sent/unsupported
+  message: { text: '你好' },        // 文本、附件，或带说明文字的附件（见“基础 Media”）；HITL 按钮 actions 只能由本插件的 HITL Bridge 签发（见“HITL Bridge”）；replyTo 等其他字段返回 not-sent/unsupported
   signal,                           // 可选：AbortSignal（或任何带布尔 aborted 的对象）
 });
 ```
@@ -50,7 +50,7 @@ const result = await ctx.get('agentIO').sendMessage({
 | `partial` | 前面分片已接受，后续分片被明确拒绝或因取消/失效而跳过 | 不自动补发；已发部分不可撤回 |
 | `unknown` | 至少一个分片结果不确定（超时、连接中断、5xx 等），可能已发出 | **不得重发** |
 
-`reason` 为固定小写代码（如 `cancelled`、`stale`、`unauthorized`、`invalid-target`、`unsupported`、`queue-full`、`adapter-unavailable`、`id-conflict`、`platform-rejected`、`rate-limited`、`timeout-or-network`）；`parts` 为每个物理分片 `{index, status: sent|not-sent|unknown|skipped, receipt?, reason?}`（附件分片另带 `attachment`＝附件序号与可选 `uploaded`＝平台文件 ID），保留同一逻辑消息与平台回执的关联。`duplicate: true` 表示该 id 已交接过，本次返回首次结果、未再次发送。
+`reason` 为固定小写代码（如 `cancelled`、`stale`、`unauthorized`、`invalid-target`、`unsupported`、`queue-full`、`adapter-unavailable`、`id-conflict`、`platform-rejected`、`rate-limited`、`timeout-or-network`）；`parts` 为每个物理分片 `{index, status: sent|not-sent|unknown|skipped, receipt?, reason?}`（附件分片另带 `attachment`＝附件序号与可选 `uploaded`＝平台文件 ID；带 HITL 按钮的最后一个文字分片另带 `actions: true`），保留同一逻辑消息与平台回执的关联。`duplicate: true` 表示该 id 已交接过，本次返回首次结果、未再次发送。
 
 ### registerAdapter(adapter) → unregister()
 
@@ -124,9 +124,10 @@ await ctx.get('agentIO').sendMessage({ id, target: conversation.target(record), 
 | `handoff(standard, {replyTarget, content})` | 入站交接：平台/账号必须属于本接线 → `admits` 复核 → `manager.getOrCreate(scope, peer, sender, replyTarget)`（Manager 的创建/恢复/轮换以及外层包装，如 Character 的 Owner-only，全部保留）→ 返回的记录必须是同一 Conversation 且 `isCurrentSession` 为真，并再次 `admits` 复核（Session 获取期间被撤权时 `rejected/unauthorized`，不创建输入）→ Interaction 查询（失败时 `not-delivered/interaction-unavailable`，不创建输入）→ 原生 `UserMessage` → `onInput` → Interaction 的 `admitInput` → Agent 运行中且策略提供 `intervene` 时 `intervene()`，否则 `followup()`。`content` 可为函数，准入后才组装。结果：`accepted {record, message, mode, interactive}`；`rejected {reason}`（`unauthorized`、`invalid-target`、`empty-message`、`closed`）；`not-delivered {reason}`（`session-unavailable` 另带只留在 Host 侧的 `error`；`session-changed`；`interaction-unavailable`），可直接作为 `openInbound` 的 deliver 结果。 |
 | `submit(record, text, {revise})` | 已取得记录时的同一交接（先复核当前 Session 与 `admits`，再查询 Interaction；同上的拒绝与失败结果）；`revise: true` 用于显式更正，要求策略提供 `revise()`，否则 `not-delivered/no-interaction`。 |
 | `route(target, origin)` | 出站可信路由：平台/账号属于本接线，类型有映射；对端仍被 `admits` 准入（`unauthorized`）；`origin.sessionId` 必须是 Manager 当前记录的 Session 且 `isCurrentSession` 为真（`stale`）。返回 `{ok: true, record}` 或 `{ok: false, reason}`。 |
-| `registerAdapter({split, send, classify, check, accepts?, sendAttachment?})` | 以 `route` 作为 `resolve` 注册该账号的出站 Adapter（首片与每个后续分片前复核）；`check(record, target)` 追加协议条件，默认拒绝：只有明确返回 `{ok: true}` 才发送，`undefined`/`null`/其他值记为 `invalid-target`（拒绝原因不是小写代码时同样记为 `invalid-target`），抛出异常记为 `adapter-error`，均不调用 `send`；`send(route, text, info)` 与可选的 `sendAttachment(route, attachment, info)` 收到 `route.record`；不提供 `sendAttachment` 时附件消息返回 `unsupported`。每个接线一个。 |
+| `registerAdapter({split, send, classify, check, accepts?, sendAttachment?, acceptsActions?})` | 以 `route` 作为 `resolve` 注册该账号的出站 Adapter（首片与每个后续分片前复核）；`check(record, target)` 追加协议条件，默认拒绝：只有明确返回 `{ok: true}` 才发送，`undefined`/`null`/其他值记为 `invalid-target`（拒绝原因不是小写代码时同样记为 `invalid-target`），抛出异常记为 `adapter-error`，均不调用 `send`；`send(route, text, info)` 与可选的 `sendAttachment(route, attachment, info)` 收到 `route.record`；不提供 `sendAttachment` 时附件消息返回 `unsupported`；不提供 `acceptsActions` 或它不接受时带按钮的消息返回 `unsupported`（按钮随最后一个文字分片的 `info.actions` 交给 `send`）。每个接线一个。 |
 | `openInbound(deliver)` | 以本接线固定的平台、Adapter 与账号打开入站通道（语义同 `openInbound`）。每个接线一个。 |
 | `openCommands({prefixes, messages})` | 本账号的命令路由（Iteration 05，见下文），以本接线的 `admits` 准入，并在本接线入站通道的去重范围内 `claim` 每条命令消息。每个接线一个。 |
+| `openHITL({responder, render, labels?, approvalTimeoutMs?, questionTimeoutMs?, logger?})` | 本账号的 HITL Bridge（Iteration 06，见下文）。每个接线一个；`close()` 时一并关闭。 |
 | `target(record)` | Manager 记录的逻辑目标 `{platform, accountId, conversation: {type, id}}`，与入站标准消息的同名字段一致；scope 未映射时为 `undefined`。 |
 | `policy(record)` | Agent 的可选 Interaction 策略（原生 `agentPresets.serviceFor(agent, 'interactionPolicy')`）：`undefined`＝未启用，`null`＝查询失败：入站不按未启用处理，`handoff`/`submit` 返回 `not-delivered/interaction-unavailable` 且不创建原生输入（I/O 记为 `failed/before-handoff`，平台重投可再处理）；出站由调用方暂停该 Session 的 Interaction 输出。 |
 | `close()` | 关闭入站通道、注销出站 Adapter；之后交接返回 `closed`，排队的出站消息返回 `adapter-unavailable`。 |
@@ -172,6 +173,18 @@ message: {
 - **结果**：上传失败（平台未发出消息）为 `not-sent`；资源在发送时不再通过校验为 `not-sent/before-platform`；媒体消息请求超时/5xx 为 `unknown`，**不重发**；前面分片已发、后面失败为 `partial`。
 - **入站**：`attachments` 与 `quote: {id?, text?, attachments?}`（被引用消息）随标准消息冻结交给会话入口；纯附件消息合法（`text` 可为空串）。
 
+## HITL Bridge（Iteration 06）
+
+原生 Approval（`approval/request`）与 `userQuestions.ask()`（`user-questions/request`）仍是**唯一业务权威**：请求校验、审批策略（`never` 直接拒绝）、结果含义与审计事件都由原生服务决定。Bridge（`hitl.mjs`，本插件内部模块，ADR-054/057）只负责请求关联、展示、可信回应、取消、超时与状态清理：
+
+- **集中安装**：两个原生 waterfall 的监听器由本插件在第一个平台打开 Bridge 时以 `prepend` 注册一次，最后一个关闭时移除；没有 Bridge 时不注册任何监听器。请求的 Session 不属于某个已打开 Bridge 的当前、仍被准入的记录（`manager.findBySessionId` + `isCurrentSession` + `admits`）时调用 `next()`，交给原生 Web/Desktop 应答者，行为不变。不再修改全局 `userQuestions.ask`。
+- **展示**：每个提示是一条逻辑消息，经 `sendMessage()` 发往该 Session 的 Conversation（同 Conversation 顺序、每片前的当前 Session 与准入复核、逻辑 ID 去重、取消）。按钮是 `message.actions`：`{ref, options:[{value, label, doneLabel?, style?}]}`，最多 10 个选项，只能由 Bridge 用 I/O 内部的 `issueActions()` 签发（提供给其他插件的 `agentIO` 服务不含它）；自行构造的 actions 为 `not-sent/unauthorized`，与附件同用为 `unsupported`。按钮数据只含请求引用与选项值，不含目标、ID 或权限。
+- **审批**：两个按钮（允许一次/拒绝），结果为原生闭合集合 `allowed-once|rejected|cancelled|unavailable`。提示**被证明未送达**（`not-sent`，或按钮所在分片 `not-sent/skipped`）立即为 `unavailable`；结果**未知**时不重发按钮，继续等待真实点击直至超时（默认 5 分钟，超时 `cancelled`）。从不因展示失败或超时而批准，也不假定用户已看到。同一 Session 同时只开放一个审批，第二个为 `unavailable`。
+- **提问**：逐题推进，每题新引用（旧题按钮失效）与自己的取消控制：一题作答后，它尚未交给平台的提示分片不再发送（已在途的分片无法撤回），下一题不受影响；单选且有选项（≤10）时带按钮，多选/无选项/选项过多为纯文本；按钮被证明未送达时以纯文本重发一次，结果未知不重发。文本作答按编号、完全一致的选项名或自由文本解析。答案为 `{answers:[{id, selected, custom?}]}`。超时（QQ `askTimeoutMs`）发送超时提示（经 `sendMessage()`）并以原生 `UserQuestionError`/`ASK_ABORTED` 结束；中止、被新问题取代、Session 释放与关闭同样为 `ASK_ABORTED`（原生服务按名称恢复为自己的错误类）。
+- **可信回应**：`respond({conversation, sender, ref, value})`（平台按钮事件）与 `answer({conversation, sender, message:{id?, text}})`（平台文本）都要求：引用属于一个未完成的请求；Conversation 与请求展示处一致；操作者是 `responder(record)` 给出的预期作答者（QQ：私聊对端；群聊为触发该 Session 的发送者，群成员 ID 取自事件的 `group_member_openid`）；原生信号未中止；该 Session 仍是当前 Session 且仍被准入。伪造、重复、迟到、过期、跨会话与旧题回应一律拒绝；每个请求（每道题）只完成一次。文本作答在本接线入站通道的去重范围内认领消息：重投既不再次作答，也不会成为 Agent 输入；不满足条件的文本（他人、无待答问题、空文本）照常作为普通聊天输入。
+- **生命周期**：`waiting(record)` 供 Conversation Manager 延后轮换与 Interaction 判断等待用户；`cancel(record)` 在 Session 释放（轮换、移除、销毁）时取消该 Session 的请求；`close()`（Gateway 卸载）取消全部并移除监听器。所有 Pending、定时器、abort 监听与在途提示发送都随请求结束清理；状态只在进程内存，重启即取消。
+- **可选**：平台不打开 Bridge（QQ `hitl.enabled: false`）时，该平台 Session 的请求留给原生 Web/Desktop。
+
 ## 语义与边界
 
 - **顺序**：同一 `(platform, accountId, conversation)` 严格按提交顺序发送；不同 Conversation 或不同账号互不阻塞，并发有界。
@@ -183,7 +196,7 @@ message: {
 - **入站去重**：键为 `(platform, accountId, conversation.type, conversation.id, message.id)`，不同平台、账号或 Conversation 的同名 ID 互不影响；并发重复在首个到达时即登记，后到者直接 `duplicate`，不等待首次结果；若首次随后以 `failed/before-handoff` 结束，这次并发重复不会被补交，只有之后的再次投递会被处理。因此调用方若可能并发提交同一消息，应自行按 Conversation 串行（QQ 由 SDK 并发合并中间件保证，见下文）。`accepted`、`rejected` 与 `failed/unknown` 都记住；只有 `failed/before-handoff` 被释放以便平台重投。缺少平台消息 ID 时不去重，**绝不以正文哈希合并消息**。记录仅在进程内存，默认 24 小时（`inboundWindowMs`）、最多 4096 条（`rememberInbound`），处理中的条目不淘汰；超期、淘汰或进程重启后同一平台消息可能再次交接，**不提供持久 exactly-once**。
 - **入站信任**：I/O 只检查形状与范围，不授予 Owner、Memory 或工具权限；用户文本、显示名和 platformData 都不是授权依据。准入由平台中间件与会话入口（Host、Conversation Manager 及其包装，例如 Character Identity 的 Owner-only 检查）决定。
 - **诊断**：只在 debug 日志输出事件类别、平台、状态、原因代码、分片数与耗时；不写正文、ID、目标或凭据。
-- **不经本插件的发送**：命令回复（平台对该命令消息的协议回复）、审批/问答、Remote Ops 通知，以及 Character Identity 的历史提醒/通知 Outbox（各自的独立授权规则不变）仍走 Gateway Sender；上述普通聊天的当前 Session 检查不适用于它们。Interaction 气泡（Iteration 04）与 `qqbot_send_file` 文件（Iteration 05）已经由本插件发送。
+- **不经本插件的发送**：命令回复（平台对该命令消息的协议回复）、Remote Ops 通知，以及 Character Identity 的历史提醒/通知 Outbox（各自的独立授权规则不变）仍走 Gateway Sender；上述普通聊天的当前 Session 检查不适用于它们。Interaction 气泡（Iteration 04）、`qqbot_send_file` 文件（Iteration 05）以及审批提示、提问、下一题与提问超时提示（Iteration 06）已经由本插件发送。
 
 ## QQ Official Adapter
 
@@ -196,6 +209,7 @@ message: {
 - 分片：原 Markdown 分片器（`textChunkLimit`，默认 4500），超长单行再按上限切开且不拆代理对。
 - 错误：SDK `ApiError` 的 4xx（除 408）为 `not-sent`（429 为 `rate-limited`），状态 0（超时/网络）、408、5xx 及非 `ApiError` 为 `unknown`。
 - 基础 Media（Iteration 05）：同一 Adapter 提供 `accepts`/`sendAttachment`，只接受 `local` 资源（不让调用方借 QQ 抓取任意 URL）。Gateway 的 `sendMedia` 分两步：先复核资源（仍是自身真实路径、在 media 目录/cwd/`sendFile.extraRoots` 白名单内、是普通文件；否则 `invalid-resource`，不读取不上传），再以 `srv_send_msg: false` 上传（SDK 自带上传重试；只上传不会给用户显示任何内容，失败记为 `not-sent/upload-failed`），最后发送媒体消息（失败按上面的文本规则分类）。被动回复额度与以前的文件发送相同（不使用 event_id）。
+- HITL（Iteration 06）：同一 Adapter 提供 `acceptsActions`，把 Bridge 签发的按钮渲染为 QQ 键盘（每行 2 个、单选互斥分组、按钮文字超长截断，`permission.type: 2` 但只有预期作答者的点击被 Bridge 接受）；`hitlResponse(event)` 把 QQ 按钮事件转为标准回应（私聊取 `user_openid`，群聊取 `group_openid` 与 `group_member_openid`，缺少时不作为回应）。Gateway 的 `openQQHITL` 只提供 QQ Markdown 渲染（原审批/问答文本，问题另显示原生 `detail`）与超时提示；按钮事件以 `acknowledgeInteraction` 回 0（被接受）或 3。原 `ApprovalChannel`/`QuestionChannel`/`questionAnswer`/`button-utils` 不再被引用（恢复为上游内容，不在补丁中），也没有 Gateway 直发审批或问答的路径。
 - `qqbot_send_file`：目标只能是调用该工具的 Agent 所在的当前会话（`findByAgent`），`target` 参数仅为兼容保留，必须与当前会话一致，否则拒绝；路径白名单与符号链接解析保留，并在发送时再查一次。文件作为一条附件消息经 `sendMessage()` 发送，逻辑 ID `qq:<Session>:<Turn>:file:<真实路径哈希>`：同一轮内同一文件的重复调用（包括结果未知后的重试）得到第一次的结果，不会重发；只有被证明未发送（`not-sent`）后才以新 ID 重试。工具不再持有 QQ bot，也没有直接调用 `sendImage`/`sendFile` 的路径。
 
 QQ 插件现在原生 `inject` `agentIO`；未安装本插件时 Gateway 拒绝启动，不退回旧的直接发送路径。
@@ -213,7 +227,7 @@ QQ 插件现在原生 `inject` `agentIO`；未安装本插件时 Gateway 拒绝�
 
 ## QQ Official 入站
 
-QQ Gateway 启动时为该应用打开入站通道。SDK 中间件链先于 I/O 执行：自回声与消息 ID 去重（SDK 记住最多 1000 个 ID，超出后清除 5 秒前的记录，并非固定 5 秒窗口）、白名单/群聊禁用（accessPolicy）、群聊 @ 门控、内容清洗、限流、斜杠命令（Iteration 05 起由本插件的命令路由识别、认领与路由，QQ 的 `commandGate` 只做 @ 标记与群 @ 判断，命令本身的执行与授权不变；不再使用 SDK `slashCommand`，也不自动注册 `/help`）、待答问题截获、显式更正、并发合并、输入状态、引用解析、附件下载与 envelope 组装；Character Identity 的 Owner 准入中间件也在其后、I/O 之前。只有走到 `bot.on('message')` 的普通聊天消息才进入 I/O：
+QQ Gateway 启动时为该应用打开入站通道。SDK 中间件链先于 I/O 执行：自回声与消息 ID 去重（SDK 记住最多 1000 个 ID，超出后清除 5 秒前的记录，并非固定 5 秒窗口）、白名单/群聊禁用（accessPolicy）、群聊 @ 门控、内容清洗、限流、斜杠命令（Iteration 05 起由本插件的命令路由识别、认领与路由，QQ 的 `commandGate` 只做 @ 标记与群 @ 判断，命令本身的执行与授权不变；不再使用 SDK `slashCommand`，也不自动注册 `/help`）、HITL 文本作答（Iteration 06 起由本插件的 HITL Bridge 校验作答者并认领消息，QQ 的 `hitlAnswers` 只做 @ 标记清理）、显式更正、并发合并、输入状态、引用解析、附件下载与 envelope 组装；Character Identity 的 Owner 准入中间件也在其后、I/O 之前。只有走到 `bot.on('message')` 的普通聊天消息才进入 I/O：
 
 1. Adapter 标准化（`normalizeQQMessage`）：C2C 的 Conversation 为发送者；群为群 openid，发送者另记；消息 ID 为 QQ `msg_id`；附件与被引用消息（含其附件）转为基础 Media 描述——已下载的为 media 目录本地文件（逐个附件下载并按附件序号关联，不按文件名：同名或无名的附件各自对应自己的文件，下载失败的附件不会关联到别的文件），否则为 QQ 事件给出的 URL，语音带 ASR 文本，过长名称与含控制字符的引用被丢弃；原始 SDK 上下文只放 platformData。模型可见正文从这些描述组装，格式与以前相同（类型标签、`Image:`/`File:` 行、ASR、`[Reference attachments]`）。
 2. I/O 去重并交给会话入口 `deliverInbound`，它只做 QQ 部分：C2C 只能是发送者本人，组装回复目标，并在准入后用原有分层逻辑组装模型可见正文（引用、附件、语音、群历史）；其余由共享 `handoff` 完成——按同一访问配置再次准入（禁用的群范围不开放），经 Conversation Manager `getOrCreate`（保留 Session 创建/恢复/轮换与 Character 包装）得到当前 Session，创建原生 `UserMessage`；Interaction 启用且 Agent 运行中时走 `intervene()`，否则 `followup()`。交接后 QQ 侧清理群历史、保持 typing，未启用 Interaction 时仍等待本轮结束。显式更正（`更正：…`）同样经共享 `submit(record, text, {revise: true})`；`/stop`、更正与出站 Interaction 绑定都用同一 `conversation.policy()` 查询。
@@ -229,8 +243,8 @@ QQ Gateway 启动时为该应用打开入站通道。SDK 中间件链先于 I/O 
 npm test
 ```
 
-（在 QQTK 根目录；包括 `maintenance/agent-io.test.mjs` 的核心语义、`maintenance/commands.test.mjs` 的命令路由、`maintenance/qq-media.test.mjs` 的 QQ 基础 Media（真实临时文件、目录联接与 `qqbot_send_file`）、`maintenance/turn-controls.test.mjs` 的 Turn 取消控制器、`maintenance/conversation-io.test.mjs` 的 Conversation 接线（真实 Conversation Manager + 不含 QQ 代码的合成第二平台：隔离、冷恢复、轮换、关闭竞态、准入拒绝、去重、出站授权、Interaction）、`maintenance/qq-agent-io.test.mjs` 的 QQ 出站集成与 `maintenance/qq-inbound.test.mjs` 的 QQ 入站集成；QQ 测试经 `maintenance/qq-conversation-fixture.mjs` 执行 Gateway 自己的 `openConversation` 代码。）设置 `QQBOT_TEST_PROFILE=<验证 Profile>` 可额外用已安装的 Markdown 分片器与 SDK 中间件（访问控制、@ 门控、斜杠命令、合并）跑相应测试，否则这些项跳过。所有测试使用 Fake Adapter / 模拟 QQ Bot，不连接 QQ。
+（在 QQTK 根目录；包括 `maintenance/agent-io.test.mjs` 的核心语义、`maintenance/hitl.test.mjs` 的 HITL Bridge（Gateway 的接线、`openQQHITL`、QQ 键盘与按钮解码，原生 waterfall 调用约定）、`maintenance/commands.test.mjs` 的命令路由、`maintenance/qq-media.test.mjs` 的 QQ 基础 Media（真实临时文件、目录联接与 `qqbot_send_file`）、`maintenance/turn-controls.test.mjs` 的 Turn 取消控制器、`maintenance/conversation-io.test.mjs` 的 Conversation 接线（真实 Conversation Manager + 不含 QQ 代码的合成第二平台：隔离、冷恢复、轮换、关闭竞态、准入拒绝、去重、出站授权、Interaction）、`maintenance/qq-agent-io.test.mjs` 的 QQ 出站集成与 `maintenance/qq-inbound.test.mjs` 的 QQ 入站集成；QQ 测试经 `maintenance/qq-conversation-fixture.mjs` 执行 Gateway 自己的 `openConversation` 代码。）设置 `QQBOT_TEST_PROFILE=<验证 Profile>` 可额外用已安装的 Markdown 分片器与 SDK 中间件（访问控制、@ 门控、斜杠命令、合并）跑相应测试，否则这些项跳过。所有测试使用 Fake Adapter / 模拟 QQ Bot，不连接 QQ。
 
 ## 本轮未覆盖
 
-被 SDK 合并的非首条消息 ID 不进入 I/O 去重；Character Identity 入站证据中间件、问答与显式更正仍在 I/O 之前，各自只靠 SDK 消息 ID 去重（更正已用共享交接，但不经 I/O 入站去重；命令自 Iteration 05 起经 I/O 认领）；出站引用关联（`replyTo`）与远程 URL 附件；视觉理解等高级媒体工具仍为原实现；Remote Ops 启动时的 Owner 路由恢复与 Character Identity 的准入仍直接调用 Manager `getOrCreate`（不是 Agent 输入）；Interaction 气泡的持久发送状态与崩溃后恢复（重启后同一气泡不会被识别为重复）；审批/问答展示（06，仍走 Gateway Sender）；通知/提醒与其历史授权规则（07，Character Identity Outbox 未改）；QQ Personal 及其他平台；持久发送状态与崩溃恢复；真实 QQ 手机收件验收。
+被 SDK 合并的非首条消息 ID 不进入 I/O 去重；Character Identity 入站证据中间件与显式更正仍在 I/O 之前，只靠 SDK 消息 ID 去重（更正已用共享交接，但不经 I/O 入站去重；命令自 Iteration 05、HITL 文本作答自 Iteration 06 起经 I/O 认领）；出站引用关联（`replyTo`）与远程 URL 附件；视觉理解等高级媒体工具仍为原实现；Remote Ops 启动时的 Owner 路由恢复与 Character Identity 的准入仍直接调用 Manager `getOrCreate`（不是 Agent 输入）；Interaction 气泡的持久发送状态与崩溃后恢复（重启后同一气泡不会被识别为重复）；HITL 请求的持久状态与重启恢复（重启即取消）、同一 Session 并发的第二个审批（返回 `unavailable`）、真实 QQ 按钮与手机端验收；通知/提醒与其历史授权规则（07，Character Identity Outbox 未改）；QQ Personal 及其他平台；持久发送状态与崩溃恢复；真实 QQ 手机收件验收。

@@ -13,7 +13,7 @@ function outbound(policy,streaming=true,diagnostics){
  const body=source.slice(start,end);
  assert(body.includes('const outboundHandler'));assert(!body.includes('bootstrapGateway'));
  const sent=[],legacy=[],delivered=[],record={sessionKey:'fixture',sessionId:'fixture',agent:{},replyTarget:{scope:'c2c',targetId:'owner',msgId:'m1'},scope:'c2c',peerId:'owner'};
- const manager={getOrCreate:async()=>record,getSessionRecord:()=>record,isCurrentSession:r=>r===record,findBySessionId:()=>record,approvalChannel:{pending:new Map()},questionChannel:{pending:new Map()}};
+ const manager={getOrCreate:async()=>record,getSessionRecord:()=>record,isCurrentSession:r=>r===record,findBySessionId:()=>record,hitl:{open:new Set(),waiting(r){return this.open.has(r);}}};
  const sender={sendMarkdown:async(t,s)=>sent.push([t,s])};
  const io={sendMessage:async request=>{delivered.push(request);return {status:'sent',parts:[]};}};
  const conversation=wiring(io,manager,a=>{assert.equal(a,record.agent);return policy;});
@@ -36,7 +36,7 @@ test('QQ bridge delegates policy output once, keeps tool errors on ordered exter
  const f=outbound(p);for(const type of ['turn/start','assistant/chunk','assistant/message','tool/result','turn/end'])await f.handler(f.session,{type});
  assert.deepEqual(events,['turn/start','assistant/chunk','assistant/message','tool/result','turn/end']);assert.deepEqual(f.legacy,['turn/start','tool/result','turn/end']);assert.deepEqual(external.map(e=>e[0]),['tool error']);assert.equal(external[0][1].kind,'tool-or-error');
  assert.equal(f.sent.length,0);assert.equal(f.delivered.length,0);assert.equal(p.transport.openStream,undefined,'the bridge offers no stream');
- f.manager.approvalChannel.pending.set('fixture',{});assert(p.transport.waitingForUser());f.manager.approvalChannel.pending.clear();assert(!p.transport.waitingForUser());
+ f.manager.hitl.open.add(f.record);assert(p.transport.waitingForUser());f.manager.hitl.open.clear();assert(!p.transport.waitingForUser());
 });
 test('with streaming on or off, a policy bubble is one Unified I/O request and never a direct send',async()=>{
  for(const streaming of [true,false]){
@@ -66,7 +66,7 @@ function middleware(enabled=true){
  conversation.openInbound(()=>({status:'accepted'}));
  // The real command gate and Agent I/O command router; only the commands are stand-ins.
  const sandbox={buildCommandList:()=>[{name:'stop',handler:()=>events.push(['native-stop'])}],
-  questionAnswer:()=>async(c,next)=>{if(c.answerPending)events.push(['answer']);else await next();},
+  cacheMsgId(){},
   concurrencyGuard:()=>async(_c,next)=>{events.push(['merge']);await next();},getHistoryStore(){},historyGroupKey(){},
   accessPolicy:()=>async(c,next)=>{if(c.message.senderId==='owner')await next();else events.push(['blocked']);}
  };
@@ -74,13 +74,15 @@ function middleware(enabled=true){
  const setup=vm.runInNewContext(source+';setupMiddlewares;',sandbox);
  setup({use:f=>chain.push(f)},{access:{c2cMode:'allowlist',c2cAllow:['owner'],groupMode:'disabled',groupAllow:[]}},manager,{},conversation);
  let seq=0;
- const run=async(content,extra={})=>{const c={message:{content,kind:'c2c',senderId:'owner',messageId:'m'+(++seq),...extra.message},state:{},bot:{sendText:async()=>{}},stop(){this.stopped=true;},...extra};let i=0;const next=async()=>{if(i<chain.length)await chain[i++](c,next);else events.push(['inbound']);};await next();};
+ const run=async(content,extra={})=>{const c={message:{content,kind:'c2c',senderId:'owner',messageId:'m'+(++seq),...extra.message},replyTarget:{scope:'c2c',targetId:'owner',msgId:'m'+seq},state:{},bot:{sendText:async()=>{}},stop(){this.stopped=true;},...extra};let i=0;const next=async()=>{if(i<chain.length)await chain[i++](c,next);else events.push(['inbound']);};await next();};
  return {run,events,agent,manager,record};
 }
 test('explicit correction passes access and question guards but avoids merge and double followup',async()=>{
  const f=middleware();await f.run('更正：保留原文件');assert.deepEqual(f.events.map(e=>e[0]),['revise']);assert.equal(f.events[0][1].source.kind,'user');
  const denied=middleware();await denied.run('',{message:{kind:'c2c',senderId:'other',content:'更正：别执行'}});assert.deepEqual(denied.events.map(e=>e[0]),['blocked']);
- const pending=middleware();await pending.run('更正：答案',{answerPending:true});assert.deepEqual(pending.events.map(e=>e[0]),['answer']);
+ // An open question takes the owner's text first (the real HITL text gate; the Bridge is a stand-in here).
+ const pending=middleware();pending.manager.hitl={answer:input=>{pending.events.push(['answer',input.message.text]);return {status:'answered'};}};
+ await pending.run('更正：答案');assert.deepEqual(pending.events,[['answer','更正：答案']]);
 });
 test('ordinary ambiguous messages and disabled policy preserve merge; stop invokes native cancel path once',async()=>{
  for(const text of ['等等看','不对吧','请总结“更正：文本”']){const f=middleware();await f.run(text);assert.deepEqual(f.events.map(e=>e[0]),['merge','inbound']);}

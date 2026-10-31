@@ -148,9 +148,11 @@ function verify(dir = profile) {
   assert.equal(settings.patchedDependencies?.['@tencent-connect/qqbot-nodejs@1.0.5'],'patches/qqbot-nodejs@1.0.5.patch');
   const sdkManifest=JSON.parse(fs.readFileSync(path.join(__dirname,'sdk-upstream-1.0.5/manifest.json'),'utf8'));
   for(const file of Object.keys(sdkManifest.files))assert.equal(fs.readFileSync(path.join(dir,'node_modules/@tencent-connect/qqbot-nodejs',file),'utf8').replaceAll('\r\n','\n'),fs.readFileSync(path.join(__dirname,'sdk-src',file),'utf8').replaceAll('\r\n','\n'),`Installed SDK differs: ${file}`);
-  const channel = fs.readFileSync(path.join(dir,'node_modules/@tencent-connect/dsh-qqbot/dist/features/approval-channel.js'),'utf8');
-  assert(channel.includes('session.eventAt(seq)'), 'QQ approval patch is missing');
-  assert(channel.includes('button.n !== entry.nonce'), 'QQ approval replay protection is missing');
+  // Approval and questions go through the Agent I/O HITL Bridge; the replaced QQ channels must not be wired.
+  const gateway = fs.readFileSync(path.join(dir,'node_modules/@tencent-connect/dsh-qqbot/dist/gateway/bootstrap.js'),'utf8');
+  assert(gateway.includes('conversation.openHITL('), 'QQ HITL Bridge wiring is missing');
+  assert(!/ApprovalChannel|QuestionChannel/.test(gateway), 'A replaced QQ approval/question channel is still wired');
+  assert(fs.readFileSync(path.join(dir,'node_modules/@tencent-connect/dsh-qqbot/dist/transport/qq-text-adapter.js'),'utf8').includes('event.group_member_openid'), 'QQ HITL button operator check is missing');
   const sources=JSON.parse(fs.readFileSync(path.join(__dirname,'qqbot-upstream-0.5.2/manifest.json'),'utf8'));
   for(const file of Object.keys(sources.files)) {
     const deployed=fs.readFileSync(path.join(dir,'node_modules/@tencent-connect/dsh-qqbot',file),'utf8').replaceAll('\r\n','\n');

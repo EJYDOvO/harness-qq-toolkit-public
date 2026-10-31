@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import { parseAnswer } from "./answer-parser.js";
 import { buildKeyboard, formatQuestion } from "./question-renderer.js";
 import { decodeButtonData } from "./button-utils.js";
@@ -110,7 +109,7 @@ export class QuestionChannel {
         if (!data)
             return false;
         const button = decodeButtonData(data);
-        if (!button || button.t !== 'question' || button.n !== entry.nonce || event.user_openid !== entry.record.senderId)
+        if (!button || button.t !== 'question')
             return false;
         const current = entry.request.questions[entry.index];
         if (!current)
@@ -121,7 +120,7 @@ export class QuestionChannel {
             return false;
         const idx = button.i;
         const opts = current.options ?? [];
-        if (!Number.isInteger(idx) || idx < 0 || idx >= opts.length)
+        if (idx < 0 || idx >= opts.length)
             return false;
         this.advance(entry, record.sessionKey, { id: current.id, selected: [opts[idx].label] });
         return true;
@@ -144,9 +143,9 @@ export class QuestionChannel {
         const first = request.questions[0];
         if (!first)
             throw new Error('ask_user_question with empty questions');
+        await this.sendQuestion(record, first);
         return new Promise((resolve, reject) => {
-            const entry = { record, request, resolve, reject, index: 0, collected: [], nonce: randomUUID() };
-            this.pending.set(key, entry);
+            const entry = { record, request, resolve, reject, index: 0, collected: [] };
             if (request.signal) {
                 const onAbort = () => {
                     if (this.pending.get(key) !== entry)
@@ -159,8 +158,7 @@ export class QuestionChannel {
                 request.signal.addEventListener('abort', onAbort, { once: true });
             }
             entry.timer = setTimeout(() => this.onTimeout(key), this.config.askTimeoutMs);
-            if (request.signal?.aborted) { this.cancelPending(key); return; }
-            void this.sendQuestion(record, first, entry.nonce).catch(error => this.fail(entry, key, error));
+            this.pending.set(key, entry);
             this.logger.info(`im-qqbot: question sent to QQ, waiting for answer key=${key}`);
         });
     }
@@ -171,8 +169,12 @@ export class QuestionChannel {
         if (entry.index < entry.request.questions.length) {
             const next = entry.request.questions[entry.index];
             this.resetTimer(entry, key);
-            entry.nonce = randomUUID();
-            void this.sendQuestion(entry.record, next, entry.nonce).catch(err => this.fail(entry, key, err));
+            void this.sendQuestion(entry.record, next).catch((err) => {
+                this.pending.delete(key);
+                this.clearTimer(entry);
+                this.removeAbort(entry);
+                entry.reject(err instanceof Error ? err : new Error(String(err)));
+            });
             return;
         }
         this.pending.delete(key);
@@ -182,16 +184,9 @@ export class QuestionChannel {
         entry.resolve({ answers: entry.collected });
     }
     /** 发送单个问题：优先带按钮，按钮发送失败降级纯文本 */
-    fail(entry, key, error) {
-        if (this.pending.get(key) !== entry) return;
-        this.pending.delete(key);
-        this.clearTimer(entry);
-        this.removeAbort(entry);
-        entry.reject(error instanceof Error ? error : new Error(String(error)));
-    }
-    async sendQuestion(record, question, nonce) {
+    async sendQuestion(record, question) {
         const hint = record.scope === 'group' && this.config.requireMention === true;
-        const keyboard = buildKeyboard(question, nonce);
+        const keyboard = buildKeyboard(question);
         try {
             if (keyboard) {
                 try {

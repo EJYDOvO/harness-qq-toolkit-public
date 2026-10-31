@@ -36,7 +36,7 @@ test('a text message reaches the adapter once and multi-part sends stay one logi
 test('the core is platform-neutral: no SDK, Character or Interaction import',()=>{
  // Only the Host message constructor joins the plugin entry; the core and the
  // Conversation wiring import nothing beyond node:crypto.
- for(const [file,allowed] of [['io.mjs',['node:crypto']],['conversation.mjs',['./commands.mjs']],['commands.mjs',[]],['index.mjs',['@deepseek-ai/dsh-llm','./io.mjs','./conversation.mjs','./commands.mjs']]]){
+ for(const [file,allowed] of [['io.mjs',['node:crypto']],['conversation.mjs',['./commands.mjs','./hitl.mjs']],['commands.mjs',[]],['hitl.mjs',['node:crypto']],['index.mjs',['@deepseek-ai/dsh-llm','./io.mjs','./conversation.mjs','./commands.mjs','./hitl.mjs']]]){
   const imports=[...fs.readFileSync(new URL('../plugin-sources/dsh-agent-io/'+file,import.meta.url),'utf8').matchAll(/^import .* from '([^']+)'/gm)].map(m=>m[1]);
   assert(imports.every(i=>allowed.includes(i)),file+': '+imports);
  }

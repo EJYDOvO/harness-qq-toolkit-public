@@ -7,7 +7,6 @@ const profile=process.env.QQBOT_TEST_PROFILE || path.resolve('data/profiles/qqbo
 const moduleUrl=p=>pathToFileURL(path.join(profile,'node_modules/@tencent-connect/dsh-qqbot/dist',p)).href;
 const {setupMiddlewares}=await import(moduleUrl('gateway/middleware-setup.js'));
 const {registerSendFileTool}=await import(moduleUrl('media/send-file-tool.js'));
-const {QuestionChannel}=await import(moduleUrl('features/question-channel.js'));
 const logger={debug(){},info(){},warn(){},error(){}};
 const defaults={appId:'test',access:{c2cMode:'allowlist',c2cAllow:['owner-openid'],groupMode:'disabled',groupAllow:[]},historyLimit:10,requireMention:true,maxQueue:8,processingTimeoutMs:30000,media:{enabled:false}};
 function accessMiddleware(config){const middlewares=[];setupMiddlewares({use:m=>middlewares.push(m)},config,{},logger);return middlewares[2];}
@@ -43,48 +42,4 @@ test('file delivery rejects a junction escape and disabled/unknown recipients',a
   await assert.rejects(definition.execute({file_path:path.join(workspace,'ok.txt'),target:'c2c:stranger-openid'},{agent:{}}));
   assert.equal(sent.length,1);
   // Unlink the junction itself; never recursively traverse it during cleanup.
-});
-test('question cancellation during send settles immediately instead of waiting for timeout',async()=>{
-  let release;const sent=new Promise(r=>{release=r});
-  const record={sessionKey:'test',scope:'c2c',senderId:'owner-openid',replyTarget:{targetId:'owner-openid'}};
-  const q=new QuestionChannel({}, {sendMarkdown:()=>sent},{askTimeoutMs:5000},logger);
-  const controller=new AbortController();
-  const answer=q.askViaQQ(record,{signal:controller.signal,questions:[{id:'q',question:'test',options:[]}]});
-  const observed=answer.then(()=> 'answered',e=>e.code);
-  controller.abort();release();
-  const outcome=await Promise.race([observed,new Promise(r=>setTimeout(()=>r('hung'),60))]);
-  q.cancelPending('test');
-  assert.equal(outcome,'ASK_ABORTED');
-});
-test('question buttons accept only current nonce, initiating user and integer option; text fallback works',async()=>{
-  const record={sessionKey:'buttons',scope:'c2c',senderId:'owner-openid',replyTarget:{targetId:'owner-openid'}};
-  const sent=[];
-  const q=new QuestionChannel({getSessionRecord:()=>record},{sendMarkdown:async(...args)=>sent.push(args)},{askTimeoutMs:5000},logger);
-  const request={questions:[{id:'same-id',question:'test',options:[{label:'A'},{label:'B'}]}]};
-  const click=(button,user='owner-openid')=>q.handleInteraction({user_openid:user,data:{resolved:{button_data:JSON.stringify(button)}}});
-  const first=q.askViaQQ(record,request);
-  const button=JSON.parse(sent[0][2].keyboard.content.rows[0].buttons[0].action.data);
-  assert.equal(click({...button,n:'old'}),false);
-  assert.equal(click(button,'stranger'),false);
-  assert.equal(click({...button,i:0.5}),false);
-  assert.equal(click(button),true);
-  assert.deepEqual((await first).answers,[{id:'same-id',selected:['A']}]);
-  const second=q.askViaQQ(record,request);
-  assert.equal(click(button),false);
-  assert.equal(q.tryAnswer('c2c','owner-openid','2'),true);
-  assert.deepEqual((await second).answers,[{id:'same-id',selected:['B']}]);
-  assert.equal(q.pending.size,0);
-});
-test('late failure of superseded question cannot delete its replacement',async()=>{
-  const record={sessionKey:'replace',scope:'c2c',senderId:'owner-openid',replyTarget:{targetId:'owner-openid'}};
-  let fail;let count=0;
-  const q=new QuestionChannel({getSessionRecord:()=>record},{sendMarkdown:()=> ++count===1?new Promise((_,reject)=>{fail=reject}):Promise.resolve()},{askTimeoutMs:5000},logger);
-  const request={questions:[{id:'q',question:'test',options:[]}]};
-  const old=q.askViaQQ(record,request).catch(e=>e.code);
-  const current=q.askViaQQ(record,request);
-  assert.equal(await old,'ASK_ABORTED');
-  fail(Error('late delivery failure'));await new Promise(r=>setImmediate(r));
-  assert.equal(q.pending.size,1);
-  assert.equal(q.tryAnswer('c2c','owner-openid','answer'),true);
-  assert.equal((await current).answers[0].custom,'answer');
 });

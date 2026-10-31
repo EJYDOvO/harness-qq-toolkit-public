@@ -245,3 +245,73 @@ test('Q21 real SDK errors: a refused upload is not-sent, a timed-out media messa
  const o=await outside.send([{kind:'file',resource:{type:'local',path:path.join(elsewhere,'x.txt')}}]);
  assert.deepEqual([o.status,o.reason,o.stage],['not-sent','invalid-resource','before-platform']);assert.equal(outside.requests.length,0,'nothing read or uploaded');
 });
+
+// ── Iteration 06 HITL Bridge on the real SDK message code (synthetic HTTP client, no network) ──
+// QQBot is never constructed: its own send/sendMarkdown/acknowledgeInteraction
+// method bodies run on a real MessageApi behind the reviewed Gateway sender,
+// adapter registration, openQQHITL and interaction handler.
+const {createHITLHost}=await import('../../plugin-sources/dsh-agent-io/hitl.mjs');
+const {dispatchEvent}=await import(pathToFileURL(path.join(sdk,'protocol/gateway/event-dispatcher.js')));
+const botSource=fs.readFileSync(path.join(sdk,'QQBot.js'),'utf8').replaceAll('\r\n','\n');
+const method=(head,end)=>{const a=botSource.indexOf(head),b=botSource.indexOf(end,a);assert(a>=0&&b>a,head);return botSource.slice(a,b).trimEnd();};
+const botMethods=vm.runInNewContext('({'+[method('    async send(opts) {','\n    /**'),method('    async sendMarkdown(target, content, opts) {','\n    /**'),method('    async acknowledgeInteraction(interactionId, code = 0, data) {','\n    // ====')].join(',\n')+'})',{MsgType:{MARKDOWN:2}});
+const qqDist=file=>fs.readFileSync(path.join(qq,file),'utf8').replace(/^import .*;\r?\n/gm,'').replace(/^export (?=function)/gm,'');
+const openQQHITL=vm.runInNewContext(qqDist('features/approval-renderer.js')+'\n'+qqDist('features/question-renderer.js')+'\n'+slice('export function openQQHITL','/**').replace('export function','function')+';openQQHITL');
+const interactionHandler=slice("    bot.on('interaction', async (_iCtx, event) => {","    bot.on('error'");
+const {hitlResponse}=await import(new URL('../qqbot-src/dist/transport/qq-text-adapter.js',import.meta.url));
+function hitlFixture(t,{fail}={}){
+ const requests=[],creds={appId:'fixture',clientSecret:'dummy'},listeners=new Map();
+ const client={async request(_token,method,route,body){requests.push({method,route,body:structuredClone(body)});const f=fail?.(route,body);if(f)throw f;return {id:'synthetic-'+requests.length};}};
+ const bot=Object.assign(Object.create(botMethods),{creds,messageApi:new MessageApi(client,{getAccessToken:async()=>'synthetic-token'},{markdownSupport:true})});
+ const {sender}=makeSender(bot,undefined);
+ const sessions=new Map(),record=(scope,peer,senderId)=>{const r={scope,peerId:peer,senderId,sessionId:'s-'+scope+peer,agent:{id:'s-'+scope+peer,session:{seq:0,eventAt(){}}},replyTarget:{scope,targetId:peer,msgId:'in-'+peer}};sessions.set(scope+':'+peer,r);return r;};
+ const manager={getOrCreate:async()=>{throw Error('unused');},getSessionRecord:(s,p)=>sessions.get(s+':'+p),isCurrentSession:r=>sessions.get(r.scope+':'+r.peerId)===r,findBySessionId:id=>[...sessions.values()].find(r=>r.sessionId===id)};
+ const ctx={on(name,fn){listeners.set(name,fn);return ()=>listeners.delete(name);}};
+ const io=createAgentIO(),config={appId:'fixture',textChunkLimit:4500,askTimeoutMs:60_000,requireMention:true};
+ const conversation=createConversations(io,{createInput:m=>m,interactionPolicy:()=>undefined,hitl:createHITLHost(ctx)})({platform:'qq-official',adapter:'qq-official-gateway',accountId:'fixture',manager,scopes:{direct:'c2c',group:'group'},admits:()=>true});
+ t.after(()=>conversation.close());
+ conversation.openInbound(()=>({status:'accepted'}));
+ registerAdapter(conversation,config,text=>[text],sender,undefined,{delivery:()=>undefined},{effect(){}});
+ manager.hitl=openQQHITL(conversation,config,{warn(){},info(){}});
+ const handlers={};vm.runInNewContext(interactionHandler,{bot:{on:(n,fn)=>{handlers[n]=fn;},acknowledgeInteraction:(id,code)=>bot.acknowledgeInteraction(id,code)},cacheEventId(){},hitlResponse,manager});
+ // A raw INTERACTION_CREATE payload through the SDK dispatcher to the Gateway handler.
+ const press=async raw=>{const routed=dispatchEvent('INTERACTION_CREATE',raw,'fixture');assert.equal(routed.action,'interaction');await handlers.interaction({},routed.event);return requests.at(-1);};
+ const approve=r=>listeners.get('approval/request')({agent:r.agent,toolName:'bash'},()=>Promise.resolve('native'));
+ const ask=(r,questions)=>listeners.get('user-questions/request')({agent:r.agent,questions},()=>Promise.reject(Error('native')));
+ return {requests,record,press,approve,ask,manager};
+}
+const buttonData=body=>body.keyboard.content.rows.flatMap(r=>r.buttons).map(b=>b.action.data);
+const click=(id,fields,data)=>({id,version:1,type:11,...fields,data:{type:11,resolved:{button_data:data}}});
+test('Q22 an approval is one markdown message with a two-button keyboard replying to the input; the click is acknowledged once',async t=>{
+ const f=hitlFixture(t),owner=f.record('c2c','fixture-owner','fixture-owner');
+ const outcome=f.approve(owner);for(let i=0;i<10;i++)await micro();
+ const [prompt]=f.requests;
+ assert.equal(prompt.route,'/v2/users/fixture-owner/messages');assert.equal(prompt.body.msg_type,2);assert.equal(prompt.body.msg_id,'in-fixture-owner');
+ assert.match(prompt.body.markdown.content,/执行审批[\s\S]*bash/);
+ const [allow]=buttonData(prompt.body);
+ const ack=await f.press(click('evt-1',{scene:'c2c',user_openid:'fixture-owner'},allow));
+ assert.deepEqual([ack.method,ack.route,ack.body],['PUT','/interactions/evt-1',{code:0}]);
+ assert.equal(await outcome,'allowed-once');
+ const replay=await f.press(click('evt-2',{scene:'c2c',user_openid:'fixture-owner'},allow));
+ assert.deepEqual(replay.body,{code:3},'a repeated click is acknowledged as not handled and changes nothing');
+ assert.equal(f.requests.filter(r=>r.route.endsWith('/messages')).length,1);
+});
+test('Q23 a group approval counts only the expected member; an unknown prompt is not resent; refused buttons are never an approval',async t=>{
+ const g=hitlFixture(t),room=g.record('group','fixture-group','member-a');
+ const outcome=g.approve(room);for(let i=0;i<10;i++)await micro();
+ const [allow]=buttonData(g.requests[0].body);
+ assert.equal(g.requests[0].route,'/v2/groups/fixture-group/messages');
+ assert.deepEqual((await g.press(click('g1',{scene:'group',group_openid:'fixture-group',group_member_openid:'member-b'},allow))).body,{code:3});
+ assert.deepEqual((await g.press(click('g2',{scene:'group',group_openid:'fixture-group',group_member_openid:'member-a'},allow))).body,{code:0});
+ assert.equal(await outcome,'allowed-once');
+ const lost=hitlFixture(t,{fail:route=>route.endsWith('/messages')?new ApiError('timeout',0,route):undefined}),owner=lost.record('c2c','fixture-owner','fixture-owner');
+ const pending=lost.approve(owner);for(let i=0;i<20;i++)await micro();
+ assert.equal(lost.requests.length,1,'the keyboard message is never repeated after an unknown outcome');assert.equal(lost.manager.hitl.waiting(owner),true);
+ lost.manager.hitl.cancel(owner);assert.equal(await pending,'cancelled');
+ const refused=hitlFixture(t,{fail:(route,body)=>route.endsWith('/messages')&&body.keyboard?new ApiError('API Error 400 keyboard not allowed',400,route):undefined}),r=refused.record('c2c','fixture-owner','fixture-owner');
+ assert.equal(await refused.approve(r),'unavailable','a refused approval prompt is never an approval');
+ const answers=refused.ask(r,[{id:'q',question:'选哪个',options:[{label:'甲'},{label:'乙'}]}]);for(let i=0;i<20;i++)await micro();
+ assert.deepEqual(refused.requests.slice(1).map(x=>!!x.body.keyboard),[true,false],'refused question buttons fall back to text once');
+ assert.equal(refused.manager.hitl.answer({conversation:{type:'direct',id:'fixture-owner'},sender:{id:'fixture-owner'},message:{id:'in-answer',text:'2'}}).status,'answered');
+ assert.deepEqual((await answers).answers,[{id:'q',selected:['乙']}]);
+});

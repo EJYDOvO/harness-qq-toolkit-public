@@ -15,7 +15,8 @@ const notSent=(id,reason,stage='before-platform',parts=[])=>freeze({id,status:'n
 // What a logical message id stands for: its Conversation, text and attachments.
 // The same id with another fingerprint is a different message, never a retry.
 const fingerprint=request=>createHash('sha256').update(JSON.stringify([request.target.conversation.type,request.target.conversation.id,request.message.text??'',
- (request.message.attachments??[]).map(a=>[a.kind,a.name??'',a.resource.type,a.resource.path??a.resource.url])])).digest('hex');
+ (request.message.attachments??[]).map(a=>[a.kind,a.name??'',a.resource.type,a.resource.path??a.resource.url]),
+ request.message.actions?[request.message.actions.ref,request.message.actions.options.map(o=>o.value)]:null])).digest('hex');
 
 const INBOUND_KEYS=new Set(['conversation','message','sender','timestamp','platformData']);
 // Basic media (ADR-057): an attachment is a descriptor. `resource` is the trusted
@@ -27,6 +28,14 @@ export const ATTACHMENT_KINDS=Object.freeze(['image','voice','video','file']);
 const OUTBOUND_ATTACHMENT_KEYS=new Set(['kind','name','contentType','size','resource']);
 const INBOUND_ATTACHMENT_KEYS=new Set([...OUTBOUND_ATTACHMENT_KEYS,'transcript']);
 const reference=value=>typeof value==='string'&&value.length>0&&value.length<=4096&&!/[\u0000-\u001f]/.test(value);
+// Interaction actions (HITL, ADR-054): one choice the platform shows as buttons
+// under the message text. Only the HITL Bridge of this package issues them
+// (issueActions, not part of the provided service): a Host plugin or the model
+// cannot put an approval or answer button on a message. A chosen option comes
+// back to the Bridge as a platform event, never as chat input.
+const ACTION_REF=/^[A-Za-z0-9_-]{8,64}$/,ACTION_VALUE=/^[A-Za-z0-9_-]{1,16}$/,ACTION_STYLES=['primary','secondary','danger'];
+const label=value=>typeof value==='string'&&value.trim().length>0&&value.length<=64;
+export const MAX_ACTION_OPTIONS=10;
 function attachmentProblem(a,keys,{required,maxText}){
  if(!a||typeof a!=='object'||Array.isArray(a))return 'invalid-message';
  if(Object.keys(a).some(k=>!keys.has(k)))return 'unsupported';
@@ -52,6 +61,22 @@ export function createAgentIO(options={}){
  let pending=0,active=0,closed=false;const running=new Set();
  const channels=new Map(),received=new Map(),inboundWindow=options.inboundWindowMs??86_400_000,rememberInbound=options.rememberInbound??4096;
  const adapterKey=(platform,accountId)=>JSON.stringify([platform,accountId]);
+ const issued=new WeakSet();
+
+ /** {ref, options:[{value, label, doneLabel?, style?}]} → frozen actions the I/O accepts on a message. */
+ function issueActions(spec){
+  const options=spec?.options;
+  if(!ACTION_REF.test(spec?.ref??'')||!Array.isArray(options)||!options.length||options.length>MAX_ACTION_OPTIONS)throw Error('Invalid actions');
+  const values=new Set();
+  const frozen=options.map(o=>{
+   if(!ACTION_VALUE.test(o?.value??'')||values.has(o.value)||!label(o.label)||(o.doneLabel!==undefined&&!label(o.doneLabel))||(o.style!==undefined&&!ACTION_STYLES.includes(o.style)))throw Error('Invalid action option');
+   values.add(o.value);
+   return Object.freeze({value:o.value,label:o.label,...(o.doneLabel===undefined?{}:{doneLabel:o.doneLabel}),...(o.style===undefined?{}:{style:o.style})});
+  });
+  const actions=Object.freeze({ref:spec.ref,options:Object.freeze(frozen)});
+  issued.add(actions);
+  return actions;
+ }
 
  function registerAdapter(adapter){
   if(closed)throw Error('Agent I/O closed');
@@ -70,7 +95,13 @@ export function createAgentIO(options={}){
   if(!target||!text(target.platform)||!text(target.accountId)||!conversation||!['direct','group'].includes(conversation.type)||!text(conversation.id))return 'invalid-target';
   if(!request.origin||typeof request.origin!=='object')return 'unauthorized';
   if(!message||typeof message!=='object')return 'invalid-message';
-  if(Object.keys(message).some(k=>k!=='text'&&k!=='attachments'))return 'unsupported';
+  if(Object.keys(message).some(k=>!['text','attachments','actions'].includes(k)))return 'unsupported';
+  // Actions only as issued by the Bridge, under a text, never with attachments.
+  if(message.actions!==undefined){
+   if(!issued.has(message.actions))return 'unauthorized';
+   if(message.attachments!==undefined)return 'unsupported';
+   if(typeof message.text!=='string'||!message.text.trim())return 'invalid-message';
+  }
   const attachments=message.attachments;
   if(attachments!==undefined){
    if(!Array.isArray(attachments)||!attachments.length)return 'invalid-message';
@@ -151,7 +182,10 @@ export function createAgentIO(options={}){
    if(typeof current.adapter.sendAttachment!=='function')return notSent(id,'unsupported');
    for(const a of attachments){let ok;try{ok=current.adapter.accepts?current.adapter.accepts(a)===true:true;}catch{ok=false;}if(!ok)return notSent(id,'unsupported');}
   }
-  const parts=[...texts.map(value=>({text:value})),...attachments.map((attachment,n)=>({attachment,n}))];
+  // Actions go with the last text part; the adapter must be able to show them.
+  const actions=request.message.actions;
+  if(actions){let ok;try{ok=current.adapter.acceptsActions?.(actions)===true;}catch{ok=false;}if(!ok)return notSent(id,'unsupported');}
+  const parts=[...texts.map((value,n)=>({text:value,...(actions&&n===texts.length-1?{actions}:{})})),...attachments.map((attachment,n)=>({attachment,n}))];
   const done=[];let failure;
   for(let index=0;index<parts.length;index++){
    if(index>0){
@@ -160,9 +194,9 @@ export function createAgentIO(options={}){
     const stop=closed?'closed':cancelled()?'cancelled':(current=check()).reason;
     if(stop){failure={status:'skipped',reason:stop};break;}
    }
-   const part=parts[index],media=part.attachment?{attachment:part.n}:{};
+   const part=parts[index],media=part.attachment?{attachment:part.n}:part.actions?{actions:true}:{};
    try{
-    const info={messageId:id,index,count:parts.length};
+    const info={messageId:id,index,count:parts.length,...(part.actions?{actions:part.actions}:{})};
     const receipt=part.attachment?await current.adapter.sendAttachment(current.route,part.attachment,info):await current.adapter.send(current.route,part.text,info);
     done.push({index,status:'sent',...media,...(text(receipt?.receipt)?{receipt:receipt.receipt}:{}),...(text(receipt?.uploaded)?{uploaded:receipt.uploaded}:{})});
    }catch(error){
@@ -173,7 +207,7 @@ export function createAgentIO(options={}){
     break;
    }
   }
-  for(let index=done.length;index<parts.length;index++)done.push({index,status:'skipped',...(parts[index].attachment?{attachment:parts[index].n}:{})});
+  for(let index=done.length;index<parts.length;index++)done.push({index,status:'skipped',...(parts[index].attachment?{attachment:parts[index].n}:parts[index].actions?{actions:true}:{})});
   if(!failure)return freeze({id,status:'sent',parts:done});
   const sent=done.some(p=>p.status==='sent');
   // An unknown part makes the whole message unknown: it must not be resent.
@@ -313,5 +347,5 @@ export function createAgentIO(options={}){
   channels.clear();received.clear();
  }
 
- return Object.freeze({sendMessage,registerAdapter,openInbound,close});
+ return Object.freeze({sendMessage,registerAdapter,openInbound,issueActions,close});
 }

@@ -20,7 +20,7 @@ function factory(home,clock,durable=new Map()){
  const timers=new Set(),IdleEvictor=vm.runInNewContext(source('session/idle-evictor.js')+';IdleEvictor;',{Date:Clock,setInterval:fn=>{timers.add(fn);return fn;},clearInterval:t=>timers.delete(t)});
  const Manager=vm.runInNewContext(source('session/session-manager.js')+';SessionManager;',{ModelResolver,IdleEvictor,SessionPersistenceNotFoundError,SessionId:x=>x,buildForkSeed:(rows,boundary)=>structuredClone(rows.slice(0,boundary+1)),createHash,randomUUID,Date:Clock,structuredClone,process:{cwd:()=>home}});
  const events=new Map();let reminders=[];const ctx={on(n,fn){events.set(n,fn);return()=>events.delete(n);},get(name){if(name==='agentPresets')return {async resolve(id){if(id==='broken')throw Error('broken preset');return {id:id??'fixture'};},async mount(){}};if(name==='sessionPersistence')return {async open(id,access){assert.equal(access,'read');if(!durable.has(id))throw new SessionPersistenceNotFoundError(id);return {header:durable.get(id).meta,read:async()=>({events:durable.get(id).events}),close:async()=>{}};}};if(name==='schedule')return {async list(){return reminders;}};if(name==='sessions')return {async flush(session){durable.set(session.header.id,{meta:{agentPreset:session.header.agentPreset},events:structuredClone(session.events)});return true;}};}};
- const config={appId:'fixture-app',preset:'fixture',cwd:home,sessionIdleTimeout:1,sessionLifecycle:{enabled:true,freshOnHostRestart:true,inactivityMs:43200000}};let manager;config.adapter={key:(scope,peer)=>'qqbot:'+config.appId+':'+scope+':'+peer,lifecycleScope:scope=>scope==='c2c',acceptActivity:(scope,peer,sender,id)=>peer===sender,isUserInput:t=>!!t?.msgId,inputId:t=>t?.msgId,waitingForUser:r=>!!(manager.questionChannel?.pending.has(r.sessionKey)||manager.approvalChannel?.pending.has(r.sessionKey))};manager=new Manager(ctx,agents,config,{info(){},warn(){},debug(){}});
+ const config={appId:'fixture-app',preset:'fixture',cwd:home,sessionIdleTimeout:1,sessionLifecycle:{enabled:true,freshOnHostRestart:true,inactivityMs:43200000}};let manager;config.adapter={key:(scope,peer)=>'qqbot:'+config.appId+':'+scope+':'+peer,lifecycleScope:scope=>scope==='c2c',acceptActivity:(scope,peer,sender,id)=>peer===sender,isUserInput:t=>!!t?.msgId,inputId:t=>t?.msgId,waitingForUser:r=>manager.hitl?.waiting(r)===true};manager=new Manager(ctx,agents,config,{info(){},warn(){},debug(){}});
  const get=id=>manager.getOrCreate('c2c','owner','owner',{scope:'c2c',targetId:'owner',msgId:id});
  return {manager,get,config,events,live,durable,options,disposed,creates:()=>creates,setReminders:rows=>reminders=rows};
 }
@@ -120,10 +120,11 @@ test('12h idle is based on admitted user messages, distinct from Agent eviction'
 test('running work, inbox, approval and question wait prevent both eviction and rotation',async()=>{
  for(const blocker of ['running','inbox','approval','question']){const f=fixture(),old=await f.get('first');f.clock.now+=43200001;old.lastActivity=0;
   if(blocker==='running')old.agent.status='running';if(blocker==='inbox')old.agent.inbox.hasPending=true;
-  f.manager.approvalChannel={pending:new Map(),cancelPending(){}};f.manager.questionChannel={pending:new Map(),cancelPending(){}};
-  if(blocker==='approval')f.manager.approvalChannel.pending.set(old.sessionKey,{});if(blocker==='question')f.manager.questionChannel.pending.set(old.sessionKey,{});
+  // The HITL Bridge holds an approval or a question for the Session.
+  const open=new Set();f.manager.hitl={waiting:r=>open.has(r.sessionKey),cancel(){}};
+  if(blocker==='approval'||blocker==='question')open.add(old.sessionKey);
   f.manager.evictor.check();assert.equal(f.manager.size,1);assert.equal((await f.get('while-blocked')).sessionId,old.sessionId);assert(!old.agent.cancelled);
-  old.agent.status='idle';old.agent.inbox.hasPending=false;f.manager.approvalChannel.pending.clear();f.manager.questionChannel.pending.clear();assert.notEqual((await f.get('after-release')).sessionId,old.sessionId);await f.manager.disposeAll();}
+  old.agent.status='idle';old.agent.inbox.hasPending=false;open.clear();assert.notEqual((await f.get('after-release')).sessionId,old.sessionId);await f.manager.disposeAll();}
 });
 test('uncompleted durable input delays restart rotation, but ordinary settled history does not',async()=>{
  const f=fixture(),old=await f.get('first');old.agent.session.events.push({type:'turn/start',data:{turn:1}});await f.manager.ctx.get('sessions').flush(old.agent.session);await f.manager.disposeAll();
