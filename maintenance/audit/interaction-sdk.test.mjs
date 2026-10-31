@@ -315,3 +315,33 @@ test('Q23 a group approval counts only the expected member; an unknown prompt is
  assert.equal(refused.manager.hitl.answer({conversation:{type:'direct',id:'fixture-owner'},sender:{id:'fixture-owner'},message:{id:'in-answer',text:'2'}}).status,'answered');
  assert.deepEqual((await answers).answers,[{id:'q',selected:['乙']}]);
 });
+
+// ── Iteration 07 Notification on the real SDK message code (synthetic HTTP client, no network) ──
+test('Q24 a notification is one markdown message to the stable target: proactive without an input, cached passive id within quota; real errors are classified',async t=>{
+ const run=async({fail,cached}={})=>{
+  const requests=[],creds={appId:'fixture',clientSecret:'dummy'};
+  const client={async request(_token,method,route,body){requests.push({method,route,body:structuredClone(body)});const f=fail?.(route);if(f)throw f;return {id:'synthetic-'+requests.length};}};
+  const bot=Object.assign(Object.create(botMethods),{creds,messageApi:new MessageApi(client,{getAccessToken:async()=>'synthetic-token'},{markdownSupport:true})});
+  const {sender}=makeSender(bot,undefined);
+  const manager={getOrCreate:async()=>{throw Error('unused');},getSessionRecord:()=>undefined,isCurrentSession:()=>false};
+  const io=createAgentIO(),config={appId:'fixture',textChunkLimit:4500};
+  const conversation=createConversations(io,{createInput:m=>m,interactionPolicy:()=>undefined})({platform:'qq-official',adapter:'qq-official-gateway',accountId:'fixture',manager,scopes:{direct:'c2c',group:'group'},admits:(s,p)=>s==='c2c'&&p==='fixture-owner'});
+  t.after(()=>conversation.close());
+  registerAdapter(conversation,config,text=>[text],sender,undefined,{delivery:()=>undefined},{effect(){}});
+  if(cached)cacheMsgId('c2c','fixture-owner',cached);
+  const notifier=conversation.openNotifications();
+  const result=await notifier.send({id:'notify:fixture',conversation:{type:'direct',id:'fixture-owner'},text:'[提醒到期]\n喝水',authorize:()=>true});
+  return {result,requests};
+ };
+ const proactive=await run();
+ assert.equal(proactive.result.status,'sent');assert.equal(proactive.requests.length,1,'one message, no Session required');
+ assert.equal(proactive.requests[0].route,'/v2/users/fixture-owner/messages');assert.equal(proactive.requests[0].body.msg_type,2);
+ assert.equal(proactive.requests[0].body.markdown.content,'[提醒到期]\n喝水');assert.equal(proactive.requests[0].body.msg_id,undefined,'no input: a proactive push');
+ const passive=await run({cached:'cached-input-id'});
+ assert.equal(passive.requests[0].body.msg_id,'cached-input-id','a recent input id is reused within the passive quota, as the former direct notification send did');
+ const timeout=await run({fail:route=>new ApiError('timeout',0,route)});
+ assert.deepEqual([timeout.result.status,timeout.requests.length],['unknown',1],'a timed-out notification is unknown and the request is not repeated');
+ const server=await run({fail:route=>new ApiError('API Error 502',502,route)});assert.equal(server.result.status,'unknown');
+ const refused=await run({fail:route=>new ApiError('API Error 403',403,route)});
+ assert.deepEqual([refused.result.status,refused.result.stage],['not-sent','platform']);
+});

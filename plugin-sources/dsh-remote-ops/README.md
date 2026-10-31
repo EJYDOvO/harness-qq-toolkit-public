@@ -41,9 +41,9 @@ stateDirectory/jobs 下的 result.json 可接入现有维护通知（action/ok/r
 
 `qqRemoteOps.attach(runtime)` 返回 detach，拒绝同时绑定两个 Gateway。运行中添加/删除插件后应重载 QQ Gateway 或重启 Profile。`/ops feature remoteOps off` 关闭监控；`/ops feature notifications off` 关闭通知。停用不删除账本。
 
-发送前持久记录 sending；未知结果不盲目重放，sent 只代表 API 成功。Character Adapter 可提供 notifyEvent 送入其 outbox；普通项目直接使用同一 Gateway 的 Sender。
+每个事件只有一个发送方：与 Character 集成时（`notifyEvent`）只由 Character 的持久 Outbox 发送，账本只记事件键与 Outbox 返回的状态；独立运行时经 Gateway 交来的 Agent I/O 通知器（`runtime.notifications`）发送，目标为固定的所有者私聊，并在发送前复核仍是本次附加与所有者。两者都没有时不发送（`not-sent`，`notifications-unavailable`），不再直接调用 Gateway Sender。发送前先持久记录 `sending`（写入失败则不发送）；进程中断留下的 `sending` 永不重放。状态：`sent`（只代表平台 API 接受）、`not-sent`、`partial`、`unknown`（不重发）、`pending`（Character Outbox 仍在投递）、`suppressed`；旧账本中的 `failed` 是此前版本对任何错误的记录，保留不改。
 
 更新前备份配置、状态和旧安装包，固定依赖及补丁哈希，独立 Profile 验证后单活切换。基础 QQ 审批/问答不经过本插件。启动仅恢复 Owner Session，不自动执行模型请求；/new 不迁移旧提醒，应先管理原提醒。
 ## Interaction 兼容
 
-当前源码版本 `1.1.1-test.1`，已配套 Character test.10 部署。目标 Agent 存在可选 Interaction 服务时让出普通等待提示，保留维护、超时、故障与任务完成通知；原生流式帧更新活动时间。旧 `1.1.0` 恢复包未被覆盖。详见 [适配说明](../../docs/INTERACTION.md)。
+当前源码版本 `1.1.1-test.2`（Iteration 07：通知只经 Agent I/O 通知器或 Character Outbox，未部署；运行实例为 `1.1.1-test.1`，与新 Character 兼容）。`1.1.1-test.1` 曾配套 Character test.10 部署。目标 Agent 存在可选 Interaction 服务时让出普通等待提示，保留维护、超时、故障与任务完成通知；原生流式帧更新活动时间。旧 `1.1.0` 恢复包未被覆盖。详见 [适配说明](../../docs/INTERACTION.md)。

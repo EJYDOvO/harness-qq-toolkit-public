@@ -13,13 +13,29 @@ export function apply(ctx,config){
   const persist=()=>atomic(outFile,JSON.stringify(ledger,null,2));
   const allowed=c=>c.message.kind==='c2c'&&c.message.senderId===owner.openid;
   const saveHealth=(connected,detail)=>atomic(path.join(state,'qq-health.json'),JSON.stringify({connected,detail,at:Date.now(),pid:process.pid}));
+  // Exactly one sender per event. With Character, its durable Outbox owns the
+  // delivery (notifyEvent) and this ledger only records the key and the Outbox
+  // status; standalone, the Gateway's Agent I/O notifier sends it. There is no
+  // direct Gateway send. The key is persisted before any send: a crash leaves
+  // 'sending', which is never replayed. Statuses: sent | not-sent | partial |
+  // unknown | pending (Character Outbox still delivering) | suppressed; older
+  // ledgers may hold 'failed' (any error before this version).
   async function notify(key,text){
-    if(!runtime||ledger.deliveries[key])return;
+    const value=runtime;
+    if(!value||ledger.deliveries[key])return;
     if(!remote.features().notifications.enabled){ledger.deliveries[key]={status:'suppressed',at:Date.now()};persist();return;}
-    // Persist before sending. A crash with status=sending is ambiguous and never auto-replayed.
     ledger.deliveries[key]={status:'sending',at:Date.now()};persist();
-    try{if(runtime.notifyEvent){await runtime.notifyEvent({eventId:'qqtk:'+key,kind:key.startsWith('job:')?'maintenance_result':key.startsWith('timeout:')?'task_timeout':key.startsWith('complete:')?'task_completed':key.startsWith('failed:')?'task_failed':'configured_alert',text});}else{await runtime.sender.sendMarkdown({scope:'c2c',targetId:owner.openid},text);}ledger.deliveries[key].status='sent';}
-    catch{ledger.deliveries[key].status='failed';}
+    const kind=key.startsWith('job:')?'maintenance_result':key.startsWith('timeout:')?'task_timeout':key.startsWith('complete:')?'task_completed':key.startsWith('failed:')?'task_failed':'configured_alert';
+    let result;
+    try{
+     if(value.notifyEvent)result=await value.notifyEvent({eventId:'qqtk:'+key,kind,text});
+     else if(value.notifications)result=await value.notifications.send({id:'qqtk:'+key,conversation:{type:'direct',id:owner.openid},text,
+      // Re-checked before the send: still this attachment and still the pinned Owner.
+      authorize:target=>runtime===value&&target.type==='direct'&&target.id===owner.openid});
+     else result={status:'not-sent',reason:'notifications-unavailable'};
+    }catch(error){result={status:typeof error?.status==='string'?error.status:'unknown'};}
+    ledger.deliveries[key].status=typeof result?.status==='string'?result.status:'unknown';
+    if(typeof result?.reason==='string')ledger.deliveries[key].reason=result.reason;
     persist();
   }
   async function tick(){if(busy||!runtime)return;busy=true;try{

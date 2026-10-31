@@ -2,6 +2,8 @@
 
 为 DeepSeek Harness 提供 **QQ 接入兼容补丁、可选 Remote Ops 插件和维护工具**。普通 DSH Agent 可以独立使用 QQ 接入，不需要 Character Agent、角色 Preset 或记忆插件。
 
+**Iteration 07（源码，未部署）：** Notification：Agent I/O `0.1.0-test.7` 新增通知发送通道 `conversation.openNotifications()`——发往稳定 Conversation，不要求当前 Session，改由访问配置与通知方自己的 `authorize(target)` 在每个分片前复核；与聊天共用同一 Conversation 队列。Gateway 只把通知器交给 Remote Ops（及经其包装的 Character Identity）。Remote Ops `1.1.1-test.2` 独立运行时经通知器发送并如实记录 sent/not-sent/partial/unknown（不再直接调用 Sender，也不再把一切错误记为 failed）；与 Character 集成时只由 Character 的持久 Outbox 发送，同一事件不会有第二个发送方。`notifications.enabled: false` 可关闭。真实 QQ 通知与手机端未验收。
+
 **Iteration 06（已授权部署，Agent I/O test.6，2026-11-01）：** HITL Bridge：Agent I/O `0.1.0-test.6` 新增内部 HITL Bridge（`conversation.openHITL()`），以原生 `approval/request` 与 `user-questions/request` waterfall 集中接收 QQ Session 的审批与提问（不再修改全局 `userQuestions.ask`），审批提示、提问、下一题与超时提示经 `sendMessage()` 发送，按钮由 Bridge 签发（`message.actions`，其他调用方不能构造）。回应须来自同一 Conversation 的预期作答者、请求仍未完成且 Session 仍为当前并被准入；展示被证明失败时审批为 `unavailable`，结果未知不重发。QQ 只保留 Markdown 渲染、键盘与按钮事件转换；原审批/问答通道与直发路径已删除。可用 `hitl.enabled: false` 关闭（交回原生 Web/Desktop）。真实 QQ 按钮与手机端未验收。
 
 **Iteration 05（已授权部署，Agent I/O test.5，已由 Iteration 06 取代）：** Commands 与基础 Media 抽离：Agent I/O `0.1.0-test.5` 新增 I/O 内部命令路由（识别、解析、在入站去重范围内一次性认领、路由；执行与授权仍由命令所属插件负责），QQ 的 `/stop`、`/bot-*`、会话命令与 Remote Ops `/ops` 改经该路由（位置仍在并发合并之前，不再用 SDK `slashCommand`）；消息契约新增可选附件描述（图片、语音、视频、文件，区分可信资源与模型可见内容），QQ 入站附件/引用改为标准描述，`qqbot_send_file` 改经 `sendMessage()` 发送（只能发往当前会话，上传与消息分阶段分类，结果未知不重发）。同时修复 Turn 取消控制器的容量淘汰（有在途消息的控制器不再被淘汰）。详见 [Agent I/O](plugin-sources/dsh-agent-io/README.md)。

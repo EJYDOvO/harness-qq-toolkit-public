@@ -2,6 +2,11 @@ import test from 'node:test';import assert from 'node:assert/strict';import fs f
 import {apply} from '../plugin-sources/dsh-remote-ops/index.js';
 import {PrefsStore} from '../plugin-sources/dsh-conversation-manager/preferences.mjs';
 
+// Stand-in for the Gateway's Agent I/O notifier: the target must pass the sender's
+// own authorization, and the result is an Agent I/O SendResult.
+function notifier(sent,{result=()=>({status:'sent'})}={}){
+ return {calls:[],send(request){this.calls.push(request);if(request.authorize({type:request.conversation.type,id:request.conversation.id})!==true)return Promise.resolve({status:'not-sent',reason:'unauthorized'});sent.push(request.text);return Promise.resolve(result(request));}};
+}
 test('explicit Host state paths isolate preferences for the same application and peer',t=>{
  const old=process.env.DSH_HOME,root=fs.mkdtempSync(path.resolve('tmp/qq-home-isolation-'));t.after(()=>{if(old===undefined)delete process.env.DSH_HOME;else process.env.DSH_HOME=old;});
  const fileA=path.join(root,'a','conversations.json'),fileB=path.join(root,'b','conversations.json');
@@ -26,7 +31,7 @@ test('long task progress is deduplicated and timeout stops the QQ task tree',asy
  t.mock.method(Date,'now',()=>now);t.mock.method(globalThis,'setInterval',f=>{tick=f;return 1;});t.mock.method(globalThis,'clearInterval',()=>{});
  apply({agents:{get:()=>({status:'running'})},on:(_,f)=>event=f,provide:(_,v)=>service=v,effect:f=>cleanup.push(f())},{root});
  t.after(()=>cleanup.forEach(f=>f()));
- service.attach({config:{access:{c2cMode:'allowlist',c2cAllow:['owner']}},bot:{on(){}},manager:{getOrCreate:async()=>{},findBySessionId:()=>true},sender:{sendMarkdown:async(_,text)=>sent.push(text)}});
+ service.attach({config:{access:{c2cMode:'allowlist',c2cAllow:['owner']}},bot:{on(){}},manager:{getOrCreate:async()=>{},findBySessionId:()=>true},sender:{sendMarkdown:async()=>{throw Error('no direct Gateway send');}},notifications:notifier(sent)});
  event({header:{id:'qq'}},{type:'turn/start',data:{turn:1}});
  const poll=async()=>{tick();for(let i=0;i<4;i++)await new Promise(r=>setImmediate(r));};
  now+=121000;await poll();await poll();assert.equal(sent.length,1);assert.match(sent[0],/仍在执行/);
@@ -66,7 +71,7 @@ test('Interaction owns generic hang-on while native frames keep Remote Ops activ
  t.mock.method(Date,'now',()=>now);t.mock.method(globalThis,'setInterval',f=>{tick=f;return 1;});t.mock.method(globalThis,'clearInterval',()=>{});
  apply({agents:{get:()=>agent},get:n=>n==='agentPresets'?{serviceFor:()=>({contractVersion:1})}:undefined,on:(n,f)=>events.set(n,f),provide:(_n,v)=>service=v,effect:f=>clean.push(f())},{ownerId:'owner',stateDirectory:state});
  t.after(()=>clean.forEach(f=>f()));
- service.attach({config:{access:{c2cMode:'allowlist',c2cAllow:['owner']}},manager:{sessions:new Map(),getOrCreate:async()=>{},findBySessionId:()=>true},bot:{on(){},off(){}},sender:{sendMarkdown:async(_t,text)=>sent.push(text)}});
+ service.attach({config:{access:{c2cMode:'allowlist',c2cAllow:['owner']}},manager:{sessions:new Map(),getOrCreate:async()=>{},findBySessionId:()=>true},bot:{on(){},off(){}},sender:{sendMarkdown:async()=>{throw Error('no direct Gateway send');}},notifications:notifier(sent)});
  events.get('session/event')({header:{id:agent.id}},{type:'turn/start',data:{turn:1}});
  now+=400000;events.get('agent/assistant-stream')({agent,frame:{type:'chunk'}});tick();for(let i=0;i<4;i++)await new Promise(r=>setImmediate(r));
  assert.equal(sent.length,0,'No duplicate progress and no false stale alert while streaming');
