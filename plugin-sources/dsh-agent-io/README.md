@@ -1,6 +1,6 @@
 # DSH Agent I/O（Unified Agent I/O）
 
-独立、平台无关的 Host 插件，提供统一聊天出站接口 `sendMessage()`、入站通道 `openInbound()`、连接 Conversation Manager 的 `openConversation()`，以及其内部的命令路由、基础附件契约与 HITL Bridge。当前源码 `0.1.0-test.6`：架构路线的 **Iteration 01：普通文本出站**、**Iteration 02：普通聊天入站**、**Iteration 03：Conversation Manager 统一 I/O 接线**、**Iteration 05：Commands / 基础 Media** 与 **Iteration 06：HITL Bridge**（见 Character 仓库 `docs/architecture-planning/IMPLEMENTATION_ROADMAP.md`）。运行实例为随 Iteration 05 授权部署的 `0.1.0-test.5`；test.6 仅源码与隔离验证，**未部署**，真实 QQ 按钮/手机验收待完成；实例版本以仓库根 README 为准。验证基线为 DSH `0.2.1-rc.3`、Node 24。
+独立、平台无关的 Host 插件，提供统一聊天出站接口 `sendMessage()`、入站通道 `openInbound()`、连接 Conversation Manager 的 `openConversation()`，以及其内部的命令路由、基础附件契约与 HITL Bridge。当前源码 `0.1.0-test.6`：架构路线的 **Iteration 01：普通文本出站**、**Iteration 02：普通聊天入站**、**Iteration 03：Conversation Manager 统一 I/O 接线**、**Iteration 05：Commands / 基础 Media** 与 **Iteration 06：HITL Bridge**（见 Character 仓库 `docs/architecture-planning/IMPLEMENTATION_ROADMAP.md`）。运行实例为随 Iteration 06 于 2026-11-01 授权部署的 `0.1.0-test.6`，真实 QQ 按钮/手机验收待完成；实例版本以仓库根 README 为准。验证基线为 DSH `0.2.1-rc.3`、Node 24。
 
 它只做逻辑消息的交接语义：出站的校验、同 Conversation 串行、取消与分片间复核、同一逻辑消息去重、诚实的结果；入站的标准消息交接、按平台消息范围去重与交接结果；以及平台无关的 Session 接线（Manager 取得/校验当前 Session、原生 `UserMessage`、Interaction 交接、出站可信路由）。平台协议（回复目标、限额、分片、API 错误、事件解析与标准化）由各平台 Adapter 负责；准入与权限仍属 Host；Session 与路由仍由原生 DSH 和 [Conversation Manager](../dsh-conversation-manager/README.md) 负责。不依赖 QQ SDK、Character、Interaction 或 Conversation Manager 包（只使用平台传入的 Manager 句柄），原生消息构造取自 Host 提供的 `@deepseek-ai/dsh-llm`；不注册模型工具、RPC 或路由；不持久化任何状态。
 
