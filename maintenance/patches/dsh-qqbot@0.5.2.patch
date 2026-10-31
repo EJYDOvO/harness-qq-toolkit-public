@@ -543,7 +543,7 @@ index c4998d0..71ed35a 100644
 \ No newline at end of file
 +//# sourceMappingURL=index.js.map
 diff --git a/dist/gateway/bootstrap.js b/dist/gateway/bootstrap.js
-index 070f21e..e6dcf90 100644
+index 070f21e..8df31d2 100644
 --- a/dist/gateway/bootstrap.js
 +++ b/dist/gateway/bootstrap.js
 @@ -1,6 +1,12 @@
@@ -605,11 +605,16 @@ index 070f21e..e6dcf90 100644
  /**
   * interaction 统一分发器：按 button_data 的顶层 `t` 判别字段，路由到对应
   * channel（question / approval）。QQ 只有一个 interaction 入口，集中路由
-@@ -30,8 +74,142 @@ function dispatchInteraction(event, manager) {
+@@ -30,8 +74,143 @@ function dispatchInteraction(event, manager) {
          return manager.approvalChannel?.handleInteraction(event) ?? false;
      return false;
  }
 +// Reusable transport wiring, separately testable without creating a QQ gateway.
++// Every QQ chat message (Interaction bubbles and hang-on lines, plain replies,
++// tool results, turn errors) is one logical message for the Unified Agent I/O,
++// which owns ordering, cancellation between parts, the route check before every
++// part, duplicate suppression and an honest result. There is no direct
++// sendMarkdown or SDK stream path for chat output here.
 +export function createInteractionOutbound(ctx, manager, sender, config, logger, toolsRegistry, diagnostics, io, conversation) {
 +    // The Agent's Interaction policy from the shared Conversation wiring (the
 +    // same lookup the inbound handoff uses); null means the lookup failed.
@@ -620,39 +625,9 @@ index 070f21e..e6dcf90 100644
 +        const targets=record.interactionTargets??=new Map();targets.delete(message.id);targets.set(message.id,{...record.replyTarget});
 +        while(targets.size>100)targets.delete(targets.keys().next().value);
 +    };
-+    const targetFor=(record,meta,fallback)=>{const own=typeof meta?.input==='string'?record.interactionTargets?.get(meta.input):undefined;return own?{...own}:fallback;};
 +    // QQ side of an admitted Interaction input (the shared handoff calls the
 +    // policy itself): resume output and remember the input's reply target.
 +    manager.trackInteractionInput=(record,message)=>{record.interactionSuppressed=false;rememberTarget(record,message);};
-+    const limit = Math.max(100, Math.min(4500, config.textChunkLimit ?? 4500));
-+    function pieces(text) {
-+        const parts=[];
-+        while(text.length){let end=Math.min(limit,text.length);if(end<text.length&&/[\uD800-\uDBFF]/u.test(text[end-1]))end--;parts.push(text.slice(0,end));text=text.slice(end);}
-+        return parts;
-+    }
-+    function boundedStream(target,meta) {
-+        let stream, latest='', cancelled=false;
-+        return {
-+            async update(text) {
-+                if(cancelled)return;
-+                latest=text;
-+                const first=pieces(text)[0];if(first===undefined)return;
-+                stream??=sender.openStream(target,meta);
-+                await stream.update(first);
-+            },
-+            async complete(){
-+                // Overflow remains buffered until durable assistant settlement.
-+                const parts=pieces(latest);
-+                for(let i=0;i<parts.length;i++){
-+                    if(cancelled)return;
-+                    if(i>0){stream=sender.openStream(target,meta);await stream.update(parts[i]);}
-+                    if(cancelled)return;
-+                    await stream?.complete();
-+                }
-+            },
-+            cancel(){cancelled=true;stream?.cancel?.();}
-+        };
-+    }
 +    // Native Turn lifecycle per Session (bounded). Output not yet handed to the
 +    // platform is cancelled by /stop, by a Turn that ends aborted/interrupted,
 +    // and stays cancelled for late output of that Turn, without Session rotation.
@@ -670,29 +645,45 @@ index 070f21e..e6dcf90 100644
 +        else if(event?.type==='turn/end'&&['aborted','interrupted'].includes(event.data?.reason?.kind))turnControl(sessionId,event.data?.turn)?.abort();
 +    }
 +    manager.cancelOutput=record=>{for(const control of turns.get(record?.sessionId)?.values()??[])control.abort();};
++    // Logical messages being handed over, by id: the QQ text adapter reads the
++    // reply target of the input a bubble answers and its diagnostic fields.
++    const deliveries=new Map();
++    async function submit(record,text,{id,input,turn,signal,delivery}){
++        if(!io){logger.error?.('im-qqbot: output withheld: Unified Agent I/O unavailable');return {id,status:'not-sent',reason:'adapter-unavailable',parts:[]};}
++        const signals=[turnControl(record.sessionId,turn)?.signal,signal].filter(s=>s instanceof AbortSignal);
++        const own=typeof input==='string'?record.interactionTargets?.get(input):undefined;
++        const mine=id!==undefined&&!deliveries.has(id);if(mine)deliveries.set(id,{target:own&&{...own},input:typeof input==='string'?input:undefined,delivery});
++        try{return await io.sendMessage({...(id?{id}:{}),target:conversation.target(record),origin:{sessionId:record.sessionId},message:{text},...(signals.length?{signal:signals.length>1?AbortSignal.any(signals):signals[0]}:{})});}
++        finally{if(mine)deliveries.delete(id);}
++    }
++    // Logical id of an Interaction message: the native Session and Turn, the
++    // policy instance, its reply and bubble numbers and the kind. A repeated
++    // submission of one bubble maps to the same id; two bubbles never do.
++    const epochs=new WeakMap();
++    function bubbleId(record,policy,meta){
++        if(!['assistant','status'].includes(meta?.kind)||!Number.isSafeInteger(meta.reply)||!Number.isSafeInteger(meta.bubble))return undefined;
++        let epoch=epochs.get(policy);if(!epoch){epoch=randomUUID().slice(0,8);epochs.set(policy,epoch);}
++        return `qq:${record.sessionId}:${Number.isSafeInteger(meta.turn)?meta.turn:'-'}:${epoch}:${meta.reply}.${meta.bubble}:${meta.kind}`;
++    }
 +    // Static text of the original outbound router (replies without an Interaction
 +    // policy, tool results, turn errors). With a policy it stays on the policy's
-+    // ordered external channel; otherwise the whole logical message goes to the
-+    // Unified Agent I/O, which re-checks the route when it sends. The QQ text
-+    // adapter chunks it; there is no direct sendMarkdown path left here.
++    // ordered external channel; otherwise it goes to the Unified Agent I/O directly.
 +    async function deliverText(record, text, tag, origin) {
 +        try {
 +            const policy = policyFor(record);
 +            if(policy===null)return;
-+            if(policy?.transport){for(const part of chunkMarkdownText(text, config.textChunkLimit ?? 4500))await policy.external(part, { kind: 'tool-or-error' });return;}
-+            if(!io){logger.error?.(`im-qqbot: ${tag} withheld: Unified Agent I/O unavailable`);return;}
 +            // Logical id from the trusted native event (Session id + durable seq +
 +            // kind): a repeated event or settlement maps to the same id, two
 +            // legitimate messages with equal text never do. No id is invented.
 +            const id=Number.isSafeInteger(origin?.seq)&&['assistant','tool','turn-error'].includes(origin.kind)?`qq:${record.sessionId}:${origin.seq}:${origin.kind}`:undefined;
-+            const signal=turnControl(record.sessionId,origin?.turn)?.signal;
-+            const result=await io.sendMessage({...(id?{id}:{}),target:conversation.target(record),origin:{sessionId:record.sessionId},message:{text},...(signal?{signal}:{})});
++            if(policy?.transport){await policy.external(text, { kind: 'tool-or-error', ...(id?{logicalId:id}:{}), ...(Number.isSafeInteger(origin?.turn)?{turn:origin.turn}:{}) });return;}
++            const result=await submit(record,text,{id,turn:origin?.turn,delivery:{kind:origin?.kind==='assistant'?'assistant':'tool-or-error'}});
 +            if(result.duplicate)logger.debug?.(`im-qqbot: ${tag} duplicate suppressed`);
 +            else if(result.status!=='sent')logger.warn?.(`im-qqbot: ${tag} ${result.status}${result.reason?` (${result.reason})`:''}`);
 +        }
 +        catch { logger.error?.(`im-qqbot: ${tag} delivery failed`); }
 +    }
-+    const legacyOutbound = createOutboundHandler(manager, { openStream: (...args) => sender.openStream(...args), deliverText }, config, logger, toolsRegistry);
++    const legacyOutbound = createOutboundHandler(manager, { deliverText }, config, logger, toolsRegistry);
 +    const outboundHandler = (session, event) => {
 +        observeTurn(session.header.id, event);
 +        const record = manager.findBySessionId(session.header.id);
@@ -713,16 +704,26 @@ index 070f21e..e6dcf90 100644
 +                }
 +            }
 +            if(record.interactionSuppressed)return;
-+            const target = { ...record.replyTarget };
 +            if(['turn/start','turn/end','assistant/message'].includes(event.type))trace('host-event',{seq:event.seq,turn:event.data?.turn});
-+            policy.bind({ key: manager, requireIngress: true, deliveryReceipts:true,trace,sendText: async (text,meta) => {const to=targetFor(record,meta,target);for(const part of pieces(text)){if(meta?.cancelled?.())return;await sender.sendMarkdown(to, part,{delivery:{...scope,...meta}});meta?.onDelivered?.();}},
-+                waitingForUser: () => manager.approvalChannel?.pending.has(record.sessionKey) || manager.questionChannel?.pending.has(record.sessionKey),
-+                ...(config.streaming && target.scope === 'c2c' && target.msgId ? { openStream: meta => boundedStream(targetFor(record,meta,target),{...scope,...meta}) } : {}) });
++            // The policy commits complete bubbles; each is one logical message.
++            // Only 'sent' resolves: anything else is reported with its delivery
++            // state, and the policy never resends an unconfirmed bubble.
++            policy.bind({ key: manager, requireIngress: true, trace, sendText: async (text,meta={}) => {
++                    const kind=['assistant','status','tool-or-error'].includes(meta.kind)?meta.kind:'assistant';
++                    if(meta.cancelled?.()===true)throw Object.assign(new Error('QQ output cancelled'),{delivery:'not-sent',reason:'cancelled'});
++                    const result=await submit(record,text,{id:typeof meta.logicalId==='string'?meta.logicalId:bubbleId(record,policy,meta),input:meta.input,turn:meta.turn,signal:meta.signal,
++                        delivery:{...scope,kind,...Object.fromEntries(['turn','reply','bubble'].filter(k=>Number.isSafeInteger(meta[k])).map(k=>[k,meta[k]]))}});
++                    if(result.status==='sent')return result;
++                    if(result.reason!=='cancelled')logger.warn?.(`im-qqbot: interaction ${kind} ${result.status}${result.reason?` (${result.reason})`:''}`);
++                    throw Object.assign(new Error('QQ output '+result.status),{delivery:result.status,reason:result.reason});
++                },
++                waitingForUser: () => manager.approvalChannel?.pending.has(record.sessionKey) || manager.questionChannel?.pending.has(record.sessionKey) });
 +            policy.event(event);
 +            if (['assistant/chunk', 'assistant/message'].includes(event.type)) return;
 +        }
 +        return legacyOutbound(session, event);
 +    };
++    outboundHandler.delivery=id=>typeof id==='string'?deliveries.get(id):undefined;
 +    return outboundHandler;
 +}
  export async function bootstrapGateway(ctx, agents, config, logger) {
@@ -748,7 +749,7 @@ index 070f21e..e6dcf90 100644
      // ── 初始化 QQ Bot SDK ──
      const userAgent = buildUserAgent();
      const bot = new QQBot({
-@@ -45,8 +223,10 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+@@ -45,8 +224,10 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
      });
      logger.info(`QQBot SDK initialized (UA: ${userAgent})`);
      // ── 中间件链 ──
@@ -761,7 +762,7 @@ index 070f21e..e6dcf90 100644
      bot.on('message', async (mCtx) => {
          const msg = mCtx.message;
          // 记录最近 msgId，供无上下文的出站发送（文件发送显式 target、主动推送等）获取被动回复目标
-@@ -54,7 +234,7 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+@@ -54,7 +235,7 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
          if (config.debug) {
              logger.debug(`← message (post-middleware): ${JSON.stringify(msg, null, 2).slice(0, 500)}`);
          }
@@ -770,60 +771,49 @@ index 070f21e..e6dcf90 100644
      });
      // ── 出站：dsh session/event → QQ 消息 ──
      // 获取 tools 服务（工具结果结构化展示），可选
-@@ -68,17 +248,47 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
-     // 发送适配器：将 QQBot 实例适配为 QQBotSender（openStream 参数形态不同）。
+@@ -65,20 +246,31 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+     catch {
+         toolsRegistry = undefined;
+     }
+-    // 发送适配器：将 QQBot 实例适配为 QQBotSender（openStream 参数形态不同）。
++    // 发送适配器：将 QQBot 实例适配为 QQBotSender（只保留静态 Markdown；聊天输出不再使用 SDK 流式消息）。
      // sendMarkdown 统一做被动回复限额管控：同一 msgId 超限/过期时降级主动推送。
      const replyLimiter = new ReplyLimiter({ limit: 4 });
 +    const diagnostics=typeof deliveryRecorder==='undefined'?null:deliveryRecorder;
      const sender = {
 -        sendMarkdown: (target, content, opts) => sendResolvedMarkdown(bot, resolveReplyTarget(target, replyLimiter, true), content, opts),
 -        openStream: (target) => bot.openStream({
+-            target: {
+-                scope: target.scope,
+-                targetId: target.targetId,
+-                msgId: target.msgId,
+-            },
+-        }),
 +        sendMarkdown: async (target, content, opts) => {
 +            const resolved=resolveReplyTarget(target, replyLimiter, true),meta=opts?.delivery??{},fields={...meta,input:diagnostics?.hash(resolved.msgId??resolved.eventId),length:content.length,textHash:diagnostics?.hash(content),passive:!!(resolved.msgId||resolved.eventId)};
 +            diagnostics?.trace('static-request',fields);
 +            try{const result=await sendResolvedMarkdown(bot,resolved,content,opts);diagnostics?.trace('static-receipt',{...fields,receipt:diagnostics?.hash(result?.id),missingReceipt:!result?.id});return result;}
 +            catch(error){diagnostics?.trace('static-failure',{...fields,httpStatus:error?.httpStatus,bizCode:error?.bizCode});throw error;}
 +        },
-+        openStream: (target,meta={}) => {
-+            const resolved=resolveReplyTarget(target, replyLimiter, false);
-+            const fields={...meta,input:diagnostics?.hash(resolved.msgId),stream:diagnostics?.hash(randomUUID()),passive:!!resolved.msgId};
-+            diagnostics?.trace('stream-open',fields);
-+            if(!resolved.msgId){
-+                let text='',cancelled=false;
-+                return {async update(value){text=value;},async complete(){if(!cancelled){let result;try{result=await sendResolvedMarkdown(bot,resolved,text);}catch(error){diagnostics?.trace('fallback-failure',{...fields,length:text.length,httpStatus:error?.httpStatus,bizCode:error?.bizCode});throw error;}diagnostics?.trace('fallback-receipt',{...fields,length:text.length,textHash:diagnostics?.hash(text),receipt:diagnostics?.hash(result?.id)});meta.onDelivered?.();}},cancel(){cancelled=true;diagnostics?.trace('stream-cancel',fields);}};
-+            }
-+            const stream=bot.openStream({
-             target: {
-                 scope: target.scope,
-                 targetId: target.targetId,
--                msgId: target.msgId,
-+                msgId: resolved.msgId,
-             },
--        }),
-+        });
-+            stream.observe?.(event=>{
-+                diagnostics?.trace('stream-'+event.type,{...fields,index:event.index,msgSeq:event.msgSeq,state:event.state,retry:event.retry,associated:!!event.streamMsgId,association:diagnostics?.hash(event.streamMsgId),length:event.text?.length,textHash:diagnostics?.hash(event.text),receipt:diagnostics?.hash(event.receiptId),missingReceipt:event.type==='receipt'&&!event.receiptId,httpStatus:event.httpStatus,bizCode:event.bizCode});
-+                if(event.type==='receipt')meta.onDelivered?.();
-+            });
-+            return stream;
-+        },
      };
 -    const outboundHandler = createOutboundHandler(manager, sender, config, logger, toolsRegistry);
++    // Optional Agent policy. No Character, Remote Ops or policy package dependency.
++    const outboundHandler = createInteractionOutbound(ctx, manager, sender, config, logger, toolsRegistry,deliveryRecorder, io, conversation);
 +    // Unified Agent I/O text adapter for this application, behind the shared
-+    // route check. It reuses the sender above for reply targets, passive-reply
-+    // quota and diagnostics.
++    // route check: the only QQ chat output path. It reuses the sender above for
++    // reply targets, passive-reply quota and diagnostics; an Interaction bubble
++    // answers the reply target of its own input.
 +    const releaseTextAdapter = conversation.registerAdapter(createQQTextAdapter({
 +        limit: config.textChunkLimit ?? 4500,
 +        split: text => chunkMarkdownText(text, config.textChunkLimit ?? 4500),
-+        send: (target, text, info) => sender.sendMarkdown(target, text, { delivery: { session: diagnostics?.hash(info.sessionId), index: info.index } }),
++        replyTarget: (_record, messageId) => outboundHandler.delivery(messageId)?.target,
++        send: (target, text, info) => sender.sendMarkdown(target, text, { delivery: { ...outboundHandler.delivery(info.messageId)?.delivery, session: diagnostics?.hash(info.sessionId), index: info.index } }),
 +    }));
 +    ctx.effect(() => releaseTextAdapter);
-+    // Optional Agent policy. No Character, Remote Ops or policy package dependency.
-+    const outboundHandler = createInteractionOutbound(ctx, manager, sender, config, logger, toolsRegistry,deliveryRecorder, io, conversation);
      ctx
          .on('session/event', outboundHandler);
      // ── 问答通道（ask_user_question → QQ 文本 + 按钮） ──
-@@ -89,6 +299,10 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+@@ -89,6 +281,10 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
      const approvalChannel = new ApprovalChannel(manager, sender, logger);
      manager.approvalChannel = approvalChannel;
      approvalChannel.install(ctx);
@@ -834,7 +824,7 @@ index 070f21e..e6dcf90 100644
      // ── 按钮点击回调（interaction）：统一分发到问答/审批通道 ──
      bot.on('interaction', async (_iCtx, event) => {
          // scope/targetId 推导对齐消息事件（inbound.ts）：按 scene 判定类型，群用 group_openid，私聊用 user_openid
-@@ -146,11 +360,12 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+@@ -146,11 +342,12 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
          bot.start().catch((err) => {
              logger.error(`Bot start failed: ${err instanceof Error ? err.message : String(err)}`);
          });
@@ -1749,12 +1739,15 @@ index 1006265..b4f9629 100644
 \ No newline at end of file
 +//# sourceMappingURL=inbound.js.map
 diff --git a/dist/config.js b/dist/config.js
-index cc39029..0259b71 100644
+index cc39029..d47f4d4 100644
 --- a/dist/config.js
 +++ b/dist/config.js
-@@ -22,6 +22,11 @@ export const ConfigSchema = Schema.object({
+@@ -20,8 +20,13 @@ export const ConfigSchema = Schema.object({
+     groupPrompt: Schema.string().description('群聊额外system prompt'),
+     directPrompt: Schema.string().description('私聊额外system prompt'),
      textChunkLimit: Schema.number().default(4500).description('单条消息最大字符数'),
-     streaming: Schema.boolean().default(true).description('是否启用流式输出（群聊始终不启用）'),
+-    streaming: Schema.boolean().default(true).description('是否启用流式输出（群聊始终不启用）'),
++    streaming: Schema.boolean().default(true).description('已停用，仅为兼容旧配置保留：QQ 普通聊天统一经 Unified Agent I/O 静态发送，不再使用 SDK 流式消息'),
      sessionIdleTimeout: Schema.number().default(30 * 60 * 1000).description('会话闲置超时(ms)'),
 +    sessionLifecycle: Schema.object({
 +        enabled: Schema.boolean().default(false),
@@ -1780,15 +1773,24 @@ index cc39029..0259b71 100644
 \ No newline at end of file
 +//# sourceMappingURL=config.js.map
 diff --git a/dist/transport/outbound.js b/dist/transport/outbound.js
-index f50e4b2..587e63e 100644
+index f50e4b2..7539e60 100644
 --- a/dist/transport/outbound.js
 +++ b/dist/transport/outbound.js
-@@ -1,4 +1,3 @@
+@@ -1,5 +1,3 @@
 -import { chunkMarkdownText } from "./chunker.js";
- import { OutboundBuffer } from "./outbound-buffer.js";
+-import { OutboundBuffer } from "./outbound-buffer.js";
  import { formatToolResult } from "./tool-presenter.js";
  import { parseEvent, extractTurnError, } from "./events.js";
-@@ -30,21 +29,31 @@ class OutboundRouter {
+ /** 不展示给用户的轮次错误码（底层传输/网络错误，对用户无意义，且常被重试兜住） */
+@@ -8,7 +6,6 @@ const SILENT_TURN_ERROR_CODES = new Set(['STREAM_CLOSED']);
+  * 出站路由器：持有会话级状态，按事件类型分发到处理器
+  */
+ class OutboundRouter {
+-    buffers = new Map();
+     toolCalls = new Map();
+     manager;
+     bot;
+@@ -30,47 +27,37 @@ class OutboundRouter {
          const record = this.manager.findBySessionId(session.header.id);
          if (record === undefined)
              return;
@@ -1797,18 +1799,20 @@ index f50e4b2..587e63e 100644
 +        const origin = { seq: raw.seq, turn: raw.data?.turn };
          switch (event.type) {
              case 'assistant/chunk':
-                 this.onChunk(session.header.id, record, event);
+-                this.onChunk(session.header.id, record, event);
++                // Not a settlement: the reply is sent only from its settled
++                // assistant/message (current Hosts publish deltas on
++                // agent/assistant-stream instead, and an abandoned attempt
++                // settles none). Accumulated deltas may be partial, repeated
++                // across retries or joined differently from the final blocks.
                  break;
              case 'assistant/message':
 -                this.onMessage(session.header.id, record, event);
 +                // A partial settled because the Turn was cancelled (/stop, removal)
 +                // is not delivered: cancellation stops output that has not started.
-+                if (raw.data?.interrupted === true) {
-+                    this.buffers.get(session.header.id)?.cancel();
-+                    this.buffers.delete(session.header.id);
++                if (raw.data?.interrupted === true)
 +                    break;
-+                }
-+                this.onMessage(session.header.id, record, event, origin);
++                this.onMessage(record, event, origin);
                  break;
              case 'tool/call':
                  this.onToolCall(event);
@@ -1823,29 +1827,44 @@ index f50e4b2..587e63e 100644
                  break;
          }
      }
-@@ -64,10 +73,10 @@ class OutboundRouter {
-             && !!record.replyTarget.msgId;
-     }
-     /** 完整 assistant 消息：有流式 buffer 则 flush，否则直接发送文本块 */
+-    /** 流式文本增量：累积到会话 buffer */
+-    onChunk(sessionId, record, event) {
+-        let buffer = this.buffers.get(sessionId);
+-        if (buffer === undefined) {
+-            buffer = new OutboundBuffer(record, this.bot, this.config.textChunkLimit, this.logger, this.shouldStream(record));
+-            this.buffers.set(sessionId, buffer);
+-        }
+-        buffer.append(event.text);
+-    }
+-    /** 是否启用流式：配置开启 + c2c + 有 msgId（群聊不支持流式） */
+-    shouldStream(record) {
+-        return this.config.streaming
+-            && record.replyTarget.scope === 'c2c'
+-            && !!record.replyTarget.msgId;
+-    }
+-    /** 完整 assistant 消息：有流式 buffer 则 flush，否则直接发送文本块 */
 -    onMessage(sessionId, record, event) {
-+    onMessage(sessionId, record, event, origin) {
-         const buffer = this.buffers.get(sessionId);
-         if (buffer !== undefined && buffer.text.trim()) {
+-        const buffer = this.buffers.get(sessionId);
+-        if (buffer !== undefined && buffer.text.trim()) {
 -            void buffer.flush();
-+            void buffer.flush(origin);
-             this.buffers.delete(sessionId);
-             return;
-         }
-@@ -79,7 +88,7 @@ class OutboundRouter {
+-            this.buffers.delete(sessionId);
+-            return;
+-        }
++    /** 完整 assistant 消息：以结算正文为准，整条交给 Unified Agent I/O */
++    onMessage(record, event, origin) {
+         const textParts = [];
+         for (const block of event.content) {
+             if (block.type === 'text' && block.text)
+@@ -79,15 +66,14 @@ class OutboundRouter {
          const fullText = textParts.join('\n');
          if (!fullText.trim())
              return;
 -        void this.send(record, fullText, 'sendMarkdown');
+-        this.buffers.delete(sessionId);
 +        void this.send(record, fullText, 'sendMarkdown', { ...origin, kind: 'assistant' });
-         this.buffers.delete(sessionId);
      }
      /** 工具调用：仅记录，不发送（避免刷屏，等待结果） */
-@@ -87,7 +96,7 @@ class OutboundRouter {
+     onToolCall(event) {
          this.toolCalls.set(event.callId, { name: event.name, args: event.arguments });
      }
      /** 工具结果：错误始终发送，成功结果按开关 */
@@ -1854,29 +1873,27 @@ index f50e4b2..587e63e 100644
          const call = this.toolCalls.get(event.callId);
          this.toolCalls.delete(event.callId);
          if (call === undefined)
-@@ -97,14 +106,16 @@ class OutboundRouter {
+@@ -97,37 +83,19 @@ class OutboundRouter {
          const text = formatToolResult(call.name, call.args, event.raw, this.toolsRegistry, record.agent);
          if (!text)
              return;
 -        void this.send(record, text, 'sendToolResult');
 +        void this.send(record, text, 'sendToolResult', { ...origin, kind: 'tool' });
      }
-     /** 轮次结束：清理 buffer，异常结束时告知用户 */
+-    /** 轮次结束：清理 buffer，异常结束时告知用户 */
 -    onTurnEnd(sessionId, record, event) {
-+    onTurnEnd(sessionId, record, event, origin) {
-         const buffer = this.buffers.get(sessionId);
-+        // A cancelled Turn's unsent buffer is dropped, not flushed.
-+        const cancelled = ['aborted', 'interrupted'].includes(event.reason?.kind);
-         if (buffer !== undefined) {
+-        const buffer = this.buffers.get(sessionId);
+-        if (buffer !== undefined) {
 -            if (buffer.text.trim()) {
 -                void buffer.flush();
-+            if (buffer.text.trim() && !cancelled) {
-+                void buffer.flush(origin);
-             }
-             else {
-                 buffer.cancel();
-@@ -113,21 +124,13 @@ class OutboundRouter {
-         }
+-            }
+-            else {
+-                buffer.cancel();
+-            }
+-            this.buffers.delete(sessionId);
+-        }
++    /** 轮次结束：异常结束时告知用户（未结算的增量不补发） */
++    onTurnEnd(sessionId, record, event, origin) {
          const failure = extractTurnError(event.reason);
          if (failure !== undefined && !SILENT_TURN_ERROR_CODES.has(failure.code)) {
 -            void this.send(record, `⚠️ 本轮异常结束\n\`${failure.code}\`: ${failure.message}`, 'sendTurnEndError');
@@ -1902,44 +1919,87 @@ index f50e4b2..587e63e 100644
  }
  /**
 diff --git a/dist/transport/outbound-buffer.js b/dist/transport/outbound-buffer.js
-index f69cedb..b5373b0 100644
+index f69cedb..6ff2378 100644
 --- a/dist/transport/outbound-buffer.js
 +++ b/dist/transport/outbound-buffer.js
-@@ -1,4 +1,3 @@
+@@ -1,50 +1,34 @@
 -import { chunkMarkdownText } from "./chunker.js";
- import { StreamingWriter } from "./streaming-writer.js";
- /** 流式输出节流间隔(ms)：连续 chunk 累积后停顿该间隔才推送 */
- const STREAM_THROTTLE_MS = 200;
-@@ -29,7 +28,7 @@ export class OutboundBuffer {
+-import { StreamingWriter } from "./streaming-writer.js";
+-/** 流式输出节流间隔(ms)：连续 chunk 累积后停顿该间隔才推送 */
+-const STREAM_THROTTLE_MS = 200;
+ export class OutboundBuffer {
+     buffer = '';
+     flushing = false;
+-    writer;
+     record;
+     bot;
+     limit;
+     logger;
+-    constructor(record, bot, limit, logger, streamingEnabled) {
++    // QQ chat output has no SDK stream path: the accumulated reply is one logical
++    // message for the Unified Agent I/O, which has no stream or edit operation.
++    constructor(record, bot, limit, logger) {
+         this.record = record;
+         this.bot = bot;
+         this.limit = limit;
+         this.logger = logger;
+-        this.writer = streamingEnabled
+-            ? new StreamingWriter({ bot, target: record.replyTarget, logger, throttleMs: STREAM_THROTTLE_MS })
+-            : null;
+     }
+     /** 追加文本增量 */
+     append(text) {
+         this.buffer += text;
+-        this.writer?.append(text);
+     }
+     /** 获取当前累积文本 */
+     get text() {
          return this.buffer;
      }
-     /** 发送所有累积文本：流式优先，降级静态 */
+-    /** 发送所有累积文本：流式优先，降级静态 */
 -    async flush() {
++    /** 发送所有累积文本：整条交给 Unified Agent I/O */
 +    async flush(origin) {
          if (this.flushing || !this.buffer.trim())
              return;
          this.flushing = true;
-@@ -40,11 +39,9 @@ export class OutboundBuffer {
-                 if (!this.writer.shouldFallback)
-                     return;
-             }
+         try {
+-            if (this.writer) {
+-                await this.writer.finish();
+-                // 流式成功（未降级）→ 直接返回
+-                if (!this.writer.shouldFallback)
+-                    return;
+-            }
 -            // 降级：静态发送（writer 不存在 or 流式失败）
 -            const chunks = chunkMarkdownText(this.buffer, this.limit);
 -            for (const chunk of chunks) {
 -                await this.bot.sendMarkdown(this.record.replyTarget, chunk);
 -            }
-+            // 降级：静态发送（writer 不存在 or 流式失败），整条交给 Unified Agent I/O
 +            // origin：触发本次输出的原生事件，与静态回复共用同一逻辑消息 ID
 +            await this.bot.deliverText(this.record, this.buffer, 'flush', { ...origin, kind: 'assistant' });
          }
          catch (err) {
              this.logger.error(`im-qqbot: flush failed: ${err instanceof Error ? err.message : String(err)}`);
+@@ -54,10 +38,9 @@ export class OutboundBuffer {
+             this.flushing = false;
+         }
+     }
+-    /** 取消（异常/丢弃），中止流式并清空缓冲 */
++    /** 取消（异常/丢弃），清空缓冲 */
+     cancel() {
+-        this.writer?.abort();
+         this.buffer = '';
+     }
+ }
+-//# sourceMappingURL=outbound-buffer.js.map
+\ No newline at end of file
++//# sourceMappingURL=outbound-buffer.js.map
 diff --git a/dist/transport/qq-text-adapter.js b/dist/transport/qq-text-adapter.js
 new file mode 100644
-index 0000000..b242b4b
+index 0000000..6f88fd2
 --- /dev/null
 +++ b/dist/transport/qq-text-adapter.js
-@@ -0,0 +1,79 @@
+@@ -0,0 +1,86 @@
 +/**
 + * QQ Official text adapter for the Unified Agent I/O (dsh-agent-io).
 + *
@@ -1997,12 +2057,15 @@ index 0000000..b242b4b
 +}
 +/**
 + * Protocol parts for `conversation.registerAdapter()`.
-+ * @param send      (replyTarget, text, {index, sessionId}) → SDK result; resolves the
-+ *                  passive-reply target and applies the quota.
-+ * @param split     text → markdown-aware chunks.
-+ * @param limit     hard per-message character limit.
++ * @param send         (replyTarget, text, {index, sessionId, messageId}) → SDK result; resolves the
++ *                     passive/active target through the gateway sender (quota, diagnostics).
++ * @param split        text → markdown-aware chunks.
++ * @param limit        hard per-message character limit.
++ * @param replyTarget  optional (record, messageId) → the reply target of the input a
++ *                     logical message answers (Interaction bubbles); used only while
++ *                     it names this record's Conversation, otherwise the record's latest.
 + */
-+export function createQQTextAdapter({ send, split, limit = 4500 }) {
++export function createQQTextAdapter({ send, split, limit = 4500, replyTarget }) {
 +    return {
 +        // After the shared route check, before every part: the record's reply
 +        // target must still point at exactly this Conversation.
@@ -2013,7 +2076,11 @@ index 0000000..b242b4b
 +        },
 +        split: text => hardLimit(split(text), limit),
 +        async send(route, text, info) {
-+            const result = await send({ ...route.record.replyTarget }, text, { index: info.index, sessionId: route.record.sessionId });
++            const record = route.record;
++            let own;
++            try { own = typeof replyTarget === 'function' ? replyTarget(record, info.messageId) : undefined; } catch { own = undefined; }
++            const target = own && own.scope === record.scope && own.targetId === record.peerId ? own : record.replyTarget;
++            const result = await send({ ...target }, text, { index: info.index, sessionId: record.sessionId, messageId: info.messageId });
 +            return { receipt: typeof result?.id === 'string' ? result.id : undefined };
 +        },
 +        classify: classifyQQError,

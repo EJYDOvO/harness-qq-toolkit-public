@@ -6,7 +6,7 @@ Conversation Manager `0.1.0-test.1` 已从 QQTK 抽离，配套 Character test.2
 
 最新源码配套 Interaction **0.1.0-test.7**、Character test.21、独立 Conversation Manager，已在授权后部署；旧版为 test.6 / test.20。本轮基线为 rc.3、QQ Bot 0.5.2、SDK 1.0.5。策略位于 [Character 仓库](https://github.com/EJYDOvO/character-agent-v1/tree/main/packages/interaction-policy)，不依赖 Character。停用 Interaction 保留普通 QQ 流程；Session 仍由同一个 Manager 管理。
 
-Iteration 01（本分支源码，未部署）不迁移 Interaction：`policy.bind` 的 `sendText`/可选 `openStream` 仍由 Gateway Sender 承担；绑定 Interaction 时工具错误/轮次错误提示仍走 `policy.external`。只有未绑定 Interaction 的普通静态文本改经 [Agent I/O](../plugin-sources/dsh-agent-io/README.md)；Interaction 改用 `sendMessage()` 属于后续切片。
+Iteration 04（已授权部署）：Interaction 只生成并提交完整气泡；`policy.bind` 的 `sendText` 由桥接层改为 [Agent I/O](../plugin-sources/dsh-agent-io/README.md) 的 `sendMessage()`（稳定逻辑 ID、按输入的回复目标、逐片复核、取消与诚实结果），不再提供 `openStream`，Gateway Sender 也不再提供 SDK 流式消息。工具错误/轮次错误提示仍走 `policy.external` 排队，再经同一 I/O 发送。（Iteration 01 时只有未绑定 Interaction 的普通静态文本经 I/O。）
 
 ## 契约
 
@@ -14,7 +14,7 @@ gateway/bootstrap.js 用原生 agentPresets.serviceFor 获取当前 Agent 的策
 
 可信入站先登记 native UserMessage。runtime-context、skill-catalog、time-context、agent-instructions 只是上下文，不能登记输入、解除后台抑制或恢复取消输出。Web/Schedule/未知或未登记输入不能通过 QQ 呈现。更正与 /stop 沿用 DSH cancel/steer/followup，不保证撤销工具副作用。
 
-适配器绑定 deliveryReceipts:true，只有 QQ 接口返回成功后调用 metadata.onDelivered()。补丁的 StreamSession.observe 只观察请求/回执/重试/失败/取消，不改变重试与协议逻辑。SDK update 可能只进入缓冲，不能据此确认发送。生成文字和 QQ 回执都不证明手机收件。等待提示（kind:status）与正文（kind:assistant）共用同一 Sender；只有正文回执用于确认自然回复，等待提示的生成与模型路由全部在 Interaction 插件内，QQTK 不调用模型。
+Iteration 04 起适配器不再设置 deliveryReceipts，也不提供 openStream：气泡的 `sendText` 只在 Agent I/O 返回 `sent`（QQ 接口对每个分片返回成功）后完成，策略据此调用 metadata.onDelivered()；`partial`/`unknown` 可能已可见，策略同样计为自然回复但不重发。生成文字和 QQ 回执都不证明手机收件。等待提示（kind:status）与正文（kind:assistant）共用同一 Interaction 队列与同一 I/O Conversation 队列。SDK 补丁中的 StreamSession.observe 仍保留，但 QQ 聊天输出不再调用 SDK 流式接口。
 
 默认 8 秒无自然回复确认时，将一次提示加入同一 FIFO 队列；发送前复查，不越过正在发送的正文。工具任务可按段落拆泡，maxBubbles 由进度/状态/结果共享。平台硬分片最多 4500 字符，仍共享被动回复额度及过期/主动降级规则。
 
@@ -22,7 +22,7 @@ gateway/bootstrap.js 用原生 agentPresets.serviceFor 获取当前 Agent 的策
 
 - 登记入站时，桥接层在 Session 记录上保存 `原生消息 ID → 回复目标`（每会话最多 100 条，先进先出）。发送时按元数据 `input` 选择目标，查不到时回退最近入站目标。被动额度、借用其他消息和主动降级规则仍完全在 QQ Gateway，Interaction 不参与。
 - 非用户、非上下文投影来源先询问 `policy.admitsSource(message)`：Interaction 认可的 Worker 续轮正常投递（并解除先前的后台抑制）；否则保持抑制并写一条 `suppressed` 诊断（`source` 只取 subagent-settled/schedule/web/other）。旧版 policy 没有该方法时保持原抑制。
-- 被动额度耗尽或过期后，流式回退为主动消息的发送失败会记录 `fallback-failure`（httpStatus/bizCode）并继续抛出。
+- 被动额度耗尽或过期后降级为主动消息的发送失败记录 `static-failure`（httpStatus/bizCode，另带 turn/reply/bubble/kind）并继续抛出；Iteration 04 起不再有流式回退路径。
 
 ### 执行期间的入站（配套 Interaction test.6）
 
@@ -41,7 +41,7 @@ QQ 配置 deliveryDiagnostics:true（默认 false），无需启用 debug。文�
 
 最多保留当前文件及一份轮转文件，每份约 1 MiB（单批可略超）；内存缓冲有界，写入失败提示一次并继续消息服务。关闭后不再记录，已有文件由维护者按需删除；不写 Session/Memory，不上传 GitHub。
 
-排查重复时对照 assistant-settlement、stream-open、stream-request / stream-receipt、static-request / static-receipt：检查同一回复是否打开两次流、静态补发，或 DONE 的 association 是否匹配先前 receipt。多帧请求本身是正常流式更新。本轮未确定真实重复气泡根因，也未改变其重试/去重策略。
+排查重复时对照 assistant-settlement 与 static-request / static-receipt（带 turn/reply/bubble）：同一气泡只应有一次请求序列；Agent I/O 以逻辑 ID 抑制重复提交。Iteration 04 前的记录中的 stream-open/stream-request/stream-receipt 属旧 SDK 流式路径。本轮未确定真实重复气泡根因，也未改变其重试/去重策略。
 
 ## 验证、升级与回滚
 

@@ -43,18 +43,18 @@ test('diagnostics record suppressed sources as a closed enum',async t=>{
  const rows=(await fs.readFile(resolve(dir,'delivery.jsonl'),'utf8')).trim().split('\n').map(JSON.parse);
  assert.deepEqual(rows.map(r=>r.source),['subagent-settled','schedule','web','other',undefined]);
 });
-test('a failed proactive stream fallback is traced and still rejects',async()=>{
- const begin=source.indexOf('    const sender = {'),stop=source.indexOf('    // Unified Agent I/O text adapter',begin);assert(begin>0&&stop>begin);
+test('a failed proactive send is traced with its bubble fields and still rejects',async()=>{
+ const begin=source.indexOf('    const sender = {'),stop=source.indexOf('    // Optional Agent policy',begin);assert(begin>0&&stop>begin);
  const traces=[],diagnostics={hash:v=>v===undefined?undefined:'a'.repeat(24),trace:(e,f)=>traces.push([e,f])};
  const failure=Object.assign(new Error('rejected'),{httpStatus:403,bizCode:22009});
  const sender=vm.runInNewContext('(function(){'+source.slice(begin,stop)+';return sender;})()',{
-  diagnostics,replyLimiter:{},randomUUID,resolveReplyTarget:t=>({...t,msgId:undefined}),
+  diagnostics,replyLimiter:{},resolveReplyTarget:t=>({...t,msgId:undefined}),
   sendResolvedMarkdown:async()=>{throw failure;},bot:{},
  });
- const stream=sender.openStream({scope:'c2c',targetId:'owner'},{kind:'assistant',bubble:2});
- await stream.update('完整正文');await assert.rejects(stream.complete(),/rejected/);
- const row=traces.find(([e])=>e==='fallback-failure');assert(row);assert.equal(row[1].httpStatus,403);assert.equal(row[1].bizCode,22009);assert.equal(row[1].length,4);
- assert(!traces.some(([e])=>e==='fallback-receipt'));
+ assert.equal(sender.openStream,undefined,'the gateway sender offers no SDK stream');
+ await assert.rejects(sender.sendMarkdown({scope:'c2c',targetId:'owner'},'完整正文',{delivery:{kind:'assistant',bubble:2}}),/rejected/);
+ const row=traces.find(([e])=>e==='static-failure');assert(row);assert.equal(row[1].httpStatus,403);assert.equal(row[1].bizCode,22009);assert.equal(row[1].length,4);assert.equal(row[1].bubble,2);assert.equal(row[1].passive,false);
+ assert(!traces.some(([e])=>e==='static-receipt'));
 });
 test('interjection decisions are recorded as closed enums only',async t=>{
  await fs.mkdir('tmp',{recursive:true});const dir=await fs.mkdtemp(resolve('tmp','qq-delivery-intervene-'));t.after(()=>fs.rm(dir,{recursive:true,force:true}));

@@ -13,15 +13,15 @@ function outbound(policy,streaming=true,diagnostics){
  assert(body.includes('const outboundHandler'));assert(!body.includes('bootstrapGateway'));
  const sent=[],legacy=[],delivered=[],record={sessionKey:'fixture',sessionId:'fixture',agent:{},replyTarget:{scope:'c2c',targetId:'owner',msgId:'m1'},scope:'c2c',peerId:'owner'};
  const manager={getOrCreate:async()=>record,getSessionRecord:()=>record,isCurrentSession:r=>r===record,findBySessionId:()=>record,approvalChannel:{pending:new Map()},questionChannel:{pending:new Map()}};
- const sender={sendMarkdown:async(t,s)=>sent.push([t,s]),openStream:()=>({update:async()=>{},complete:async()=>{}})};
+ const sender={sendMarkdown:async(t,s)=>sent.push([t,s])};
  const io={sendMessage:async request=>{delivered.push(request);return {status:'sent',parts:[]};}};
  const conversation=wiring(io,manager,a=>{assert.equal(a,record.agent);return policy;});
  const handler=vm.runInNewContext('(function(){'+body+';return outboundHandler;})()',{
   ctx:{get:()=>{throw Error('the policy comes from the shared Conversation wiring');}},manager,sender,config:{streaming,appId:'app'},logger:{},toolsRegistry:undefined,diagnostics,io,conversation,
-  chunkMarkdownText:text=>[text],
+  AbortController,AbortSignal,randomUUID:()=>'0123abcd-0000-4000-8000-000000000000',
   createOutboundHandler:(_m,s)=>async(session,event)=>{legacy.push(event.type);if(event.type==='tool/result')await s.deliverText(record,'tool error','sendToolResult');}
  });
- return {handler,sent,legacy,delivered,record,manager,session:{header:{id:'fixture'}}};
+ return {handler,sent,legacy,delivered,record,manager,io,session:{header:{id:'fixture'}}};
 }
 test('QQ bridge absent policy keeps the original router, whose static text goes to the Unified I/O',async()=>{
  const f=outbound();await f.handler(f.session,{type:'assistant/message'});await f.handler(f.session,{type:'tool/result'});assert.deepEqual(f.legacy,['assistant/message','tool/result']);
@@ -29,13 +29,17 @@ test('QQ bridge absent policy keeps the original router, whose static text goes 
  assert.deepEqual(JSON.parse(JSON.stringify(f.delivered[0])),{target:{platform:'qq-official',accountId:'app',conversation:{type:'direct',id:'owner'}},origin:{sessionId:'fixture'},message:{text:'tool error'}});
 });
 test('QQ bridge delegates policy output once, keeps tool errors on ordered external channel',async()=>{
- const events=[],external=[],p={bind(t){this.transport=t;},event:e=>events.push(e.type),external:async t=>external.push(t)};
+ const events=[],external=[],p={bind(t){this.transport=t;},event:e=>events.push(e.type),external:async(t,m)=>external.push([t,m])};
  const f=outbound(p);for(const type of ['turn/start','assistant/chunk','assistant/message','tool/result','turn/end'])await f.handler(f.session,{type});
- assert.deepEqual(events,['turn/start','assistant/chunk','assistant/message','tool/result','turn/end']);assert.deepEqual(f.legacy,['turn/start','tool/result','turn/end']);assert.deepEqual(external,['tool error']);assert.equal(f.sent.length,0);assert.equal(f.delivered.length,0);assert.equal(typeof p.transport.openStream,'function');
+ assert.deepEqual(events,['turn/start','assistant/chunk','assistant/message','tool/result','turn/end']);assert.deepEqual(f.legacy,['turn/start','tool/result','turn/end']);assert.deepEqual(external.map(e=>e[0]),['tool error']);assert.equal(external[0][1].kind,'tool-or-error');
+ assert.equal(f.sent.length,0);assert.equal(f.delivered.length,0);assert.equal(p.transport.openStream,undefined,'the bridge offers no stream');
  f.manager.approvalChannel.pending.set('fixture',{});assert(p.transport.waitingForUser());f.manager.approvalChannel.pending.clear();assert(!p.transport.waitingForUser());
 });
-test('QQ no-stream configuration does not accidentally open a stream',async()=>{
- const p={bind(t){this.transport=t;},event(){}};const f=outbound(p,false);f.handler(f.session,{type:'turn/start'});assert.equal(p.transport.openStream,undefined);await p.transport.sendText('test');assert.equal(f.sent.length,1);
+test('with streaming on or off, a policy bubble is one Unified I/O request and never a direct send',async()=>{
+ for(const streaming of [true,false]){
+  const p={bind(t){this.transport=t;},event(){}};const f=outbound(p,streaming);f.handler(f.session,{type:'turn/start'});assert.equal(p.transport.openStream,undefined);
+  await p.transport.sendText('test',{kind:'assistant',reply:1,bubble:1});assert.equal(f.sent.length,0);assert.equal(f.delivered.length,1);assert.equal(f.delivered[0].message.text,'test');
+ }
 });
 
 test('native Host context does not stop QQ output, and cannot clear background suppression',()=>{
@@ -108,8 +112,11 @@ test('QQ bridge sends each reply to the target of its own input id',async()=>{
  f.manager.trackInteractionInput(f.record,{id:'input-1',source:{kind:'user'}});
  f.record.replyTarget={scope:'c2c',targetId:'owner',msgId:'m2'};f.manager.trackInteractionInput(f.record,{id:'input-2',source:{kind:'user'}});
  f.handler(f.session,{type:'turn/start'});
- await p.transport.sendText('旧任务尾部',{input:'input-1'});await p.transport.sendText('新回复',{input:'input-2'});await p.transport.sendText('无归属',{});await p.transport.sendText('未知',{input:'other'});
- assert.deepEqual(f.sent.map(([t,s])=>[s,t.msgId]),[['旧任务尾部','m1'],['新回复','m2'],['无归属','m2'],['未知','m2']]);
+ // The fake I/O resolves the adapter's reply target the way the gateway's QQ text adapter does.
+ const targets=[];f.io.sendMessage=async r=>{targets.push([r.message.text,f.handler.delivery(r.id)?.target?.msgId??f.record.replyTarget.msgId]);return {status:'sent',parts:[]};};
+ let n=0;const meta=input=>({kind:'assistant',reply:1,bubble:++n,...(input?{input}:{})});
+ await p.transport.sendText('旧任务尾部',meta('input-1'));await p.transport.sendText('新回复',meta('input-2'));await p.transport.sendText('无归属',meta());await p.transport.sendText('未知',meta('other'));
+ assert.deepEqual(targets,[['旧任务尾部','m1'],['新回复','m2'],['无归属','m2'],['未知','m2']]);assert.equal(f.sent.length,0);assert.equal(f.handler.delivery('anything'),undefined,'nothing kept after the hand-over');
  for(let i=0;i<120;i++)f.manager.trackInteractionInput(f.record,{id:'bulk-'+i});assert.equal(f.record.interactionTargets.size,100);assert(!f.record.interactionTargets.has('input-1'));
 });
 function inbound(policy,status='running'){
