@@ -49,7 +49,7 @@ function gateway({access={c2cMode:'allowlist',c2cAllow:['owner'],groupMode:'disa
  const agent={id:'agent-1'},record={sessionKey:'qqbot:app-a:c2c:owner',sessionId:'s1',agent,replyTarget:{scope:'c2c',targetId:'owner',msgId:'m1'},scope:'c2c',peerId:'owner'};
  const sessions=new Map([['c2c:owner',record]]),agents=new Map([['s1',agent]]);
  const manager={getOrCreate:async()=>record,getSessionRecord:(s,p)=>sessions.get(s+':'+p),findBySessionId:id=>[...sessions.values()].find(r=>r.sessionId===id),findByAgent:a=>[...sessions.values()].find(r=>r.agent===a),
-  isCurrentSession:r=>sessions.get(r.scope+':'+r.peerId)===r&&agents.get(r.sessionId)===r.agent,approvalChannel:{pending:new Map()},questionChannel:{pending:new Map()}};
+  isCurrentSession:r=>sessions.get(r.scope+':'+r.peerId)===r&&agents.get(r.sessionId)===r.agent,hitl:{waiting:()=>false}};
  const logs=[],logger={info:m=>logs.push(['info',m]),debug(){},warn:m=>logs.push(['warn',m]),error:m=>logs.push(['error',m])};
  const config={appId:'app-a',textChunkLimit:4500,access,sendFile:{restrictPaths:true,extraRoots:[]},cwd};
  const bot=mediaBot(),cleanups=[],defs=[],ctx={get:n=>n==='tools'?{register:d=>defs.push(d)}:undefined,effect:f=>cleanups.push(f())};

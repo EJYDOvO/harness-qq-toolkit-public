@@ -30,6 +30,9 @@ export const ConfigSchema = Schema.object({
     maxQueue: Schema.number().default(20).description('并发队列最大长度'),
     processingTimeoutMs: Schema.number().default(30 * 60 * 1000).description('处理超时(ms)，超时中断当前 LLM 调用'),
     askTimeoutMs: Schema.number().default(5 * 60 * 1000).description('待答问题超时(ms)，超时自动拒绝并提示'),
+    hitl: Schema.object({
+        enabled: Schema.boolean().default(true),
+    }).default({ enabled: true }).description('原生审批与 ask_user_question 经 Agent I/O HITL Bridge 在 QQ 展示和作答；关闭后由原生 Web/Desktop 处理'),
     historyLimit: Schema.number().default(10).description('群历史缓冲条数'),
     access: AccessControlSchema.default({
         c2cMode: 'open',

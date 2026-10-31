@@ -5,14 +5,13 @@ import { resolve as diagnosticPath } from 'node:path';
 import { homedir as diagnosticHome } from 'node:os';
 import { SessionManager } from "../session/index.js";
 import { handleInbound, createOutboundHandler, chunkMarkdownText } from "../transport/index.js";
-import { QQ_OFFICIAL, QQ_SCOPES, accessAllows, createQQTextAdapter } from "../transport/qq-text-adapter.js";
+import { QQ_OFFICIAL, QQ_SCOPES, accessAllows, createQQTextAdapter, hitlResponse } from "../transport/qq-text-adapter.js";
 import { deliverInbound } from "../transport/inbound.js";
 import { ReplyLimiter } from "../transport/reply-limiter.js";
 import { cacheMsgId, cacheEventId } from "../transport/msgid-cache.js";
 import { resolveReplyTarget, sendResolvedMarkdown } from "../transport/reply-target.js";
-import { QuestionChannel } from "../features/question-channel.js";
-import { ApprovalChannel } from "../features/approval-channel.js";
-import { decodeButtonData } from "../features/button-utils.js";
+import { buildApprovalText } from "../features/approval-renderer.js";
+import { formatQuestion } from "../features/question-renderer.js";
 import { buildUserAgent } from "../shared/index.js";
 import { setupMiddlewares } from "./middleware-setup.js";
 import { startMediaCleanup } from "../media/media-cleaner.js";
@@ -57,22 +56,27 @@ export function createDeliveryRecorder(enabled, logger, directory) {
     return {hash,trace,flush,async close(){closed=true;await flush();}};
 }
 /**
- * interaction 统一分发器：按 button_data 的顶层 `t` 判别字段，路由到对应
- * channel（question / approval）。QQ 只有一个 interaction 入口，集中路由
- * 避免多通道各自 try 导致误判。
+ * QQ side of the Agent I/O HITL Bridge: the QQ Markdown of approvals, questions
+ * and the timeout notice. The Bridge (dsh-agent-io) correlates native Approval
+ * and userQuestions requests with this account's current Sessions, issues their
+ * buttons, sends every prompt through sendMessage() and accepts only the
+ * expected person's answer; the QQ adapter renders the keyboard and turns button
+ * events and text messages into its standard responses. Off with `hitl.enabled:
+ * false`: requests then stay with the native Web/Desktop answerers.
  */
-function dispatchInteraction(event, manager) {
-    const raw = event.data?.resolved?.button_data;
-    if (!raw)
-        return false;
-    const button = decodeButtonData(raw);
-    if (!button)
-        return false;
-    if (button.t === 'question')
-        return manager.questionChannel?.handleInteraction(event) ?? false;
-    if (button.t === 'approval')
-        return manager.approvalChannel?.handleInteraction(event) ?? false;
-    return false;
+export function openQQHITL(conversation, config, logger) {
+    if (config.hitl?.enabled === false) return undefined;
+    return conversation.openHITL({
+        // The person whose message the Session answers: the C2C peer, in a group the sender.
+        responder: record => record.senderId || (record.scope === 'c2c' ? record.peerId : undefined),
+        render: {
+            approval: view => buildApprovalText(view, view.command),
+            question: (question, { actions, conversation: c }) => formatQuestion(question, c?.type === 'group' && config.requireMention === true, actions),
+            timeout: () => '⚠️ 提问已超时，未收到回答。',
+        },
+        questionTimeoutMs: config.askTimeoutMs,
+        logger,
+    });
 }
 /**
  * Cancellation controllers of native Turns, per Session. A controller leased by
@@ -272,7 +276,7 @@ export function createInteractionOutbound(ctx, manager, sender, config, logger, 
                     if(result.reason!=='cancelled')logger.warn?.(`im-qqbot: interaction ${kind} ${result.status}${result.reason?` (${result.reason})`:''}`);
                     throw Object.assign(new Error('QQ output '+result.status),{delivery:result.status,reason:result.reason});
                 },
-                waitingForUser: () => manager.approvalChannel?.pending.has(record.sessionKey) || manager.questionChannel?.pending.has(record.sessionKey) });
+                waitingForUser: () => manager.hitl?.waiting(record) === true });
             policy.event(event);
             if (['assistant/chunk', 'assistant/message'].includes(event.type)) return;
         }
@@ -328,6 +332,7 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
         onInput: (record, message, policy) => { if (policy) manager.trackInteractionInput?.(record, message); } });
     ctx.effect(() => conversation.close);
     if (typeof conversation.openCommands !== 'function') throw new Error('dsh-agent-io 0.1.0-test.5 or later (commands and attachments) is required before QQ');
+    if (typeof conversation.openHITL !== 'function') throw new Error('dsh-agent-io 0.1.0-test.6 or later (HITL Bridge) is required before QQ');
     const deliveryRecorder=createDeliveryRecorder(config.deliveryDiagnostics,logger);
     ctx.effect(()=>()=>deliveryRecorder?.close());
     // ── 初始化 QQ Bot SDK ──
@@ -387,32 +392,28 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
         limit: config.textChunkLimit ?? 4500,
         split: text => chunkMarkdownText(text, config.textChunkLimit ?? 4500),
         replyTarget: (_record, messageId) => outboundHandler.delivery(messageId)?.target,
-        send: (target, text, info) => sender.sendMarkdown(target, text, { delivery: { ...outboundHandler.delivery(info.messageId)?.delivery, session: diagnostics?.hash(info.sessionId), index: info.index } }),
+        send: (target, text, info) => sender.sendMarkdown(target, text, { delivery: { ...outboundHandler.delivery(info.messageId)?.delivery, session: diagnostics?.hash(info.sessionId), index: info.index }, ...(info.keyboard ? { keyboard: info.keyboard } : {}) }),
         sendMedia: (target, attachment) => sendMedia(bot, replyLimiter, config, target, attachment),
     }));
     ctx.effect(() => releaseTextAdapter);
     ctx
         .on('session/event', outboundHandler);
-    // ── 问答通道（ask_user_question → QQ 文本 + 按钮） ──
-    const questionChannel = new QuestionChannel(manager, sender, config, logger);
-    manager.questionChannel = questionChannel;
-    questionChannel.install(ctx);
-    // ── 审批通道（approval/request → QQ 两按钮审批） ──
-    const approvalChannel = new ApprovalChannel(manager, sender, logger);
-    manager.approvalChannel = approvalChannel;
-    approvalChannel.install(ctx);
+    // ── HITL：原生审批与 ask_user_question 经 Agent I/O HITL Bridge（QQ 文本 + 按钮） ──
+    // Closed with the Conversation wiring (Gateway unload); Session release cancels its requests.
+    manager.hitl = openQQHITL(conversation, config, logger);
     ctx.provide('qqGateway', Object.freeze({ bot, manager, sender }));
     // Remote Ops is an optional extension. Core messaging and approval own no ops dependency.
     const releaseRemoteOps = ctx.get('qqRemoteOps')?.attach({ bot, manager, sender, config });
     if (typeof releaseRemoteOps === 'function') ctx.effect(() => releaseRemoteOps);
-    // ── 按钮点击回调（interaction）：统一分发到问答/审批通道 ──
+    // ── 按钮点击回调（interaction）：HITL 按钮交给 Bridge 校验与结算 ──
     bot.on('interaction', async (_iCtx, event) => {
         // scope/targetId 推导对齐消息事件（inbound.ts）：按 scene 判定类型，群用 group_openid，私聊用 user_openid
         const scope = event.scene === 'group' ? 'group' : 'c2c';
         const targetId = scope === 'group' ? (event.group_openid ?? event.user_openid) : event.user_openid;
         // 记录互动事件 id，作为后续被动回复候选（event_id）
         cacheEventId(scope, targetId, event.id);
-        const matched = dispatchInteraction(event, manager);
+        const response = hitlResponse(event);
+        const matched = !!response && manager.hitl?.respond(response).status === 'accepted';
         await bot.acknowledgeInteraction(event.id, matched ? 0 : 3).catch(() => { });
     });
     bot.on('error', (err) => {

@@ -54,7 +54,7 @@ function gateway({io=createAgentIO(),appId='app-a',policy,streaming=false,limit=
  const sessions=new Map([['c2c:owner',record]]);
  // The Manager's ownership contract: the record is the mapped one and its live Agent is registered.
  const manager={getOrCreate:async()=>{throw Error('no inbound in these fixtures');},getSessionRecord:(scope,peer)=>sessions.get(scope+':'+peer),findBySessionId:id=>[...sessions.values()].find(r=>r.sessionId===id),
-  isCurrentSession:r=>sessions.get((r.scope)+':'+r.peerId)===r&&agents.get(r.sessionId)===r.agent,approvalChannel:{pending:new Map()},questionChannel:{pending:new Map()}};
+  isCurrentSession:r=>sessions.get((r.scope)+':'+r.peerId)===r&&agents.get(r.sessionId)===r.agent,hitl:{waiting:()=>false}};
  const logger={info(){},debug:m=>logs.push(['debug',m]),warn:m=>logs.push(['warn',m]),error:m=>logs.push(['error',m])};
  const config={appId,streaming,textChunkLimit:limit,showToolResults:false,access:access??{c2cMode:'allowlist',c2cAllow:['owner'],groupMode:'allowlist',groupAllow:['grp']}};
  const ctx={get:()=>undefined,effect:f=>cleanups.push(f())};

@@ -135,7 +135,7 @@ try {
         if ($LASTEXITCODE -ne 0) { throw 'Candidate dependency installation failed.' }
         Invoke-TaskNode @($taskOps,'verify',$taskStage)
         $env:QQBOT_TEST_PROFILE = $taskStage
-        Invoke-TaskNode @('--test',(Join-Path $PSScriptRoot 'approval.test.mjs'),(Join-Path $PSScriptRoot 'qq-boundaries.test.mjs'),(Join-Path $PSScriptRoot 'maintenance.test.cjs'),(Join-Path $PSScriptRoot 'remote-ops.test.mjs'),(Join-Path $taskRoot 'plugin-sources\dsh-task-memory\tests\render.test.mjs'))
+        Invoke-TaskNode @('--test',(Join-Path $PSScriptRoot 'hitl.test.mjs'),(Join-Path $PSScriptRoot 'qq-boundaries.test.mjs'),(Join-Path $PSScriptRoot 'maintenance.test.cjs'),(Join-Path $PSScriptRoot 'remote-ops.test.mjs'),(Join-Path $taskRoot 'plugin-sources\dsh-task-memory\tests\render.test.mjs'))
         $taskCompositionErrors = Join-Path $taskRoot 'tmp\inspect\validated-composition.err.log'
         & (Join-Path $taskRoot 'resources\runtime\cli\bin\dsh.cmd') --profile qqbot-validation --dump-config 1> (Join-Path $taskRoot 'tmp\inspect\validated-composition.yml') 2> $taskCompositionErrors
         if ($LASTEXITCODE -ne 0) { throw 'Candidate composition failed.' }

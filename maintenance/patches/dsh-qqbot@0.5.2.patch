@@ -1,389 +1,128 @@
-diff --git a/dist/features/approval-channel.js b/dist/features/approval-channel.js
-index 15182b6..8802825 100644
---- a/dist/features/approval-channel.js
-+++ b/dist/features/approval-channel.js
-@@ -1,142 +1,121 @@
--import { decodeButtonData } from "./button-utils.js";
--import { buildApprovalKeyboard, buildApprovalText } from "./approval-renderer.js";
--const COMMAND_CLIP = 500;
--/**
-- * 从 session log 按 callId 找回被 gate 的命令（审批请求本身不重复携带 arguments）。
-- * 对齐 TUI/web 的 `commandOf` 语义。
-- */
-+import { randomUUID } from 'node:crypto';
-+import { decodeButtonData } from './button-utils.js';
-+import { buildApprovalKeyboard, buildApprovalText } from './approval-renderer.js';
- function commandOf(req) {
--    if (req.callId === undefined)
--        return undefined;
--    const events = req.agent.session.events;
--    for (let i = events.length - 1; i >= 0; i -= 1) {
--        const event = events[i];
--        if (!event || event.type !== 'tool/call')
--            continue;
--        const data = event.data;
--        if (String(data?.callId) !== String(req.callId))
--            continue;
--        const raw = data?.arguments;
--        if (typeof raw !== 'string')
--            return undefined;
-+    if (req.callId === undefined) return undefined;
-+    const session = req.agent.session;
-+    for(let seq = session.seq - 1; seq >= 0; seq--){
-+        const event = session.eventAt(seq);
-+        if (event?.type !== 'tool/call' || String(event.data?.callId) !== String(req.callId)) continue;
-+        const raw = event.data?.arguments;
-+        if (typeof raw !== 'string') return undefined;
-         try {
-             const parsed = JSON.parse(raw);
--            if (parsed !== null && typeof parsed === 'object' && 'command' in parsed) {
--                const command = parsed.command;
--                if (typeof command === 'string')
--                    return command;
--            }
--        }
--        catch {
--            // 非 JSON，回退到原始字符串
--        }
--        return raw.length <= COMMAND_CLIP ? raw : `${raw.slice(0, COMMAND_CLIP)}…`;
-+            if (parsed && typeof parsed.command === 'string') return parsed.command;
-+        } catch  {}
-+        return raw.length <= 500 ? raw : `${raw.slice(0, 500)}…`;
-     }
-     return undefined;
- }
- export class ApprovalChannel {
--    pending = new Map();
-     manager;
-     sender;
-     logger;
--    constructor(manager, sender, logger) {
-+    pending = new Map();
-+    installed = false;
-+    constructor(manager, sender, logger){
-         this.manager = manager;
-         this.sender = sender;
-         this.logger = logger;
-     }
--    /**
--     * 注册 approval/request waterfall answerer。approval 服务未挂载时优雅禁用。
--     */
-     install(ctx) {
--        let hasApproval = false;
--        try {
--            hasApproval = ctx.get('approval') !== undefined;
--        }
--        catch {
--            hasApproval = false;
--        }
--        if (!hasApproval) {
--            this.logger.debug('im-qqbot: approval service unavailable — approval channel disabled');
--            return;
--        }
--        const self = this;
--        ctx.on('approval/request', (req, next) => {
-+        if (this.installed) return;
-+        this.installed = true;
-+        ctx.on('approval/request', (req, next)=>{
-             const request = req;
--            const nextFn = next;
--            const record = self.manager.findBySessionId(request.agent.id);
--            if (record)
--                return self.park(record, request);
--            return nextFn();
--        }, { prepend: true });
-+            const record = this.manager.findBySessionId(request.agent.id);
-+            return record ? this.park(record, request) : next();
-+        }, {
-+            prepend: true
-+        });
-+        ctx.effect?.(()=>()=>{
-+                for (const key of [
-+                    ...this.pending.keys()
-+                ])this.cancelPending(key);
-+            });
-         this.logger.info('im-qqbot: QQ approval channel installed');
-     }
--    /** 会话回收时清理其 pending 审批，避免 Promise 悬挂 */
--    cancelPending(sessionKey) {
--        const entry = this.pending.get(sessionKey);
--        if (!entry)
--            return;
--        this.pending.delete(sessionKey);
--        this.removeAbort(entry);
--        entry.resolve('cancelled');
-+    settle(key, entry, outcome) {
-+        if (this.pending.get(key) !== entry) return;
-+        this.pending.delete(key);
-+        if (entry.timer) clearTimeout(entry.timer);
-+        if (entry.onAbort) entry.request.signal?.removeEventListener('abort', entry.onAbort);
-+        entry.resolve(outcome);
-+    }
-+    cancelPending(key) {
-+        const entry = this.pending.get(key);
-+        if (entry) this.settle(key, entry, 'cancelled');
-     }
--    /** 按钮点击决策：解码 button_data，settle pending 审批 */
-     handleInteraction(event) {
-         const peerId = event.group_openid ?? event.user_openid;
--        if (!peerId)
--            return false;
-+        if (!peerId) return false;
-         const scope = event.group_openid ? 'group' : 'c2c';
-         const record = this.manager.getSessionRecord(scope, peerId);
--        if (!record)
--            return false;
-+        if (!record) return false;
-         const entry = this.pending.get(record.sessionKey);
--        if (!entry)
--            return false;
--        const data = event.data?.resolved?.button_data;
--        if (!data)
-+        const raw = event.data?.resolved?.button_data;
-+        const button = raw ? decodeButtonData(raw) : undefined;
-+        if (!entry || !button || button.t !== 'approval' || button.n !== entry.nonce) return false;
-+        if (button.d !== 'allow' && button.d !== 'deny') return false;
-+        if (!event.user_openid || event.user_openid !== entry.approverId) return false;
-+        if (entry.request.signal?.aborted) {
-+            this.settle(record.sessionKey, entry, 'cancelled');
-             return false;
--        const button = decodeButtonData(data);
--        if (!button || button.t !== 'approval')
--            return false;
--        this.pending.delete(record.sessionKey);
--        this.removeAbort(entry);
--        entry.resolve(button.d === 'allow' ? 'allowed-once' : 'rejected');
-+        }
-+        this.settle(record.sessionKey, entry, button.d === 'allow' ? 'allowed-once' : 'rejected');
-         return true;
-     }
--    /** 走 QQ 通道：发审批消息 + 挂起 Promise，等待用户决策 */
--    async park(record, request) {
-+    park(record, request) {
-         const key = record.sessionKey;
--        // 会话回收/取消可能在发送前发生：signal 已 abort 则直接失败
--        if (request.signal?.aborted)
--            return 'cancelled';
--        const command = commandOf(request);
-+        if (request.signal?.aborted) return Promise.resolve('cancelled');
-+        if (this.pending.has(key)) return Promise.resolve('unavailable');
-+        const approverId = record.senderId || (record.scope === 'c2c' ? record.replyTarget.targetId : undefined);
-+        if (!approverId) return Promise.resolve('unavailable');
-+        let command;
-         try {
--            await this.sender.sendMarkdown(record.replyTarget, buildApprovalText(request, command), { keyboard: buildApprovalKeyboard() });
-+            command = commandOf(request);
-+        } catch (error) {
-+            this.logger.error(`im-qqbot: approval command lookup failed: ${String(error)}`);
-+            return Promise.resolve('unavailable');
-         }
--        catch (err) {
--            const msg = err instanceof Error ? err.message : String(err);
--            this.logger.error(`im-qqbot: approval send failed key=${key}: ${msg}`);
--            return 'unavailable'; // 无法呈现审批，fail-closed
--        }
--        return new Promise((resolve) => {
--            const entry = { record, request, resolve };
--            if (request.signal) {
--                const onAbort = () => {
--                    if (this.pending.get(key) !== entry)
--                        return;
--                    this.pending.delete(key);
--                    resolve('cancelled');
--                };
--                entry.onAbort = onAbort;
--                request.signal.addEventListener('abort', onAbort, { once: true });
--            }
-+        return new Promise((resolve)=>{
-+            const entry = {
-+                request,
-+                nonce: randomUUID(),
-+                approverId,
-+                resolve
-+            };
-             this.pending.set(key, entry);
--            this.logger.info(`im-qqbot: approval sent to QQ, waiting for decision key=${key}`);
-+            entry.onAbort = ()=>this.settle(key, entry, 'cancelled');
-+            request.signal?.addEventListener('abort', entry.onAbort, {
-+                once: true
-+            });
-+            entry.timer = setTimeout(()=>this.settle(key, entry, 'cancelled'), 300_000);
-+            if (request.signal?.aborted) {
-+                this.settle(key, entry, 'cancelled');
-+                return;
-+            }
-+            Promise.resolve().then(()=>{
-+                if (this.pending.get(key) !== entry) return;
-+                return this.sender.sendMarkdown(record.replyTarget, buildApprovalText(request, command), {
-+                    keyboard: buildApprovalKeyboard(entry.nonce)
-+                });
-+            }).then(()=>{
-+                if (this.pending.get(key) === entry) this.logger.info(`im-qqbot: approval sent to QQ, waiting for decision key=${key}`);
-+            }, (error)=>{
-+                this.logger.error(`im-qqbot: approval send failed key=${key}: ${String(error)}`);
-+                this.settle(key, entry, 'unavailable');
-+            });
-         });
-     }
--    removeAbort(entry) {
--        if (entry.onAbort && entry.request.signal) {
--            entry.request.signal.removeEventListener('abort', entry.onAbort);
--        }
--    }
- }
--//# sourceMappingURL=approval-channel.js.map
-\ No newline at end of file
 diff --git a/dist/features/approval-renderer.js b/dist/features/approval-renderer.js
-index ad00ad3..77bf8ad 100644
+index ad00ad3..0d9965d 100644
 --- a/dist/features/approval-renderer.js
 +++ b/dist/features/approval-renderer.js
-@@ -24,7 +24,7 @@ export function buildApprovalText(request, command) {
-  * 无 allow-always，因此只提供两个按钮；`group_id` 相同实现单选互斥变灰。
-  * button_data 编码 `{"t":"approval","d":"allow"|"deny"}`，由分发器解码。
-  */
--export function buildApprovalKeyboard() {
-+export function buildApprovalKeyboard(nonce) {
-     const allow = {
-         id: 'approval-allow',
-         render_data: { label: '✅ 允许一次', visited_label: '✓ 已允许', style: 1 },
-@@ -32,7 +32,7 @@ export function buildApprovalKeyboard() {
-             type: 1,
-             permission: { type: 2 },
-             click_limit: 1,
--            data: encodeButtonData({ t: 'approval', d: 'allow' }),
-+            data: encodeButtonData({ t: 'approval', d: 'allow', n: nonce }),
-         },
-         group_id: 'approval',
-     };
-@@ -43,10 +43,9 @@ export function buildApprovalKeyboard() {
-             type: 1,
-             permission: { type: 2 },
-             click_limit: 1,
--            data: encodeButtonData({ t: 'approval', d: 'deny' }),
-+            data: encodeButtonData({ t: 'approval', d: 'deny', n: nonce }),
-         },
-         group_id: 'approval',
-     };
-     return { content: { rows: [{ buttons: [allow, deny] }] } };
+@@ -1,5 +1,8 @@
+-import { encodeButtonData } from "./button-utils.js";
+-/** 把审批请求渲染成 QQ 文本（含被 gate 的命令回显） */
++/**
++ * 把审批请求渲染成 QQ 文本（含被 gate 的命令回显）。按钮（允许一次 / 拒绝）由
++ * HITL Bridge 签发、QQ Adapter 渲染为键盘；dsh 审批结果为闭合集合
++ * （allowed-once/rejected/cancelled/unavailable），没有 allow-always。
++ */
+ export function buildApprovalText(request, command) {
+     const lines = ['🔐 **执行审批**', ''];
+     lines.push(`🔧 工具: ${request.toolName}`);
+@@ -17,36 +20,3 @@ export function buildApprovalText(request, command) {
+     lines.push('> 👇 点击下方按钮确认是否允许执行');
+     return lines.join('\n');
  }
+-/**
+- * 构建审批键盘：两按钮（允许一次 / 拒绝）。
+- *
+- * dsh 审批协议 outcome 是闭合集合（allowed-once/rejected/cancelled/unavailable），
+- * 无 allow-always，因此只提供两个按钮；`group_id` 相同实现单选互斥变灰。
+- * button_data 编码 `{"t":"approval","d":"allow"|"deny"}`，由分发器解码。
+- */
+-export function buildApprovalKeyboard() {
+-    const allow = {
+-        id: 'approval-allow',
+-        render_data: { label: '✅ 允许一次', visited_label: '✓ 已允许', style: 1 },
+-        action: {
+-            type: 1,
+-            permission: { type: 2 },
+-            click_limit: 1,
+-            data: encodeButtonData({ t: 'approval', d: 'allow' }),
+-        },
+-        group_id: 'approval',
+-    };
+-    const deny = {
+-        id: 'approval-deny',
+-        render_data: { label: '❌ 拒绝', visited_label: '✓ 已拒绝', style: 0 },
+-        action: {
+-            type: 1,
+-            permission: { type: 2 },
+-            click_limit: 1,
+-            data: encodeButtonData({ t: 'approval', d: 'deny' }),
+-        },
+-        group_id: 'approval',
+-    };
+-    return { content: { rows: [{ buttons: [allow, deny] }] } };
+-}
 -//# sourceMappingURL=approval-renderer.js.map
 \ No newline at end of file
-diff --git a/dist/features/question-channel.js b/dist/features/question-channel.js
-index 3d2811c..21f91e1 100644
---- a/dist/features/question-channel.js
-+++ b/dist/features/question-channel.js
-@@ -1,3 +1,4 @@
-+import { randomUUID } from 'node:crypto';
- import { parseAnswer } from "./answer-parser.js";
- import { buildKeyboard, formatQuestion } from "./question-renderer.js";
- import { decodeButtonData } from "./button-utils.js";
-@@ -109,7 +110,7 @@ export class QuestionChannel {
-         if (!data)
-             return false;
-         const button = decodeButtonData(data);
--        if (!button || button.t !== 'question')
-+        if (!button || button.t !== 'question' || button.n !== entry.nonce || event.user_openid !== entry.record.senderId)
-             return false;
-         const current = entry.request.questions[entry.index];
-         if (!current)
-@@ -120,7 +121,7 @@ export class QuestionChannel {
-             return false;
-         const idx = button.i;
-         const opts = current.options ?? [];
--        if (idx < 0 || idx >= opts.length)
-+        if (!Number.isInteger(idx) || idx < 0 || idx >= opts.length)
-             return false;
-         this.advance(entry, record.sessionKey, { id: current.id, selected: [opts[idx].label] });
-         return true;
-@@ -143,9 +144,9 @@ export class QuestionChannel {
-         const first = request.questions[0];
-         if (!first)
-             throw new Error('ask_user_question with empty questions');
--        await this.sendQuestion(record, first);
-         return new Promise((resolve, reject) => {
--            const entry = { record, request, resolve, reject, index: 0, collected: [] };
-+            const entry = { record, request, resolve, reject, index: 0, collected: [], nonce: randomUUID() };
-+            this.pending.set(key, entry);
-             if (request.signal) {
-                 const onAbort = () => {
-                     if (this.pending.get(key) !== entry)
-@@ -158,7 +159,8 @@ export class QuestionChannel {
-                 request.signal.addEventListener('abort', onAbort, { once: true });
-             }
-             entry.timer = setTimeout(() => this.onTimeout(key), this.config.askTimeoutMs);
--            this.pending.set(key, entry);
-+            if (request.signal?.aborted) { this.cancelPending(key); return; }
-+            void this.sendQuestion(record, first, entry.nonce).catch(error => this.fail(entry, key, error));
-             this.logger.info(`im-qqbot: question sent to QQ, waiting for answer key=${key}`);
-         });
-     }
-@@ -169,12 +171,8 @@ export class QuestionChannel {
-         if (entry.index < entry.request.questions.length) {
-             const next = entry.request.questions[entry.index];
-             this.resetTimer(entry, key);
--            void this.sendQuestion(entry.record, next).catch((err) => {
--                this.pending.delete(key);
--                this.clearTimer(entry);
--                this.removeAbort(entry);
--                entry.reject(err instanceof Error ? err : new Error(String(err)));
--            });
-+            entry.nonce = randomUUID();
-+            void this.sendQuestion(entry.record, next, entry.nonce).catch(err => this.fail(entry, key, err));
-             return;
-         }
-         this.pending.delete(key);
-@@ -184,9 +182,16 @@ export class QuestionChannel {
-         entry.resolve({ answers: entry.collected });
-     }
-     /** 发送单个问题：优先带按钮，按钮发送失败降级纯文本 */
--    async sendQuestion(record, question) {
-+    fail(entry, key, error) {
-+        if (this.pending.get(key) !== entry) return;
-+        this.pending.delete(key);
-+        this.clearTimer(entry);
-+        this.removeAbort(entry);
-+        entry.reject(error instanceof Error ? error : new Error(String(error)));
-+    }
-+    async sendQuestion(record, question, nonce) {
-         const hint = record.scope === 'group' && this.config.requireMention === true;
--        const keyboard = buildKeyboard(question);
-+        const keyboard = buildKeyboard(question, nonce);
-         try {
-             if (keyboard) {
-                 try {
 diff --git a/dist/features/question-renderer.js b/dist/features/question-renderer.js
-index dc2e41f..0757387 100644
+index dc2e41f..d41b48f 100644
 --- a/dist/features/question-renderer.js
 +++ b/dist/features/question-renderer.js
-@@ -8,7 +8,7 @@ import { BUTTONS_PER_ROW, buttonLabel, encodeButtonData } from "./button-utils.j
-  * `t` 顶层判别字段供 interaction 统一路由；`q` 关联「当前正在问的题」：逐题
-  * 推进时旧题按钮在新题发出后被点击，其 q 不等于当前题 id，可被识别并忽略。
-  */
+@@ -1,44 +1,4 @@
+-import { BUTTONS_PER_ROW, buttonLabel, encodeButtonData } from "./button-utils.js";
+-/**
+- * 为「单选、带选项」的问题构建内联键盘；不适用时返回 undefined。
+- *
+- * 多行多列布局：每行 BUTTONS_PER_ROW 个按钮，减少选项多时的刷屏。
+- *
+- * button_data 编码 `{"t":"question","q":<问题id>,"i":<选项下标>}`，由分发器解码。
+- * `t` 顶层判别字段供 interaction 统一路由；`q` 关联「当前正在问的题」：逐题
+- * 推进时旧题按钮在新题发出后被点击，其 q 不等于当前题 id，可被识别并忽略。
+- */
 -export function buildKeyboard(question) {
-+export function buildKeyboard(question, nonce) {
-     const opts = question.options ?? [];
-     if (opts.length === 0 || question.multiSelect)
-         return undefined;
-@@ -28,7 +28,7 @@ export function buildKeyboard(question) {
-                         type: 1,
-                         permission: { type: 2 },
-                         click_limit: 1,
+-    const opts = question.options ?? [];
+-    if (opts.length === 0 || question.multiSelect)
+-        return undefined;
+-    const rows = [];
+-    for (let i = 0; i < opts.length; i += BUTTONS_PER_ROW) {
+-        rows.push({
+-            buttons: opts.slice(i, i + BUTTONS_PER_ROW).map((o, offset) => {
+-                const idx = i + offset;
+-                return {
+-                    id: `q-${question.id}-opt-${idx}`,
+-                    render_data: {
+-                        label: buttonLabel(o.label),
+-                        visited_label: '✓ 已选',
+-                        style: 1,
+-                    },
+-                    action: {
+-                        type: 1,
+-                        permission: { type: 2 },
+-                        click_limit: 1,
 -                        data: encodeButtonData({ t: 'question', q: question.id, i: idx }),
-+                        data: encodeButtonData({ t: 'question', q: question.id, i: idx, n: nonce }),
-                     },
-                     // 同一题的选项共享分组：点一个后其余变灰（单选互斥）
-                     group_id: `q-${question.id}`,
+-                    },
+-                    // 同一题的选项共享分组：点一个后其余变灰（单选互斥）
+-                    group_id: `q-${question.id}`,
+-                };
+-            }),
+-        });
+-    }
+-    return { content: { rows } };
+-}
+-/** 把单个问题渲染成 QQ 文本 */
++/** 把单个问题渲染成 QQ 文本（单选按钮由 HITL Bridge 签发、QQ Adapter 渲染为键盘） */
+ export function formatQuestion(question, requireMentionHint, withButtons) {
+     const lines = [];
+     if (question.header)
+@@ -47,6 +7,9 @@ export function formatQuestion(question, requireMentionHint, withButtons) {
+     const multi = question.multiSelect === true;
+     // 问题行：多选标记前置，用户第一眼就知道作答方式
+     lines.push(multi ? `${question.question}（可多选）` : question.question);
++    // 原生 intent 问题（如计划审阅）附带须审阅的内容
++    if (typeof question.detail === 'string' && question.detail.trim())
++        lines.push('', question.detail.trim(), '');
+     // 选项列表：保留完整 label + description（按钮 label 截断时 description 靠正文展示）
+     opts.forEach((o, i) => {
+         lines.push(`${i + 1}. ${o.label}${o.description ? ` · ${o.description}` : ''}`);
 diff --git a/dist/gateway/middleware-setup.js b/dist/gateway/middleware-setup.js
-index ca4b002..ea7991b 100644
+index ca4b002..b0af073 100644
 --- a/dist/gateway/middleware-setup.js
 +++ b/dist/gateway/middleware-setup.js
-@@ -1,9 +1,83 @@
+@@ -1,9 +1,106 @@
 -import { errorHandler, messageFilter, accessPolicy, mentionGate, contentSanitizer, rateLimiter, slashCommand, concurrencyGuard, typingIndicator, quoteRef, historyBuffer, envelopeFormatter, } from '@tencent-connect/qqbot-nodejs';
 +import { errorHandler, messageFilter, accessPolicy, mentionGate, contentSanitizer, rateLimiter, concurrencyGuard, typingIndicator, quoteRef, historyBuffer, envelopeFormatter, } from '@tencent-connect/qqbot-nodejs';
  import { buildCommandList } from "../commands/index.js";
 -import { attachmentProcessor } from "../middleware/attachment.js";
+-import { questionAnswer } from "../middleware/question-answer.js";
 +import { downloadMediaAttachments } from "../transport/attachment.js";
- import { questionAnswer } from "../middleware/question-answer.js";
++import { cacheMsgId } from "../transport/msgid-cache.js";
  import { getHistoryStore, historyGroupKey } from "../features/history-store.js";
 -export function setupMiddlewares(bot, config, manager, logger) {
 +/**
@@ -460,11 +199,34 @@ index ca4b002..ea7991b 100644
 +        await next();
 +    };
 +}
++/**
++ * QQ protocol side of HITL text answers, at the former questionAnswer position
++ * (before the merge guard, so an answer is never queued behind the waiting
++ * Turn): the standard message goes to the Bridge, which answers the open
++ * question of this Conversation only for the expected person and claims the
++ * platform message once. Anything else continues as ordinary chat input.
++ */
++export function hitlAnswers(manager) {
++    return async (ctx, next) => {
++        const hitl = manager.hitl, msg = ctx.message;
++        if (!hitl) return next();
++        const group = msg.kind === 'group';
++        const result = hitl.answer({
++            conversation: { type: group ? 'group' : 'direct', id: group ? (msg.groupOpenid ?? msg.senderId) : msg.senderId },
++            sender: { id: msg.senderId },
++            message: { ...(typeof msg.messageId === 'string' && msg.messageId ? { id: msg.messageId } : {}), text: (msg.content ?? '').replace(/<@!?[^>]+>\s*/g, '').trim() },
++        });
++        if (result.status === 'pass') return next();
++        // The answer never reaches bot.on('message'): keep its msgId as a passive-reply candidate.
++        if (result.status === 'answered') cacheMsgId(ctx.replyTarget.scope, ctx.replyTarget.targetId, ctx.replyTarget.msgId);
++        ctx.stop(`hitl:${result.status}`);
++    };
++}
 +export function setupMiddlewares(bot, config, manager, logger, conversation) {
      // 1. 错误兜底（最外层洋葱皮）
      bot.use(errorHandler());
      // 2. 消息过滤：bot 回声 + 消息去重
-@@ -12,11 +86,11 @@ export function setupMiddlewares(bot, config, manager, logger) {
+@@ -12,11 +109,11 @@ export function setupMiddlewares(bot, config, manager, logger) {
      bot.use(accessPolicy({
          c2c: {
              mode: config.access.c2cMode,
@@ -478,7 +240,7 @@ index ca4b002..ea7991b 100644
          },
          onBlock: (_mCtx, reason) => {
              if (config.debug) {
-@@ -41,22 +115,62 @@ export function setupMiddlewares(bot, config, manager, logger) {
+@@ -41,22 +138,62 @@ export function setupMiddlewares(bot, config, manager, logger) {
      bot.use(mentionGate({
          requireMentionInGroup: config.requireMention,
      }));
@@ -499,8 +261,6 @@ index ca4b002..ea7991b 100644
 -        // 避免 SDK 再自动注册一个无前缀的 /help 造成重复
 -        autoHelp: false,
 -        commands: buildCommandList({ manager, config }),
--    });
--    bot.use(slash.middleware);
 +    // 8. 斜杠命令（在 concurrencyGuard 之前，命令匹配后不排队直接响应；识别/解析/路由由 Unified Agent I/O 完成）
 +    const commands = [...buildCommandList({ manager, config }), ...(manager.ctx?.get('qqRemoteOps')?.commands(manager) ?? [])];
 +    const stop = commands.find(c => c.name === 'stop');
@@ -526,8 +286,8 @@ index ca4b002..ea7991b 100644
 +    const router = conversation.openCommands({ prefixes: ['/'] });
 +    for (const cmd of commands) router.register(qqCommand(cmd));
 +    bot.use(commandGate(router));
-     // 8.5. 待答问题截获（在 concurrencyGuard 之前，答案消息不排队直接作答）
-     bot.use(questionAnswer(manager));
++    // 8.5. 待答问题文本作答（HITL Bridge；在 concurrencyGuard 之前，答案消息不排队直接作答）
++    bot.use(hitlAnswers(manager));
 +    // Explicit correction only, after access/question admission but before merge.
 +    // Ordinary messages and /stop retain their existing native paths.
 +    bot.use(async (mCtx, next) => {
@@ -545,11 +305,14 @@ index ca4b002..ea7991b 100644
 +        // The shared handoff re-checks the current Session and creates the native input.
 +        const handed = conversation.submit(record, msg.content, { revise: true });
 +        if (handed.status !== 'accepted') throw new Error('Interaction Session changed during admission');
-+    });
+     });
+-    bot.use(slash.middleware);
+-    // 8.5. 待答问题截获（在 concurrencyGuard 之前，答案消息不排队直接作答）
+-    bot.use(questionAnswer(manager));
      // 9. 并发串行 + 消息合并（同 peer 排队，避免 session 冲突）
      bot.use(concurrencyGuard({
          strategy: 'merge',
-@@ -71,7 +185,7 @@ export function setupMiddlewares(bot, config, manager, logger) {
+@@ -71,7 +208,7 @@ export function setupMiddlewares(bot, config, manager, logger) {
          preferMsgElements: true,
      }));
      // 11.5. 附件下载（file 附件下载到本地，供 @提及 / 工具访问）
@@ -558,7 +321,7 @@ index ca4b002..ea7991b 100644
      // 12. 上下文组装（将 history + quote + sender 组成 envelope）
      bot.use(envelopeFormatter({
          historyLimit: config.historyLimit,
-@@ -79,4 +193,4 @@ export function setupMiddlewares(bot, config, manager, logger) {
+@@ -79,4 +216,4 @@ export function setupMiddlewares(bot, config, manager, logger) {
          includeSender: true,
      }));
  }
@@ -786,10 +549,10 @@ index c4998d0..71ed35a 100644
 \ No newline at end of file
 +//# sourceMappingURL=index.js.map
 diff --git a/dist/gateway/bootstrap.js b/dist/gateway/bootstrap.js
-index 070f21e..ce934a8 100644
+index 070f21e..f55123f 100644
 --- a/dist/gateway/bootstrap.js
 +++ b/dist/gateway/bootstrap.js
-@@ -1,6 +1,12 @@
+@@ -1,37 +1,340 @@
 -import { QQBot } from '@tencent-connect/qqbot-nodejs';
 +import { QQBot, MediaFileType } from '@tencent-connect/qqbot-nodejs';
 +import { createHmac, randomBytes, randomUUID } from 'node:crypto';
@@ -799,12 +562,17 @@ index 070f21e..ce934a8 100644
  import { SessionManager } from "../session/index.js";
 -import { handleInbound, createOutboundHandler } from "../transport/index.js";
 +import { handleInbound, createOutboundHandler, chunkMarkdownText } from "../transport/index.js";
-+import { QQ_OFFICIAL, QQ_SCOPES, accessAllows, createQQTextAdapter } from "../transport/qq-text-adapter.js";
++import { QQ_OFFICIAL, QQ_SCOPES, accessAllows, createQQTextAdapter, hitlResponse } from "../transport/qq-text-adapter.js";
 +import { deliverInbound } from "../transport/inbound.js";
  import { ReplyLimiter } from "../transport/reply-limiter.js";
  import { cacheMsgId, cacheEventId } from "../transport/msgid-cache.js";
  import { resolveReplyTarget, sendResolvedMarkdown } from "../transport/reply-target.js";
-@@ -11,7 +17,45 @@ import { buildUserAgent } from "../shared/index.js";
+-import { QuestionChannel } from "../features/question-channel.js";
+-import { ApprovalChannel } from "../features/approval-channel.js";
+-import { decodeButtonData } from "../features/button-utils.js";
++import { buildApprovalText } from "../features/approval-renderer.js";
++import { formatQuestion } from "../features/question-renderer.js";
+ import { buildUserAgent } from "../shared/index.js";
  import { setupMiddlewares } from "./middleware-setup.js";
  import { startMediaCleanup } from "../media/media-cleaner.js";
  import { ensureVisionInputModal, registerDescribeImageTool } from "../media/vision-tool.js";
@@ -848,13 +616,29 @@ index 070f21e..ce934a8 100644
 +    };
 +    return {hash,trace,flush,async close(){closed=true;await flush();}};
 +}
- /**
-  * interaction 统一分发器：按 button_data 的顶层 `t` 判别字段，路由到对应
-  * channel（question / approval）。QQ 只有一个 interaction 入口，集中路由
-@@ -30,8 +74,262 @@ function dispatchInteraction(event, manager) {
-         return manager.approvalChannel?.handleInteraction(event) ?? false;
-     return false;
- }
++/**
++ * QQ side of the Agent I/O HITL Bridge: the QQ Markdown of approvals, questions
++ * and the timeout notice. The Bridge (dsh-agent-io) correlates native Approval
++ * and userQuestions requests with this account's current Sessions, issues their
++ * buttons, sends every prompt through sendMessage() and accepts only the
++ * expected person's answer; the QQ adapter renders the keyboard and turns button
++ * events and text messages into its standard responses. Off with `hitl.enabled:
++ * false`: requests then stay with the native Web/Desktop answerers.
++ */
++export function openQQHITL(conversation, config, logger) {
++    if (config.hitl?.enabled === false) return undefined;
++    return conversation.openHITL({
++        // The person whose message the Session answers: the C2C peer, in a group the sender.
++        responder: record => record.senderId || (record.scope === 'c2c' ? record.peerId : undefined),
++        render: {
++            approval: view => buildApprovalText(view, view.command),
++            question: (question, { actions, conversation: c }) => formatQuestion(question, c?.type === 'group' && config.requireMention === true, actions),
++            timeout: () => '⚠️ 提问已超时，未收到回答。',
++        },
++        questionTimeoutMs: config.askTimeoutMs,
++        logger,
++    });
++}
 +/**
 + * Cancellation controllers of native Turns, per Session. A controller leased by
 + * a submission still in the Unified Agent I/O is never evicted, so /stop always
@@ -1053,7 +837,7 @@ index 070f21e..ce934a8 100644
 +                    if(result.reason!=='cancelled')logger.warn?.(`im-qqbot: interaction ${kind} ${result.status}${result.reason?` (${result.reason})`:''}`);
 +                    throw Object.assign(new Error('QQ output '+result.status),{delivery:result.status,reason:result.reason});
 +                },
-+                waitingForUser: () => manager.approvalChannel?.pending.has(record.sessionKey) || manager.questionChannel?.pending.has(record.sessionKey) });
++                waitingForUser: () => manager.hitl?.waiting(record) === true });
 +            policy.event(event);
 +            if (['assistant/chunk', 'assistant/message'].includes(event.type)) return;
 +        }
@@ -1063,13 +847,28 @@ index 070f21e..ce934a8 100644
 +    return outboundHandler;
 +}
 +const MEDIA_TYPES = { image: 'IMAGE', video: 'VIDEO', voice: 'VOICE', file: 'FILE' };
-+/**
+ /**
+- * interaction 统一分发器：按 button_data 的顶层 `t` 判别字段，路由到对应
+- * channel（question / approval）。QQ 只有一个 interaction 入口，集中路由
+- * 避免多通道各自 try 导致误判。
 + * One trusted local attachment → QQ media message, in two stages so a failure
 + * is classified honestly: the resource is re-checked first (still its own real
 + * path, inside the allowed roots, a regular file), then uploaded without sending
 + * (the SDK retries uploads; an upload alone is invisible to the user), then the
 + * media message is sent. Passive-reply quota as for files before (no event_id).
-+ */
+  */
+-function dispatchInteraction(event, manager) {
+-    const raw = event.data?.resolved?.button_data;
+-    if (!raw)
+-        return false;
+-    const button = decodeButtonData(raw);
+-    if (!button)
+-        return false;
+-    if (button.t === 'question')
+-        return manager.questionChannel?.handleInteraction(event) ?? false;
+-    if (button.t === 'approval')
+-        return manager.approvalChannel?.handleInteraction(event) ?? false;
+-    return false;
 +export async function sendMedia(bot, replyLimiter, config, target, attachment) {
 +    let file;
 +    try { file = await verifyLocalFile(attachment?.resource?.path, config.sendFile, config.cwd || process.cwd(), { expectReal: true }); }
@@ -1089,7 +888,7 @@ index 070f21e..ce934a8 100644
 +        return { id: message?.id, uploaded: upload.file_uuid };
 +    }
 +    catch (error) { throw Object.assign(new Error('QQ media message failed'), { qqStage: 'message', cause: error }); }
-+}
+ }
  export async function bootstrapGateway(ctx, agents, config, logger) {
 +    if (gatewayLeases.has(config.appId)) throw new Error('Duplicate QQ Gateway for this application');
 +    const lease = {};
@@ -1109,12 +908,13 @@ index 070f21e..ce934a8 100644
 +        onInput: (record, message, policy) => { if (policy) manager.trackInteractionInput?.(record, message); } });
 +    ctx.effect(() => conversation.close);
 +    if (typeof conversation.openCommands !== 'function') throw new Error('dsh-agent-io 0.1.0-test.5 or later (commands and attachments) is required before QQ');
++    if (typeof conversation.openHITL !== 'function') throw new Error('dsh-agent-io 0.1.0-test.6 or later (HITL Bridge) is required before QQ');
 +    const deliveryRecorder=createDeliveryRecorder(config.deliveryDiagnostics,logger);
 +    ctx.effect(()=>()=>deliveryRecorder?.close());
      // ── 初始化 QQ Bot SDK ──
      const userAgent = buildUserAgent();
      const bot = new QQBot({
-@@ -45,8 +343,10 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+@@ -45,8 +348,10 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
      });
      logger.info(`QQBot SDK initialized (UA: ${userAgent})`);
      // ── 中间件链 ──
@@ -1127,7 +927,7 @@ index 070f21e..ce934a8 100644
      bot.on('message', async (mCtx) => {
          const msg = mCtx.message;
          // 记录最近 msgId，供无上下文的出站发送（文件发送显式 target、主动推送等）获取被动回复目标
-@@ -54,7 +354,7 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+@@ -54,7 +359,7 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
          if (config.debug) {
              logger.debug(`← message (post-middleware): ${JSON.stringify(msg, null, 2).slice(0, 500)}`);
          }
@@ -1136,7 +936,7 @@ index 070f21e..ce934a8 100644
      });
      // ── 出站：dsh session/event → QQ 消息 ──
      // 获取 tools 服务（工具结果结构化展示），可选
-@@ -65,20 +365,32 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+@@ -65,38 +370,50 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
      catch {
          toolsRegistry = undefined;
      }
@@ -1172,25 +972,42 @@ index 070f21e..ce934a8 100644
 +        limit: config.textChunkLimit ?? 4500,
 +        split: text => chunkMarkdownText(text, config.textChunkLimit ?? 4500),
 +        replyTarget: (_record, messageId) => outboundHandler.delivery(messageId)?.target,
-+        send: (target, text, info) => sender.sendMarkdown(target, text, { delivery: { ...outboundHandler.delivery(info.messageId)?.delivery, session: diagnostics?.hash(info.sessionId), index: info.index } }),
++        send: (target, text, info) => sender.sendMarkdown(target, text, { delivery: { ...outboundHandler.delivery(info.messageId)?.delivery, session: diagnostics?.hash(info.sessionId), index: info.index }, ...(info.keyboard ? { keyboard: info.keyboard } : {}) }),
 +        sendMedia: (target, attachment) => sendMedia(bot, replyLimiter, config, target, attachment),
 +    }));
 +    ctx.effect(() => releaseTextAdapter);
      ctx
          .on('session/event', outboundHandler);
-     // ── 问答通道（ask_user_question → QQ 文本 + 按钮） ──
-@@ -89,6 +401,10 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
-     const approvalChannel = new ApprovalChannel(manager, sender, logger);
-     manager.approvalChannel = approvalChannel;
-     approvalChannel.install(ctx);
+-    // ── 问答通道（ask_user_question → QQ 文本 + 按钮） ──
+-    const questionChannel = new QuestionChannel(manager, sender, config, logger);
+-    manager.questionChannel = questionChannel;
+-    questionChannel.install(ctx);
+-    // ── 审批通道（approval/request → QQ 两按钮审批） ──
+-    const approvalChannel = new ApprovalChannel(manager, sender, logger);
+-    manager.approvalChannel = approvalChannel;
+-    approvalChannel.install(ctx);
+-    // ── 按钮点击回调（interaction）：统一分发到问答/审批通道 ──
++    // ── HITL：原生审批与 ask_user_question 经 Agent I/O HITL Bridge（QQ 文本 + 按钮） ──
++    // Closed with the Conversation wiring (Gateway unload); Session release cancels its requests.
++    manager.hitl = openQQHITL(conversation, config, logger);
 +    ctx.provide('qqGateway', Object.freeze({ bot, manager, sender }));
 +    // Remote Ops is an optional extension. Core messaging and approval own no ops dependency.
 +    const releaseRemoteOps = ctx.get('qqRemoteOps')?.attach({ bot, manager, sender, config });
 +    if (typeof releaseRemoteOps === 'function') ctx.effect(() => releaseRemoteOps);
-     // ── 按钮点击回调（interaction）：统一分发到问答/审批通道 ──
++    // ── 按钮点击回调（interaction）：HITL 按钮交给 Bridge 校验与结算 ──
      bot.on('interaction', async (_iCtx, event) => {
          // scope/targetId 推导对齐消息事件（inbound.ts）：按 scene 判定类型，群用 group_openid，私聊用 user_openid
-@@ -130,15 +446,9 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+         const scope = event.scene === 'group' ? 'group' : 'c2c';
+         const targetId = scope === 'group' ? (event.group_openid ?? event.user_openid) : event.user_openid;
+         // 记录互动事件 id，作为后续被动回复候选（event_id）
+         cacheEventId(scope, targetId, event.id);
+-        const matched = dispatchInteraction(event, manager);
++        const response = hitlResponse(event);
++        const matched = !!response && manager.hitl?.respond(response).status === 'accepted';
+         await bot.acknowledgeInteraction(event.id, matched ? 0 : 3).catch(() => { });
+     });
+     bot.on('error', (err) => {
+@@ -130,15 +447,9 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
      ensureVisionInputModal(config.vision, logger);
      registerDescribeImageTool(ctx, config.vision, logger);
      // ── 附件发送工具注册（qqbot_send_file） ──
@@ -1209,7 +1026,7 @@ index 070f21e..ce934a8 100644
      // ── 生命周期 ──
      ctx
          .effect(() => {
-@@ -146,11 +456,12 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+@@ -146,11 +457,12 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
          bot.start().catch((err) => {
              logger.error(`Bot start failed: ${err instanceof Error ? err.message : String(err)}`);
          });
@@ -1229,7 +1046,7 @@ index 070f21e..ce934a8 100644
 \ No newline at end of file
 +//# sourceMappingURL=bootstrap.js.map
 diff --git a/dist/session/session-manager.js b/dist/session/session-manager.js
-index 5eae070..7f782d1 100644
+index 5eae070..7999a59 100644
 --- a/dist/session/session-manager.js
 +++ b/dist/session/session-manager.js
 @@ -1,536 +1,18 @@
@@ -1763,8 +1580,8 @@ index 5eae070..7f782d1 100644
 +   acceptActivity:(scope,peer,sender,id)=>scope==='c2c'&&peer===sender&&typeof id==='string'&&id.length>0,
 +   isUserInput:target=>typeof target?.msgId==='string'&&target.msgId.length>0,
 +   inputId:target=>target?.msgId,
-+   waitingForUser:record=>!!(manager.questionChannel?.pending.has(record.sessionKey)||manager.approvalChannel?.pending.has(record.sessionKey)),
-+   cancelPending(record){manager.questionChannel?.cancelPending(record.sessionKey);manager.approvalChannel?.cancelPending(record.sessionKey);},
++   waitingForUser:record=>manager.hitl?.waiting(record)===true,
++   cancelPending(record){manager.hitl?.cancel(record);},
 +   prompt:record=>record.scope==='group'?config.groupPrompt:config.directPrompt,
 +   release(record){if(record.typingKeepAlive){clearInterval(record.typingKeepAlive);record.typingKeepAlive=undefined;}manager.releaseOutput?.(record);},
 +  }});
@@ -2333,10 +2150,10 @@ index 1006265..62963ce 100644
 \ No newline at end of file
 +//# sourceMappingURL=inbound.js.map
 diff --git a/dist/config.js b/dist/config.js
-index cc39029..d47f4d4 100644
+index cc39029..c234905 100644
 --- a/dist/config.js
 +++ b/dist/config.js
-@@ -20,8 +20,13 @@ export const ConfigSchema = Schema.object({
+@@ -20,11 +20,19 @@ export const ConfigSchema = Schema.object({
      groupPrompt: Schema.string().description('群聊额外system prompt'),
      directPrompt: Schema.string().description('私聊额外system prompt'),
      textChunkLimit: Schema.number().default(4500).description('单条消息最大字符数'),
@@ -2351,7 +2168,13 @@ index cc39029..d47f4d4 100644
      maxQueue: Schema.number().default(20).description('并发队列最大长度'),
      processingTimeoutMs: Schema.number().default(30 * 60 * 1000).description('处理超时(ms)，超时中断当前 LLM 调用'),
      askTimeoutMs: Schema.number().default(5 * 60 * 1000).description('待答问题超时(ms)，超时自动拒绝并提示'),
-@@ -34,6 +39,7 @@ export const ConfigSchema = Schema.object({
++    hitl: Schema.object({
++        enabled: Schema.boolean().default(true),
++    }).default({ enabled: true }).description('原生审批与 ask_user_question 经 Agent I/O HITL Bridge 在 QQ 展示和作答；关闭后由原生 Web/Desktop 处理'),
+     historyLimit: Schema.number().default(10).description('群历史缓冲条数'),
+     access: AccessControlSchema.default({
+         c2cMode: 'open',
+@@ -34,6 +42,7 @@ export const ConfigSchema = Schema.object({
      }).description('访问控制'),
      showToolResults: Schema.boolean().default(false).description('是否展示工具调用成功结果（错误始终展示）'),
      debug: Schema.boolean().default(false),
@@ -2359,7 +2182,7 @@ index cc39029..d47f4d4 100644
      media: Schema.object({
          enabled: Schema.boolean().default(true).description('是否启用富媒体理解（图片/视频下载 + 工具分析）'),
          maxMB: Schema.number().default(200).description('富媒体下载大小上限(MB)'),
-@@ -68,4 +74,4 @@ export const ConfigSchema = Schema.object({
+@@ -68,4 +77,4 @@ export const ConfigSchema = Schema.object({
          extraRoots: [],
      }).description('附件发送工具配置'),
  });
@@ -2590,16 +2413,17 @@ index f69cedb..6ff2378 100644
 +//# sourceMappingURL=outbound-buffer.js.map
 diff --git a/dist/transport/qq-text-adapter.js b/dist/transport/qq-text-adapter.js
 new file mode 100644
-index 0000000..883dbd3
+index 0000000..032c130
 --- /dev/null
 +++ b/dist/transport/qq-text-adapter.js
-@@ -0,0 +1,116 @@
+@@ -0,0 +1,156 @@
 +/**
 + * QQ Official text and basic media adapter for the Unified Agent I/O (dsh-agent-io).
 + *
 + * Owns only QQ protocol: the reply target of the trusted Conversation Manager
 + * record, passive-reply quota and diagnostics (reused from the gateway sender),
-+ * platform chunking, media upload/send of trusted local resources, and QQ API
++ * platform chunking, media upload/send of trusted local resources, the keyboard
++ * of HITL Bridge actions and the decoding of its button events, and QQ API
 + * error classification. The route itself (access,
 + * current Session of exactly this Conversation) is the shared Conversation
 + * wiring's; ordering, cancellation and duplicate suppression belong to the I/O
@@ -2664,9 +2488,46 @@ index 0000000..883dbd3
 +    if (mode !== 'allowlist' || !Array.isArray(policy.allow)) return false;
 +    return policy.allow.some(value => value === '*' || value === peerId);
 +}
++// ── HITL actions ↔ QQ keyboard ──
++// QQ shows at most five rows; two buttons per row keeps labels readable.
++const BUTTONS_PER_ROW = 2, MAX_ACTION_BUTTONS = 10, BUTTON_LABEL_MAX = 10;
++const buttonLabel = text => { const s = String(text ?? '').trim(); return s.length > BUTTON_LABEL_MAX ? s.slice(0, BUTTON_LABEL_MAX - 1) + '…' : s; };
++/**
++ * The QQ keyboard of one Bridge-issued action set: one single-choice group; the
++ * button data names only the request ref and the option value (never a target,
++ * an id or a permission). The operator is checked by the Bridge when the click
++ * arrives, so every member may press (permission type 2) but only the expected
++ * person's click counts.
++ */
++export function actionKeyboard(actions) {
++    const rows = [];
++    for (let i = 0; i < actions.options.length; i += BUTTONS_PER_ROW) {
++        rows.push({ buttons: actions.options.slice(i, i + BUTTONS_PER_ROW).map((o, k) => ({
++                id: `hitl-${i + k}`,
++                render_data: { label: buttonLabel(o.label), visited_label: buttonLabel(o.doneLabel ?? o.label), style: o.style === 'primary' ? 1 : 0 },
++                action: { type: 1, permission: { type: 2 }, click_limit: 1, data: JSON.stringify({ t: 'hitl', r: actions.ref, v: o.value }) },
++                group_id: `hitl-${actions.ref.slice(0, 8)}`,
++            })) });
++    }
++    return { content: { rows } };
++}
++/**
++ * A QQ button event → the Bridge's standard response, or undefined when it is
++ * not a well-formed HITL button. The Conversation and the operator come from the
++ * event's own fields (group: the clicking member), never from the button data.
++ */
++export function hitlResponse(event) {
++    let data;
++    try { data = JSON.parse(event?.data?.resolved?.button_data ?? ''); } catch { return undefined; }
++    if (data?.t !== 'hitl' || typeof data.r !== 'string' || typeof data.v !== 'string') return undefined;
++    const group = typeof event.group_openid === 'string' && event.group_openid.length > 0;
++    const conversationId = group ? event.group_openid : event.user_openid, operator = group ? event.group_member_openid : event.user_openid;
++    if (typeof conversationId !== 'string' || !conversationId || typeof operator !== 'string' || !operator) return undefined;
++    return { conversation: { type: group ? 'group' : 'direct', id: conversationId }, sender: { id: operator }, ref: data.r, value: data.v };
++}
 +/**
 + * Protocol parts for `conversation.registerAdapter()`.
-+ * @param send         (replyTarget, text, {index, sessionId, messageId}) → SDK result; resolves the
++ * @param send         (replyTarget, text, {index, sessionId, messageId, keyboard?}) → SDK result; resolves the
 + *                     passive/active target through the gateway sender (quota, diagnostics).
 + * @param split        text → markdown-aware chunks.
 + * @param limit        hard per-message character limit.
@@ -2694,9 +2555,11 @@ index 0000000..883dbd3
 +        split: text => hardLimit(split(text), limit),
 +        async send(route, text, info) {
 +            const record = route.record;
-+            const result = await send({ ...targetFor(record, info.messageId) }, text, { index: info.index, sessionId: record.sessionId, messageId: info.messageId });
++            const result = await send({ ...targetFor(record, info.messageId) }, text, { index: info.index, sessionId: record.sessionId, messageId: info.messageId, ...(info.actions ? { keyboard: actionKeyboard(info.actions) } : {}) });
 +            return { receipt: typeof result?.id === 'string' ? result.id : undefined };
 +        },
++        // HITL actions as a keyboard under the last text part.
++        acceptsActions: actions => Array.isArray(actions?.options) && actions.options.length > 0 && actions.options.length <= MAX_ACTION_BUTTONS,
 +        // Only trusted local resources: a remote URL would let a caller make QQ
 +        // fetch an arbitrary address on its behalf.
 +        ...(typeof sendMedia === 'function' ? {

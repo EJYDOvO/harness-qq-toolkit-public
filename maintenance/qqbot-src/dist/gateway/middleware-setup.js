@@ -1,7 +1,7 @@
 import { errorHandler, messageFilter, accessPolicy, mentionGate, contentSanitizer, rateLimiter, concurrencyGuard, typingIndicator, quoteRef, historyBuffer, envelopeFormatter, } from '@tencent-connect/qqbot-nodejs';
 import { buildCommandList } from "../commands/index.js";
 import { downloadMediaAttachments } from "../transport/attachment.js";
-import { questionAnswer } from "../middleware/question-answer.js";
+import { cacheMsgId } from "../transport/msgid-cache.js";
 import { getHistoryStore, historyGroupKey } from "../features/history-store.js";
 /**
  * A QQ command spec (SDK SlashCommand shape: name, scope, authorized, handler)
@@ -75,6 +75,29 @@ export function attachmentDownloads(config, logger) {
         const quoted = ctx.state.quote?.attachments;
         if (quoted?.length) ctx.state.downloadedQuoteFiles = await each(quoted.map(a => ({ content_type: a.contentType ?? '', filename: a.filename ?? '', size: 0, url: a.url })));
         await next();
+    };
+}
+/**
+ * QQ protocol side of HITL text answers, at the former questionAnswer position
+ * (before the merge guard, so an answer is never queued behind the waiting
+ * Turn): the standard message goes to the Bridge, which answers the open
+ * question of this Conversation only for the expected person and claims the
+ * platform message once. Anything else continues as ordinary chat input.
+ */
+export function hitlAnswers(manager) {
+    return async (ctx, next) => {
+        const hitl = manager.hitl, msg = ctx.message;
+        if (!hitl) return next();
+        const group = msg.kind === 'group';
+        const result = hitl.answer({
+            conversation: { type: group ? 'group' : 'direct', id: group ? (msg.groupOpenid ?? msg.senderId) : msg.senderId },
+            sender: { id: msg.senderId },
+            message: { ...(typeof msg.messageId === 'string' && msg.messageId ? { id: msg.messageId } : {}), text: (msg.content ?? '').replace(/<@!?[^>]+>\s*/g, '').trim() },
+        });
+        if (result.status === 'pass') return next();
+        // The answer never reaches bot.on('message'): keep its msgId as a passive-reply candidate.
+        if (result.status === 'answered') cacheMsgId(ctx.replyTarget.scope, ctx.replyTarget.targetId, ctx.replyTarget.msgId);
+        ctx.stop(`hitl:${result.status}`);
     };
 }
 export function setupMiddlewares(bot, config, manager, logger, conversation) {
@@ -151,8 +174,8 @@ export function setupMiddlewares(bot, config, manager, logger, conversation) {
     const router = conversation.openCommands({ prefixes: ['/'] });
     for (const cmd of commands) router.register(qqCommand(cmd));
     bot.use(commandGate(router));
-    // 8.5. 待答问题截获（在 concurrencyGuard 之前，答案消息不排队直接作答）
-    bot.use(questionAnswer(manager));
+    // 8.5. 待答问题文本作答（HITL Bridge；在 concurrencyGuard 之前，答案消息不排队直接作答）
+    bot.use(hitlAnswers(manager));
     // Explicit correction only, after access/question admission but before merge.
     // Ordinary messages and /stop retain their existing native paths.
     bot.use(async (mCtx, next) => {
