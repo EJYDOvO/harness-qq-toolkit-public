@@ -92,16 +92,20 @@ export function createHITLBridge({io,manager,wiring,responder,render,labels={},a
 
  /**
   * One logical prompt message through the I/O (same Conversation order, current
-  * Session check before every part, duplicate suppression, cancellation).
-  * → shown | maybe (the outcome is unknown: never resent) | not-shown | settled
+  * Session check before every part, duplicate suppression, cancellation). A
+  * question's prompt also stops with its own question: once that is answered,
+  * parts not yet handed to the platform are not sent (a part in flight is).
+  * → shown | maybe (the outcome is unknown: never resent) | not-shown | settled | superseded
   */
  async function present(entry,text,actions,suffix){
+  const own=entry.current;
   let result;
   try{
    result=await io.sendMessage({id:`hitl:${entry.sessionId}:${entry.ref}${suffix}`,target:wiring.target(entry.record),origin:{sessionId:entry.sessionId},
-    message:{text,...(actions?{actions}:{})},signal:entry.sending.signal});
+    message:{text,...(actions?{actions}:{})},signal:own?AbortSignal.any([entry.sending.signal,own.signal]):entry.sending.signal});
   }catch{result={status:'unknown',parts:[]};}
   if(entry.done)return 'settled';
+  if(own&&own!==entry.current)return 'superseded';
   let state;
   if(actions){const part=result.parts?.find(p=>p.actions);state=part?.status==='sent'?'shown':part?.status==='unknown'?'maybe':'not-shown';}
   else state=result.status==='sent'?'shown':['unknown','partial'].includes(result.status)?'maybe':'not-shown';
@@ -149,7 +153,7 @@ export function createHITLBridge({io,manager,wiring,responder,render,labels={},a
   if(!responderId)return Promise.reject(aborted('ask_user_question has no answerer in this conversation'));
   questions.get(record.sessionId)?.fail(aborted('superseded by a new question'));
   return new Promise((resolve,reject)=>{
-   const entry={kind:'question',record,sessionId:record.sessionId,conversation:wiring.target(record).conversation,responder:responderId,ref:newRef(),request,index:0,collected:[],sending:new AbortController()};
+   const entry={kind:'question',record,sessionId:record.sessionId,conversation:wiring.target(record).conversation,responder:responderId,ref:newRef(),request,index:0,collected:[],sending:new AbortController(),current:new AbortController()};
    entry.settle=value=>{if(finish(entry))resolve(value);};
    entry.fail=error=>{if(finish(entry))reject(error);};
    entry.onAbort=()=>entry.fail(aborted('ask_user_question was aborted before the user answered'));
@@ -200,7 +204,9 @@ export function createHITLBridge({io,manager,wiring,responder,render,labels={},a
  function advance(entry,answer){
   entry.collected.push(answer);entry.index++;
   if(entry.index>=entry.request.questions.length){entry.settle({answers:entry.collected});return;}
-  // The next question gets a new ref: buttons of the previous one are stale.
+  // The next question gets a new ref (buttons of the previous one are stale) and
+  // its own controller: unsent parts of the answered one stop, the next is unaffected.
+  entry.current.abort();entry.current=new AbortController();
   refs.delete(entry.ref);entry.ref=newRef();refs.set(entry.ref,entry);
   arm(entry);void ask(entry);
  }

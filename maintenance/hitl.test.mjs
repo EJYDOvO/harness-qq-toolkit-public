@@ -286,3 +286,29 @@ test('the Bridge itself hands a request it does not own to the next answerer, an
  assert.deepEqual(f.click(f.sent[0],1),{status:'accepted'});stop.abort();
  assert.equal(await outcome,'rejected');assert.deepEqual({...f.hitl.size()},{approvals:0,questions:0,refs:0});
 });
+
+test('an answered question stops: its queued or unsent parts never follow, the next question is not cancelled',async()=>{
+ // Q1 queued behind earlier output and answered before it went out.
+ let release;const held=new Promise(r=>{release=()=>r({id:'held'});});
+ const bridge=c=>c.openHITL({responder:r=>r.senderId,render:{approval:()=>'审批',question:x=>x.question}});
+ const a=setup({send:m=>m.text==='earlier'?held:{id:'ok'},bridge}),r1=a.add('c2c','owner');
+ const earlier=a.io.sendMessage({target:a.conversation.target(r1),origin:{sessionId:r1.sessionId},message:{text:'earlier'}});
+ const first=a.ask(r1,[q('a'),q('b')]);await tick();
+ assert.deepEqual(a.text(r1,'答一',{id:'x1'}),{status:'answered'});
+ release();await earlier;await tick(20);
+ assert.deepEqual(a.sent.map(m=>m.text),['earlier','问题 b'],'the answered question is not sent late; the next one is');
+ assert.deepEqual(a.text(r1,'答二',{id:'x2'}),{status:'answered'});assert.equal((await first).answers.length,2);
+ // Q1 in parts, answered while its first part is in flight: that part completes, the rest is skipped.
+ let open;const inFlight=new Promise(r=>{open=()=>r({id:'p1'});});
+ const b=setup({split:t=>t.split('|'),send:m=>m.text==='一'?inFlight:{id:'ok'},bridge:c=>c.openHITL({responder:r=>r.senderId,render:{approval:()=>'审批',question:x=>x.id==='a'?'一|二|三':'下一题'}})}),r2=b.add('c2c','owner');
+ const second=b.ask(r2,[q('a'),q('b')]);await tick();
+ assert.deepEqual(b.text(r2,'答',{id:'y1'}),{status:'answered'});open();await tick(20);
+ assert.deepEqual(b.sent.map(m=>m.text),['一','下一题'],'the part already handed to QQ stays sent; parts not yet started are not');
+ b.text(r2,'答',{id:'y2'});await second;
+ // An unknown first prompt is not resent and does not cancel the next question.
+ const c=setup({send:m=>{if(m.text.startsWith('问题 a'))throw new ApiError(0);return {id:'ok'};}}),r3=c.add('c2c','owner');
+ const third=c.ask(r3,[q('a',['甲','乙']),q('b')]);await tick(20);
+ assert.deepEqual(c.text(r3,'1',{id:'z1'}),{status:'answered'});await tick(20);
+ assert.deepEqual(c.sent.map(m=>m.text.split('\n')[0]),['问题 a','问题 b'],'one attempt for the unknown prompt, then the next question');
+ c.text(r3,'答',{id:'z2'});await third;
+});
