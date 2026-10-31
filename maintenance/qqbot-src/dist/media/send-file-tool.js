@@ -1,13 +1,14 @@
 /**
- * 内置 qqbot_send_file 工具 — 将本地文件发送给 QQ 用户或群。
+ * 内置 qqbot_send_file 工具 — 将本地文件发送给当前 QQ 会话（用户或群）。
  *
- *   - 发送目标默认自动定位（exec.agent → SessionManager.findByAgent → replyTarget），
- *     无需模型手动传 openid；显式 target 参数作为覆盖。
- *   - 按扩展名分发到 SDK 的 sendImage / sendVideo / sendVoice / sendFile。
- *   - 路径白名单：默认只允许访问 media 目录 + agent cwd，可开关 + 扩展白名单。
+ *   - 发送目标只能是调用工具的 Agent 所在的当前会话（exec.agent → SessionManager.findByAgent）；
+ *     显式 target 仅为兼容保留，且必须与当前会话一致，模型不能借它改发给其他 openid。
+ *   - 文件作为一条附件消息交给 Unified Agent I/O：同会话顺序、逻辑 ID 去重、取消、
+ *     每个分片前的会话/访问复核与诚实结果；QQ Adapter 负责上传和媒体消息。
+ *   - 路径白名单：默认只允许访问 media 目录 + agent cwd，可开关 + 扩展白名单；发送前再复核。
  */
-import { existsSync } from 'node:fs';
 import { stat, realpath } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { basename, isAbsolute, relative, resolve } from 'node:path';
 import { MEDIA_ROOT } from "./media-cleaner.js";
 /** 工具名（qqbot 前缀避免与其他通道的同名工具冲突） */
@@ -19,6 +20,11 @@ const DESCRIPTION = 'Send a local file (image, video, voice, or generic file) to
 const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp']);
 const VIDEO_EXTS = new Set(['.mp4', '.mov', '.avi', '.mkv', '.webm']);
 const VOICE_EXTS = new Set(['.mp3', '.wav', '.ogg', '.aac', '.silk', '.amr']);
+/** 按扩展名归类为 Unified Agent I/O 附件类型 */
+export function attachmentKind(filePath) {
+    const ext = filePath.slice(filePath.lastIndexOf('.')).toLowerCase();
+    return IMAGE_EXTS.has(ext) ? 'image' : VIDEO_EXTS.has(ext) ? 'video' : VOICE_EXTS.has(ext) ? 'voice' : 'file';
+}
 /** 解析显式 target（"c2c:openid" / "group:openid"），非法返回 undefined */
 function parseTarget(input) {
     const idx = input.indexOf(':');
@@ -46,14 +52,33 @@ async function isPathAllowed(filePath, config, cwd) {
     }
     return false;
 }
+/**
+ * 可信本地文件：解析符号链接后的真实路径在白名单内，且是普通文件。
+ * expectReal 为发送前复核：资源路径必须仍是自身的真实路径（中途被换成指向别处的
+ * 符号链接、删除或替换为目录都会被拒绝）。返回 {path, size}，否则抛出带原因的错误。
+ */
+export async function verifyLocalFile(filePath, sendFile, cwd, { expectReal = false } = {}) {
+    if (typeof filePath !== 'string' || !filePath) throw Object.assign(new Error('empty path'), { reason: 'invalid-path' });
+    let real;
+    try { real = await realpath(resolve(filePath)); }
+    catch { throw Object.assign(new Error('file does not exist'), { reason: 'missing' }); }
+    if (expectReal && real !== filePath) throw Object.assign(new Error('resource changed since it was checked'), { reason: 'changed' });
+    if (!await isPathAllowed(real, sendFile, cwd)) throw Object.assign(new Error('path outside the allowed directories'), { reason: 'outside-roots', path: real });
+    const info = await stat(real);
+    if (!info.isFile()) throw Object.assign(new Error('not a regular file'), { reason: 'not-file', path: real });
+    return { path: real, size: info.size };
+}
 /** 注册 qqbot_send_file 工具（tools 服务缺失时优雅降级，不阻断插件启动） */
-export function registerSendFileTool(ctx, bot, manager, config, logger) {
+export function registerSendFileTool(ctx, _bot, manager, config, logger) {
     const tools = ctx.get('tools');
     if (!tools?.register) {
         logger.warn('im-qqbot: tools 服务不可用，qqbot_send_file 工具未注册');
         return;
     }
     const cwd = config.cwd || process.cwd();
+    // A provably unsent file (refused, upload failed) may be tried again under a
+    // new logical id; an unknown or sent one keeps its id, so it is never resent.
+    const retries = new Map();
     const definition = {
         name: SEND_FILE_TOOL_NAME,
         description: DESCRIPTION,
@@ -66,7 +91,7 @@ export function registerSendFileTool(ctx, bot, manager, config, logger) {
                 },
                 target: {
                     type: 'string',
-                    description: 'Optional send target as "c2c:openid" or "group:openid". Omit to send to the current conversation.',
+                    description: 'Optional; only the current conversation ("c2c:openid" or "group:openid") is accepted. Omit it.',
                 },
             },
             required: ['file_path'],
@@ -95,63 +120,55 @@ export function registerSendFileTool(ctx, bot, manager, config, logger) {
             if (typeof file_path !== 'string' || file_path.length === 0) {
                 throw new Error('qqbot_send_file: `file_path` must be a non-empty string');
             }
-            // 1. 解析发送目标：显式 target > 当前会话（exec.agent → SessionRecord）
-            let replyTarget;
+            // 1. 发送目标：只取调用者 Agent 的当前会话；模型给出的 target 不能扩大范围
+            const record = exec.agent !== undefined ? manager.findByAgent(exec.agent) : undefined;
+            if (record === undefined || typeof manager.submitOutput !== 'function') {
+                throw new Error('qqbot_send_file: 当前 Agent 没有 QQ 会话，无法发送');
+            }
             if (target !== undefined && target !== '') {
-                replyTarget = parseTarget(target);
-                if (replyTarget === undefined) {
-                    throw new Error(`qqbot_send_file: target 格式错误，需要 c2c:openid 或 group:openid，收到: ${target}`);
+                const named = parseTarget(target);
+                if (named === undefined) {
+                    throw new Error(`qqbot_send_file: target 格式错误，需要 c2c:openid 或 group:openid`);
+                }
+                if (named.scope !== record.scope || named.targetId !== record.peerId) {
+                    throw new Error('qqbot_send_file: target must be the current conversation; files are only sent there');
                 }
             }
-            else if (exec.agent !== undefined) {
-                replyTarget = manager.findByAgent(exec.agent)?.replyTarget;
+            // 2. 校验文件 + 路径白名单（真实路径；发送前 Adapter 再复核一次）
+            let file;
+            try { file = await verifyLocalFile(file_path, config.sendFile, cwd); }
+            catch (error) {
+                if (error.reason === 'outside-roots') throw new Error(`qqbot_send_file: file_path 不在允许的目录内: ${error.path}`);
+                if (error.reason === 'not-file') throw new Error(`qqbot_send_file: 路径不是普通文件: ${error.path}`);
+                throw new Error(`qqbot_send_file: 文件不存在: ${resolve(file_path)}`);
             }
-            if (replyTarget === undefined) {
-                throw new Error('qqbot_send_file: 无法确定发送目标，请显式传 target 参数');
+            const fileName = basename(file.path);
+            // 3. 一条附件消息交给 Unified Agent I/O。逻辑 ID 由会话、轮次与真实路径决定：
+            //    同一轮内对同一文件的重复调用（含结果未知后的重试）得到第一次的结果，不会再发。
+            const turn = manager.latestTurn?.(record);
+            const base = `qq:${record.sessionId}:${Number.isSafeInteger(turn) ? turn : '-'}:file:${createHash('sha256').update(file.path).digest('hex').slice(0, 16)}`;
+            const attempt = retries.get(base) ?? 0, id = attempt ? `${base}:${attempt}` : base;
+            const result = await manager.submitOutput(record, { attachments: [{ kind: attachmentKind(file.path), name: fileName, size: file.size, resource: { type: 'local', path: file.path } }] },
+                { id, turn, signal: exec.signal instanceof AbortSignal ? exec.signal : undefined, delivery: { kind: 'tool-or-error' } });
+            const part = result.parts?.find(p => p.attachment === 0);
+            if (result.status === 'not-sent') {
+                retries.delete(base); retries.set(base, attempt + 1);
+                while (retries.size > 256) retries.delete(retries.keys().next().value);
             }
-            const access = config.access;
-            const mode = replyTarget.scope === 'c2c' ? access.c2cMode : access.groupMode;
-            const allow = replyTarget.scope === 'c2c' ? access.c2cAllow : access.groupAllow;
-            if (mode !== 'open' && !(mode === 'allowlist' && allow.includes(replyTarget.targetId))) {
-                throw new Error('qqbot_send_file: recipient is not allowed by the access policy');
+            if (result.status === 'sent') {
+                logger.info(`im-qqbot: qqbot_send_file 发送 ${attachmentKind(file.path)} (${file.size} bytes)${result.duplicate ? ' (duplicate, not resent)' : ''}`);
+                return {
+                    fileName,
+                    fileSize: file.size,
+                    target: `${record.scope}:${record.peerId}`,
+                    fileUuid: part?.uploaded ?? '',
+                    ...(part?.receipt !== undefined ? { messageId: part.receipt } : {}),
+                };
             }
-            // 2. 校验文件 + 路径白名单
-            const absPath = await realpath(resolve(file_path));
-            if (!await isPathAllowed(absPath, config.sendFile, cwd)) {
-                throw new Error(`qqbot_send_file: file_path 不在允许的目录内: ${absPath}`);
+            if (result.status === 'unknown') {
+                throw new Error(`qqbot_send_file: 发送结果未知（${result.reason ?? 'unknown'}），文件可能已到达 QQ，不会自动重发`);
             }
-            if (!existsSync(absPath)) {
-                throw new Error(`qqbot_send_file: 文件不存在: ${absPath}`);
-            }
-            const info = await stat(absPath);
-            if (!info.isFile()) {
-                throw new Error(`qqbot_send_file: 路径不是普通文件: ${absPath}`);
-            }
-            // 3. 按扩展名分类发送
-            const fileName = basename(absPath);
-            const ext = absPath.slice(absPath.lastIndexOf('.')).toLowerCase();
-            const source = { localPath: absPath };
-            let result;
-            if (IMAGE_EXTS.has(ext)) {
-                result = await bot.sendImage(replyTarget, source);
-            }
-            else if (VIDEO_EXTS.has(ext)) {
-                result = await bot.sendVideo(replyTarget, source);
-            }
-            else if (VOICE_EXTS.has(ext)) {
-                result = await bot.sendVoice(replyTarget, source);
-            }
-            else {
-                result = await bot.sendFile(replyTarget, source, { fileName });
-            }
-            logger.info(`im-qqbot: qqbot_send_file 发送 ${fileName} (${info.size} bytes) → ${replyTarget.scope}:${replyTarget.targetId}`);
-            return {
-                fileName,
-                fileSize: info.size,
-                target: `${replyTarget.scope}:${replyTarget.targetId}`,
-                fileUuid: result.upload.file_uuid,
-                ...(result.message?.id !== undefined ? { messageId: result.message.id } : {}),
-            };
+            throw new Error(`qqbot_send_file: 未发送（${result.reason ?? result.status}）`);
         },
     };
     tools.register(definition);

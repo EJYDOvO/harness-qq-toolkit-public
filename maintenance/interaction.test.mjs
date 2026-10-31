@@ -3,6 +3,7 @@
 import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import vm from 'node:vm';
 import {createAgentIO} from '../plugin-sources/dsh-agent-io/io.mjs';
 import {createConversations} from '../plugin-sources/dsh-agent-io/conversation.mjs';
+import {createTurnControls} from './qq-conversation-fixture.mjs';
 const base=new URL('./qqbot-src/dist/gateway/',import.meta.url);
 // The shared Conversation wiring as the agent-io plugin builds it, with a stand-in native message.
 const wiring=(io,manager,interactionPolicy,extra={})=>createConversations(io,{createInput:m=>({id:'native-'+Math.random().toString(36).slice(2),...m}),interactionPolicy})({platform:'qq-official',adapter:'qq-official-gateway',accountId:extra.accountId??'app',manager,scopes:{direct:'c2c',group:'group'},admits:()=>true,...extra});
@@ -18,7 +19,7 @@ function outbound(policy,streaming=true,diagnostics){
  const conversation=wiring(io,manager,a=>{assert.equal(a,record.agent);return policy;});
  const handler=vm.runInNewContext('(function(){'+body+';return outboundHandler;})()',{
   ctx:{get:()=>{throw Error('the policy comes from the shared Conversation wiring');}},manager,sender,config:{streaming,appId:'app'},logger:{},toolsRegistry:undefined,diagnostics,io,conversation,
-  AbortController,AbortSignal,randomUUID:()=>'0123abcd-0000-4000-8000-000000000000',
+  AbortController,AbortSignal,createTurnControls,randomUUID:()=>'0123abcd-0000-4000-8000-000000000000',
   createOutboundHandler:(_m,s)=>async(session,event)=>{legacy.push(event.type);if(event.type==='tool/result')await s.deliverText(record,'tool error','sendToolResult');}
  });
  return {handler,sent,legacy,delivered,record,manager,io,session:{header:{id:'fixture'}}};
@@ -26,7 +27,9 @@ function outbound(policy,streaming=true,diagnostics){
 test('QQ bridge absent policy keeps the original router, whose static text goes to the Unified I/O',async()=>{
  const f=outbound();await f.handler(f.session,{type:'assistant/message'});await f.handler(f.session,{type:'tool/result'});assert.deepEqual(f.legacy,['assistant/message','tool/result']);
  assert.equal(f.sent.length,0,'no direct sendMarkdown');assert.equal(f.delivered.length,1);
- assert.deepEqual(JSON.parse(JSON.stringify(f.delivered[0])),{target:{platform:'qq-official',accountId:'app',conversation:{type:'direct',id:'owner'}},origin:{sessionId:'fixture'},message:{text:'tool error'}});
+ const {signal,...request}=f.delivered[0];
+ assert.deepEqual(JSON.parse(JSON.stringify(request)),{target:{platform:'qq-official',accountId:'app',conversation:{type:'direct',id:'owner'}},origin:{sessionId:'fixture'},message:{text:'tool error'}});
+ assert.equal(signal?.aborted,false,'output without a Turn still carries the Session controller, so /stop reaches it');
 });
 test('QQ bridge delegates policy output once, keeps tool errors on ordered external channel',async()=>{
  const events=[],external=[],p={bind(t){this.transport=t;},event:e=>events.push(e.type),external:async(t,m)=>external.push([t,m])};
@@ -55,13 +58,14 @@ test('native Host context does not stop QQ output, and cannot clear background s
  }
 });
 function middleware(enabled=true){
- const source=fs.readFileSync(new URL('middleware-setup.js',base),'utf8').replace(/^import .*;\r?\n/gm,'').replace('export function setupMiddlewares','function setupMiddlewares');
+ const source=fs.readFileSync(new URL('middleware-setup.js',base),'utf8').replace(/^import .*;\r?\n/gm,'').replaceAll('export function ','function ');
  const chain=[],events=[],agent={status:'running'},policy={revise:m=>events.push(['revise',m]),stopOutput:()=>events.push(['stop-output'])};
  const record={agent,scope:'c2c',peerId:'owner'},manager={getOrCreate:async()=>record,getSessionRecord:()=>record,isCurrentSession:r=>r===record};
  // enabled==='throw': a reloading policy service that cannot resolve this Agent.
  const conversation=wiring(createAgentIO(),manager,()=>{if(enabled==='throw')throw Error('Agent outside Interaction scope');return enabled?policy:undefined;});
+ conversation.openInbound(()=>({status:'accepted'}));
+ // The real command gate and Agent I/O command router; only the commands are stand-ins.
  const sandbox={buildCommandList:()=>[{name:'stop',handler:()=>events.push(['native-stop'])}],
-  slashCommand:({commands})=>({middleware:async(c,next)=>c.message.content==='/stop'?commands.find(x=>x.name==='stop').handler(c):next()}),
   questionAnswer:()=>async(c,next)=>{if(c.answerPending)events.push(['answer']);else await next();},
   concurrencyGuard:()=>async(_c,next)=>{events.push(['merge']);await next();},getHistoryStore(){},historyGroupKey(){},
   accessPolicy:()=>async(c,next)=>{if(c.message.senderId==='owner')await next();else events.push(['blocked']);}
@@ -69,7 +73,8 @@ function middleware(enabled=true){
  for(const name of ['errorHandler','messageFilter','mentionGate','contentSanitizer','rateLimiter','typingIndicator','quoteRef','historyBuffer','envelopeFormatter','attachmentProcessor'])sandbox[name]=()=>async(_c,next)=>next();
  const setup=vm.runInNewContext(source+';setupMiddlewares;',sandbox);
  setup({use:f=>chain.push(f)},{access:{c2cMode:'allowlist',c2cAllow:['owner'],groupMode:'disabled',groupAllow:[]}},manager,{},conversation);
- const run=async(content,extra={})=>{const c={message:{content,kind:'c2c',senderId:'owner',...extra.message},...extra};let i=0;const next=async()=>{if(i<chain.length)await chain[i++](c,next);else events.push(['inbound']);};await next();};
+ let seq=0;
+ const run=async(content,extra={})=>{const c={message:{content,kind:'c2c',senderId:'owner',messageId:'m'+(++seq),...extra.message},state:{},bot:{sendText:async()=>{}},stop(){this.stopped=true;},...extra};let i=0;const next=async()=>{if(i<chain.length)await chain[i++](c,next);else events.push(['inbound']);};await next();};
  return {run,events,agent,manager,record};
 }
 test('explicit correction passes access and question guards but avoids merge and double followup',async()=>{

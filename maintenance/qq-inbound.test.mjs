@@ -27,6 +27,8 @@ const profile=process.env.QQBOT_TEST_PROFILE??fileURLToPath(new URL('../data/pro
 const sdkFile=path.join(profile,'node_modules/@tencent-connect/qqbot-nodejs/dist/middleware/index.js');
 const sdk=fs.existsSync(sdkFile)?await import(pathToFileURL(sdkFile).href):null;
 const needsSdk={skip:sdk?false:'no validation profile with the installed SDK middlewares'};
+// The reviewed QQ command gate and spec mapping (middleware-setup.js).
+const {qqCommand,commandGate}=vm.runInNewContext(strip(read('gateway/middleware-setup.js'))+';({qqCommand,commandGate})',{});
 
 function agent(id){
  const a={id,status:'idle',received:[],followup(m){a.received.push(m);},whenIdle:()=>a.idle??Promise.resolve()};return a;
@@ -47,9 +49,11 @@ function gateway({io=createAgentIO(),appId='app-a',access=owner,commands=[]}={})
  // The same wiring as bootstrapGateway: one Conversation wiring and channel per QQ application.
  const conversation=qqConversation({io,manager:mgr,config,policy:()=>mgr.policy});
  const channel=conversation.openInbound(s=>inbound.deliverInbound(s,conversation,config,logger));
+ // Commands: the Agent I/O router of this wiring behind the reviewed QQ gate.
+ const router=conversation.openCommands({prefixes:['/']});for(const c of commands)router.register(qqCommand(c));const gate=commandGate(router);
  const replies=[],typing=[];
  const final=ctx=>inbound.handleInbound(ctx,logger,channel);
- const chain=sdk?[sdk.messageFilter({skipSelfEcho:false}),sdk.accessPolicy({c2c:{mode:access.c2cMode,allow:access.c2cAllow},group:{mode:access.groupMode,allow:access.groupAllow}}),sdk.mentionGate({requireMentionInGroup:true}),sdk.slashCommand({autoHelp:false,commands}).middleware,sdk.concurrencyGuard({strategy:'merge',maxQueue:10})]:[];
+ const chain=sdk?[sdk.messageFilter({skipSelfEcho:false}),sdk.accessPolicy({c2c:{mode:access.c2cMode,allow:access.c2cAllow},group:{mode:access.groupMode,allow:access.groupAllow}}),sdk.mentionGate({requireMentionInGroup:true}),gate,sdk.concurrencyGuard({strategy:'merge',maxQueue:10})]:[];
  const event=({kind='c2c',sender='owner',group,id='msg-1',content='你好',attachments=[],mention=false}={})=>{
   const target={scope:kind==='group'?'group':'c2c',targetId:kind==='group'?group:sender,msgId:id};
   return {message:{kind,senderId:sender,groupOpenid:group,messageId:id,content,attachments,senderIsBot:false,replyTarget:target,...(mention?{rawEventType:'GROUP_AT_MESSAGE_CREATE'}:{})},
@@ -130,6 +134,45 @@ test('/stop stays a command, attachments still reach the chat flow',needsSdk,asy
  await g.push({id:'c1',content:'/stop'});assert.deepEqual(stops,[1]);assert.equal(all(g).length,0,'never chat input');assert.deepEqual(g.replies,['已中止']);
  await g.push({id:'c2',content:'',attachments:[{content_type:'application/pdf',filename:'a.pdf',size:10}]});
  assert.equal(all(g).length,1);assert.match(texts(g)[0],/\[文件\]/);assert.match(texts(g)[0],/a\.pdf/);
+});
+test('/stop runs at once while the running Turn holds the merge guard, and only once',needsSdk,async()=>{
+ const stops=[],g=gateway({commands:[{name:'stop',hidden:true,handler:()=>{stops.push(Date.now());return '已中止';}}]});
+ let idle;const agentIdle=new Promise(r=>idle=r);
+ await g.push({id:'t0',content:'开始'});
+ const record=[...g.mgr.records.values()][0];record.agent.idle=agentIdle;
+ // This input now waits in handleInbound for idle, holding the SDK merge guard;
+ // the next one queues behind it.
+ const running=g.push({id:'t1',content:'长任务'});await tick();
+ const queued=g.push({id:'t2',content:'排队消息'});await tick();
+ await g.push({id:'c1',content:'/stop'});
+ assert.equal(stops.length,1,'/stop executed while the guard is held');
+ assert.deepEqual(texts(g),['开始','长任务'],'the command is not Agent input and the queued message still waits');
+ idle();await running;await queued;
+ assert.deepEqual(texts(g),['开始','长任务','排队消息']);
+ await g.push({id:'c1',content:'/stop'});assert.equal(stops.length,1,'a repeated /stop delivery is not executed again');
+});
+test('a command re-delivered past the command gate never becomes Agent input',needsSdk,async()=>{
+ const runs=[],g=gateway({commands:[{name:'new',handler:()=>{runs.push(1);return '已开启新会话 ✓';}}]});
+ const first=await g.push({id:'n1',content:'/new'});assert.equal(runs.length,1);assert.equal(first.stopped,'command:handled:new');
+ await g.direct({id:'n1',content:'/new'});
+ assert.equal(all(g).length,0,'the claimed message is a duplicate for the chat channel');assert.equal(runs.length,1);
+});
+test('unknown commands stay ordinary chat; an owner-only command refuses another admitted user without Agent input',needsSdk,async()=>{
+ const access={c2cMode:'allowlist',c2cAllow:['owner','friend'],groupMode:'disabled',groupAllow:[]};
+ const ops=[],g=gateway({access,commands:[{name:'ops',scope:'c2c',authorized:c=>(c.message.kind==='c2c'&&c.message.senderId==='owner')||'仅部署所有者可执行运维命令。',handler:c=>{ops.push(c.command.args);return 'ok';}}]});
+ await g.push({id:'u1',content:'/unknown 参数'});assert.deepEqual(texts(g),['/unknown 参数'],'compatible: unknown commands reach the Agent');
+ const denied=await g.push({id:'o1',sender:'friend',content:'/ops status'});
+ assert.equal(denied.stopped,'command:denied:ops','the gate itself ends the chain for a refused command');
+ assert.deepEqual(ops,[]);assert.equal(all(g).length,1);assert.deepEqual(g.replies,['仅部署所有者可执行运维命令。']);
+ await g.push({id:'o2',content:'/ops status now'});assert.equal(JSON.stringify(ops),JSON.stringify([['status','now']]));assert.equal(g.replies.at(-1),'ok');
+ await g.push({id:'s1',sender:'stranger',content:'/ops status'});assert.equal(ops.length,1,'the SDK access policy keeps strangers out first');
+});
+test('the replaced path: no SDK slashCommand, the command gate sits before the merge guard',()=>{
+ const source=read('gateway/middleware-setup.js').replace(/\/\*[\s\S]*?\*\//g,'').replace(/\/\/.*$/gm,'');
+ assert(!/slashCommand/.test(source),'commands no longer use the SDK middleware');
+ const gate=source.indexOf('bot.use(commandGate(router))'),merge=source.indexOf('bot.use(concurrencyGuard(');
+ assert(gate>0&&merge>gate,'/stop is handled before the merge guard');
+ assert(source.indexOf('conversation.openCommands(')>0);
 });
 test('closing the channel on Gateway disposal leaves no live intake; a reloaded Gateway takes over',async()=>{
  const io=createAgentIO(),g=gateway({io});g.channel.close();await g.direct({id:'late'});

@@ -14,6 +14,10 @@ const bootstrap=read('gateway/bootstrap.js');
 const start=bootstrap.indexOf('    const conversation = io.openConversation('),end=bootstrap.indexOf('    ctx.effect(() => conversation.close);',start);
 if(start<0||end<start)throw Error('bootstrap Conversation wiring not found');
 export const opening=bootstrap.slice(start,end);
+// The gateway's own Turn cancellation registry (createTurnControls), as reviewed.
+const turnStart=bootstrap.indexOf('export function createTurnControls'),turnEnd=bootstrap.indexOf('// Reusable transport wiring',turnStart);
+if(turnStart<0||turnEnd<turnStart)throw Error('bootstrap createTurnControls not found');
+export const createTurnControls=vm.runInNewContext(bootstrap.slice(turnStart,turnEnd).replace('export function','function')+';createTurnControls',{AbortController,AbortSignal});
 
 let inputs=0;
 export const nativeInput=m=>({id:'native-'+(++inputs),role:'user',...m});

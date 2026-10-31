@@ -11,7 +11,7 @@ export class SessionManager {
    waitingForUser:record=>!!(manager.questionChannel?.pending.has(record.sessionKey)||manager.approvalChannel?.pending.has(record.sessionKey)),
    cancelPending(record){manager.questionChannel?.cancelPending(record.sessionKey);manager.approvalChannel?.cancelPending(record.sessionKey);},
    prompt:record=>record.scope==='group'?config.groupPrompt:config.directPrompt,
-   release(record){if(record.typingKeepAlive){clearInterval(record.typingKeepAlive);record.typingKeepAlive=undefined;}},
+   release(record){if(record.typingKeepAlive){clearInterval(record.typingKeepAlive);record.typingKeepAlive=undefined;}manager.releaseOutput?.(record);},
   }});
   return manager;
  }

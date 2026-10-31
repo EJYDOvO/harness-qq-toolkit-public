@@ -1,4 +1,4 @@
-import { QQBot } from '@tencent-connect/qqbot-nodejs';
+import { QQBot, MediaFileType } from '@tencent-connect/qqbot-nodejs';
 import { createHmac, randomBytes, randomUUID } from 'node:crypto';
 import * as diagnosticFs from 'node:fs/promises';
 import { resolve as diagnosticPath } from 'node:path';
@@ -17,7 +17,7 @@ import { buildUserAgent } from "../shared/index.js";
 import { setupMiddlewares } from "./middleware-setup.js";
 import { startMediaCleanup } from "../media/media-cleaner.js";
 import { ensureVisionInputModal, registerDescribeImageTool } from "../media/vision-tool.js";
-import { registerSendFileTool } from "../media/send-file-tool.js";
+import { registerSendFileTool, verifyLocalFile } from "../media/send-file-tool.js";
 // Shared across duplicate module copies in the same Host process.
 const gatewayLeases = globalThis[Symbol.for('dsh.qqGateway.leases.v1')] ??= new Map();
 // Opt-in bounded local diagnostics. HMAC keys live only in this Gateway instance;
@@ -74,6 +74,94 @@ function dispatchInteraction(event, manager) {
         return manager.approvalChannel?.handleInteraction(event) ?? false;
     return false;
 }
+/**
+ * Cancellation controllers of native Turns, per Session. A controller leased by
+ * a submission still in the Unified Agent I/O is never evicted, so /stop always
+ * reaches queued output; idle ones are bounded per Session and overall (leased
+ * ones are bounded by the I/O queue limits). A completed Turn's idle controller
+ * is dropped at turn/end; an aborted one stays as a tombstone (within the
+ * bounds) so late output of that Turn remains cancelled. Output without a Turn
+ * shares one Session controller that /stop replaces after aborting it.
+ */
+export function createTurnControls({ maxTurns = 8, maxSessions = 256 } = {}) {
+    const sessions = new Map();
+    const ANY = '*';
+    let closed = false;
+    const held = session => [...session.values()].some(c => c.refs > 0);
+    function prune(session) {
+        for (const [turn, c] of session) {
+            if (session.size <= maxTurns) break;
+            if (c.refs === 0) session.delete(turn);
+        }
+        for (const [id, s] of sessions) {
+            if (sessions.size <= maxSessions) break;
+            if (s !== session && !held(s)) sessions.delete(id);
+        }
+    }
+    function control(sessionId, turn) {
+        if (typeof sessionId !== 'string' || !sessionId) return undefined;
+        const key = Number.isSafeInteger(turn) ? turn : ANY;
+        let session = sessions.get(sessionId);
+        if (!session) { session = new Map(); sessions.set(sessionId, session); }
+        let c = session.get(key);
+        if (!c) { c = { controller: new AbortController(), refs: 0 }; session.set(key, c); prune(session); }
+        return c;
+    }
+    function abortAll(session) { for (const c of session.values()) c.controller.abort(); }
+    return {
+        start(sessionId, turn) { if (!closed && Number.isSafeInteger(turn)) control(sessionId, turn); },
+        end(sessionId, turn, aborted) {
+            if (closed || !Number.isSafeInteger(turn)) return;
+            if (aborted) { control(sessionId, turn)?.controller.abort(); return; }
+            const session = sessions.get(sessionId), c = session?.get(turn);
+            if (!c) return;
+            c.ended = true;
+            if (c.refs === 0 && !c.controller.signal.aborted) session.delete(turn);
+            if (!session.size) sessions.delete(sessionId);
+        },
+        /** → {signal, release()}; the signal is aborted once the Gateway closed. */
+        acquire(sessionId, turn) {
+            if (closed) return { signal: AbortSignal.abort(), release() { } };
+            const c = control(sessionId, turn);
+            if (!c) return { signal: undefined, release() { } };
+            c.refs++;
+            let released = false;
+            return {
+                signal: c.controller.signal,
+                release() {
+                    if (released) return;
+                    released = true; c.refs--;
+                    const session = sessions.get(sessionId), key = Number.isSafeInteger(turn) ? turn : ANY;
+                    if (session?.get(key) !== c) return;
+                    // A completed Turn's last lease: nothing can cancel it any more.
+                    if (c.refs === 0 && c.ended && !c.controller.signal.aborted) session.delete(key);
+                    prune(session);
+                    if (!session.size) sessions.delete(sessionId);
+                },
+            };
+        },
+        /** /stop: every leased and remembered controller of the Session. */
+        cancel(sessionId) {
+            const session = sessions.get(sessionId);
+            if (!session) return;
+            abortAll(session);
+            session.delete(ANY);
+        },
+        /** Session release (rotation, removal, disposal): abort and forget. */
+        release(sessionId) {
+            const session = sessions.get(sessionId);
+            if (!session) return;
+            abortAll(session); sessions.delete(sessionId);
+        },
+        latest(sessionId) {
+            let last;
+            for (const key of sessions.get(sessionId)?.keys() ?? []) if (Number.isSafeInteger(key) && (last === undefined || key > last)) last = key;
+            return last;
+        },
+        close() { closed = true; for (const session of sessions.values()) abortAll(session); sessions.clear(); },
+        size() { let n = 0; for (const s of sessions.values()) n += s.size; return { sessions: sessions.size, controllers: n }; },
+    };
+}
 // Reusable transport wiring, separately testable without creating a QQ gateway.
 // Every QQ chat message (Interaction bubbles and hang-on lines, plain replies,
 // tool results, turn errors) is one logical message for the Unified Agent I/O,
@@ -93,34 +181,34 @@ export function createInteractionOutbound(ctx, manager, sender, config, logger, 
     // QQ side of an admitted Interaction input (the shared handoff calls the
     // policy itself): resume output and remember the input's reply target.
     manager.trackInteractionInput=(record,message)=>{record.interactionSuppressed=false;rememberTarget(record,message);};
-    // Native Turn lifecycle per Session (bounded). Output not yet handed to the
-    // platform is cancelled by /stop, by a Turn that ends aborted/interrupted,
-    // and stays cancelled for late output of that Turn, without Session rotation.
-    const turns=new Map();
-    function turnControl(sessionId,turn){
-        if(!Number.isSafeInteger(turn))return undefined;
-        let session=turns.get(sessionId);
-        if(!session){session=new Map();turns.set(sessionId,session);while(turns.size>256)turns.delete(turns.keys().next().value);}
-        let control=session.get(turn);
-        if(!control){control=new AbortController();session.set(turn,control);while(session.size>8)session.delete(session.keys().next().value);}
-        return control;
-    }
+    // Native Turn lifecycle per Session. Output not yet handed to the platform is
+    // cancelled by /stop, by a Turn that ends aborted/interrupted (and stays
+    // cancelled for late output of that Turn), by Session release and by Gateway
+    // close, without Session rotation.
+    const turns=createTurnControls();
     function observeTurn(sessionId,event){
-        if(event?.type==='turn/start')turnControl(sessionId,event.data?.turn);
-        else if(event?.type==='turn/end'&&['aborted','interrupted'].includes(event.data?.reason?.kind))turnControl(sessionId,event.data?.turn)?.abort();
+        if(event?.type==='turn/start')turns.start(sessionId,event.data?.turn);
+        else if(event?.type==='turn/end')turns.end(sessionId,event.data?.turn,['aborted','interrupted'].includes(event.data?.reason?.kind));
     }
-    manager.cancelOutput=record=>{for(const control of turns.get(record?.sessionId)?.values()??[])control.abort();};
+    manager.cancelOutput=record=>turns.cancel(record?.sessionId);
+    manager.releaseOutput=record=>turns.release(record?.sessionId);
+    manager.latestTurn=record=>turns.latest(record?.sessionId);
+    ctx.effect?.(()=>()=>turns.close());
     // Logical messages being handed over, by id: the QQ text adapter reads the
     // reply target of the input a bubble answers and its diagnostic fields.
     const deliveries=new Map();
     async function submit(record,text,{id,input,turn,signal,delivery}){
         if(!io){logger.error?.('im-qqbot: output withheld: Unified Agent I/O unavailable');return {id,status:'not-sent',reason:'adapter-unavailable',parts:[]};}
-        const signals=[turnControl(record.sessionId,turn)?.signal,signal].filter(s=>s instanceof AbortSignal);
+        // The lease keeps this Turn's controller (and so /stop) reachable until the
+        // I/O has settled the message; capacity never evicts a held controller.
+        const lease=turns.acquire(record.sessionId,turn);
+        const signals=[lease.signal,signal].filter(s=>s instanceof AbortSignal);
         const own=typeof input==='string'?record.interactionTargets?.get(input):undefined;
         const mine=id!==undefined&&!deliveries.has(id);if(mine)deliveries.set(id,{target:own&&{...own},input:typeof input==='string'?input:undefined,delivery});
-        try{return await io.sendMessage({...(id?{id}:{}),target:conversation.target(record),origin:{sessionId:record.sessionId},message:{text},...(signals.length?{signal:signals.length>1?AbortSignal.any(signals):signals[0]}:{})});}
-        finally{if(mine)deliveries.delete(id);}
+        try{return await io.sendMessage({...(id?{id}:{}),target:conversation.target(record),origin:{sessionId:record.sessionId},message:typeof text==='string'?{text}:text,...(signals.length?{signal:signals.length>1?AbortSignal.any(signals):signals[0]}:{})});}
+        finally{lease.release();if(mine)deliveries.delete(id);}
     }
+    manager.submitOutput=submit;
     // Logical id of an Interaction message: the native Session and Turn, the
     // policy instance, its reply and bubble numbers and the kind. A repeated
     // submission of one bubble maps to the same id; two bubbles never do.
@@ -191,6 +279,34 @@ export function createInteractionOutbound(ctx, manager, sender, config, logger, 
     outboundHandler.delivery=id=>typeof id==='string'?deliveries.get(id):undefined;
     return outboundHandler;
 }
+const MEDIA_TYPES = { image: 'IMAGE', video: 'VIDEO', voice: 'VOICE', file: 'FILE' };
+/**
+ * One trusted local attachment → QQ media message, in two stages so a failure
+ * is classified honestly: the resource is re-checked first (still its own real
+ * path, inside the allowed roots, a regular file), then uploaded without sending
+ * (the SDK retries uploads; an upload alone is invisible to the user), then the
+ * media message is sent. Passive-reply quota as for files before (no event_id).
+ */
+export async function sendMedia(bot, replyLimiter, config, target, attachment) {
+    let file;
+    try { file = await verifyLocalFile(attachment?.resource?.path, config.sendFile, config.cwd || process.cwd(), { expectReal: true }); }
+    catch (error) { throw Object.assign(new Error('QQ media resource refused'), { qqStage: 'resource', reason: error?.reason }); }
+    const resolved = resolveReplyTarget(target, replyLimiter, false);
+    const fileType = MediaFileType[MEDIA_TYPES[attachment.kind]];
+    if (typeof bot.uploadMedia !== 'function' || typeof bot.mediaApi?.sendMediaMessage !== 'function') {
+        // An SDK without the two public stages: one combined call, classified as a message request.
+        try { const r = await bot.sendMedia({ target: resolved, fileType, localPath: file.path, ...(attachment.kind === 'file' ? { fileName: attachment.name } : {}) }); return { id: r?.message?.id, uploaded: r?.upload?.file_uuid }; }
+        catch (error) { throw Object.assign(new Error('QQ media message failed'), { qqStage: 'message', cause: error }); }
+    }
+    let upload;
+    try { upload = await bot.uploadMedia({ target: resolved, fileType, localPath: file.path, srvSendMsg: false, ...(attachment.kind === 'file' ? { fileName: attachment.name } : {}) }); }
+    catch (error) { throw Object.assign(new Error('QQ media upload failed'), { qqStage: 'upload', cause: error }); }
+    try {
+        const message = await bot.mediaApi.sendMediaMessage(resolved.scope, resolved.targetId, upload.file_info, bot.creds, { msgId: resolved.msgId });
+        return { id: message?.id, uploaded: upload.file_uuid };
+    }
+    catch (error) { throw Object.assign(new Error('QQ media message failed'), { qqStage: 'message', cause: error }); }
+}
 export async function bootstrapGateway(ctx, agents, config, logger) {
     if (gatewayLeases.has(config.appId)) throw new Error('Duplicate QQ Gateway for this application');
     const lease = {};
@@ -209,6 +325,7 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
         admits: (scope, peer) => accessAllows(config.access, scope, peer),
         onInput: (record, message, policy) => { if (policy) manager.trackInteractionInput?.(record, message); } });
     ctx.effect(() => conversation.close);
+    if (typeof conversation.openCommands !== 'function') throw new Error('dsh-agent-io 0.1.0-test.5 or later (commands and attachments) is required before QQ');
     const deliveryRecorder=createDeliveryRecorder(config.deliveryDiagnostics,logger);
     ctx.effect(()=>()=>deliveryRecorder?.close());
     // ── 初始化 QQ Bot SDK ──
@@ -269,6 +386,7 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
         split: text => chunkMarkdownText(text, config.textChunkLimit ?? 4500),
         replyTarget: (_record, messageId) => outboundHandler.delivery(messageId)?.target,
         send: (target, text, info) => sender.sendMarkdown(target, text, { delivery: { ...outboundHandler.delivery(info.messageId)?.delivery, session: diagnostics?.hash(info.sessionId), index: info.index } }),
+        sendMedia: (target, attachment) => sendMedia(bot, replyLimiter, config, target, attachment),
     }));
     ctx.effect(() => releaseTextAdapter);
     ctx
@@ -326,15 +444,9 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
     ensureVisionInputModal(config.vision, logger);
     registerDescribeImageTool(ctx, config.vision, logger);
     // ── 附件发送工具注册（qqbot_send_file） ──
-    // 包装 bot：让文件发送也走 msgId 兜底 + 被动回复限额管控。
-    // 注意：SDK 文件发送暂不支持 event_id，故 allowEvent=false，跳过 event 候选。
-    const mediaSender = {
-        sendImage: (target, source) => bot.sendImage(resolveReplyTarget(target, replyLimiter, false), source),
-        sendVideo: (target, source) => bot.sendVideo(resolveReplyTarget(target, replyLimiter, false), source),
-        sendVoice: (target, source) => bot.sendVoice(resolveReplyTarget(target, replyLimiter, false), source),
-        sendFile: (target, source, opts) => bot.sendFile(resolveReplyTarget(target, replyLimiter, false), source, opts),
-    };
-    registerSendFileTool(ctx, mediaSender, manager, config, logger);
+    // 文件作为附件消息交给 Unified Agent I/O，经上面的 QQ Adapter（sendMedia）上传发送；
+    // 不再有直接调用 bot.sendImage/sendFile 的路径。
+    registerSendFileTool(ctx, null, manager, config, logger);
     // ── 生命周期 ──
     ctx
         .effect(() => {

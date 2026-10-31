@@ -36,7 +36,7 @@ test('a text message reaches the adapter once and multi-part sends stay one logi
 test('the core is platform-neutral: no SDK, Character or Interaction import',()=>{
  // Only the Host message constructor joins the plugin entry; the core and the
  // Conversation wiring import nothing beyond node:crypto.
- for(const [file,allowed] of [['io.mjs',['node:crypto']],['conversation.mjs',[]],['index.mjs',['@deepseek-ai/dsh-llm','./io.mjs','./conversation.mjs']]]){
+ for(const [file,allowed] of [['io.mjs',['node:crypto']],['conversation.mjs',['./commands.mjs']],['commands.mjs',[]],['index.mjs',['@deepseek-ai/dsh-llm','./io.mjs','./conversation.mjs','./commands.mjs']]]){
   const imports=[...fs.readFileSync(new URL('../plugin-sources/dsh-agent-io/'+file,import.meta.url),'utf8').matchAll(/^import .* from '([^']+)'/gm)].map(m=>m[1]);
   assert(imports.every(i=>allowed.includes(i)),file+': '+imports);
  }
@@ -162,7 +162,10 @@ test('unregistering an adapter stops its queued messages',async()=>{
 });
 test('requests are validated before queueing; unsupported content is refused, not dropped',async()=>{
  const {io,sent}=setup();
- const cases=[[{...msg(),message:{text:'图',attachments:[]}},'unsupported'],[{...msg(),message:{text:'引',replyTo:{id:'x'}}},'unsupported'],[msg('   '),'invalid-message'],
+ const local={type:'local',path:'/media/a.png'};
+ const cases=[[{...msg(),message:{text:'图',attachments:[]}},'invalid-message'],[{...msg(),message:{attachments:[{kind:'sticker',resource:local}]}},'unsupported'],
+  [{...msg(),message:{attachments:[{kind:'image'}]}},'invalid-message'],[{...msg(),message:{attachments:[{kind:'image',resource:{type:'ftp',path:'x'}}]}},'unsupported'],
+  [{...msg(),message:{attachments:[{kind:'image',resource:local,secret:1}]}},'unsupported'],[{...msg(),message:{text:'引',replyTo:{id:'x'}}},'unsupported'],[msg('   '),'invalid-message'],
   [{...msg(),target:{platform:'fake',accountId:'app-a',conversation:{type:'channel',id:'peer'}}},'invalid-target'],[{...msg(),target:{platform:'fake',conversation:{type:'direct',id:'peer'}}},'invalid-target'],
   [msg('x'.repeat(11)),'too-large'],[undefined,'invalid-target']];
  const small=createAgentIO({maxTextLength:10});const f=fakeAdapter();f.routes.set('peer','s1');small.registerAdapter(f.adapter);
@@ -253,7 +256,8 @@ test('inbound memory is bounded in time and size and never forgets a message in 
 test('inbound validation refuses malformed or unsupported messages before any Agent input',async()=>{
  const {channel,delivered}=inboundSetup();
  const cases=[[{...inboundMsg(),sender:undefined},'unauthorized'],[{...inboundMsg(),conversation:{type:'channel',id:'x'}},'invalid-target'],
-  [{...inboundMsg(),message:{id:'m',text:'图',attachments:[]}},'unsupported'],[{...inboundMsg(),message:{id:'m'}},'invalid-message'],[null,'invalid-message']];
+  [{...inboundMsg(),message:{id:'m',text:'图',attachments:[{kind:'sticker'}]}},'unsupported'],[{...inboundMsg(),message:{id:'m',text:'',quote:{text:1}}},'invalid-message'],
+  [{...inboundMsg(),message:{id:'m',text:'',forwarded:true}},'unsupported'],[{...inboundMsg(),message:{id:'m'}},'invalid-message'],[null,'invalid-message']];
  for(const [m,reason] of cases)assert.deepEqual({...await channel.receive(m)},{status:'rejected',reason});
  assert.equal(delivered.length,0);
  // Without a platform message id there is nothing to deduplicate by; content is never hashed instead.

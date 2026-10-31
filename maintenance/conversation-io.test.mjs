@@ -279,6 +279,6 @@ test('the wiring contract: an ownership-checking Manager, an admission check and
  assert.throws(()=>open(base).openInbound(()=>{}),/already open/,'one intake per platform account across wirings');
  assert.equal(c.target({scope:'unmapped',peerId:'u1'}),undefined);
  c.close();assert.throws(()=>c.openInbound(()=>{}),/closed/);assert.throws(()=>c.registerAdapter({}),/closed/);
- const imports=[...fs.readFileSync(new URL('../plugin-sources/dsh-agent-io/conversation.mjs',import.meta.url),'utf8').matchAll(/^import .*$/gm)];
- assert.equal(imports.length,0,'the wiring imports no platform SDK, Character, Interaction or Manager package');
+ const imports=[...fs.readFileSync(new URL('../plugin-sources/dsh-agent-io/conversation.mjs',import.meta.url),'utf8').matchAll(/^import .* from '([^']+)'/gm)].map(m=>m[1]);
+ assert.deepEqual(imports,['./commands.mjs'],'the wiring imports no platform SDK, Character, Interaction or Manager package, only the I/O commands module');
 });
