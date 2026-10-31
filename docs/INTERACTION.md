@@ -6,7 +6,7 @@ Conversation Manager `0.1.0-test.1` 已从 QQTK 抽离，配套 Character test.2
 
 最新源码配套 Interaction **0.1.0-test.7**、Character test.21、独立 Conversation Manager，已在授权后部署；旧版为 test.6 / test.20。本轮基线为 rc.3、QQ Bot 0.5.2、SDK 1.0.5。策略位于 [Character 仓库](https://github.com/EJYDOvO/character-agent-v1/tree/main/packages/interaction-policy)，不依赖 Character。停用 Interaction 保留普通 QQ 流程；Session 仍由同一个 Manager 管理。
 
-Iteration 04（源码，未部署）：Interaction 只生成并提交完整气泡；`policy.bind` 的 `sendText` 由桥接层改为 [Agent I/O](../plugin-sources/dsh-agent-io/README.md) 的 `sendMessage()`（稳定逻辑 ID、按输入的回复目标、逐片复核、取消与诚实结果），不再提供 `openStream`，Gateway Sender 也不再提供 SDK 流式消息。工具错误/轮次错误提示仍走 `policy.external` 排队，再经同一 I/O 发送。（Iteration 01 时只有未绑定 Interaction 的普通静态文本经 I/O。）
+Iteration 04（已授权部署）：Interaction 只生成并提交完整气泡；`policy.bind` 的 `sendText` 由桥接层改为 [Agent I/O](../plugin-sources/dsh-agent-io/README.md) 的 `sendMessage()`（稳定逻辑 ID、按输入的回复目标、逐片复核、取消与诚实结果），不再提供 `openStream`，Gateway Sender 也不再提供 SDK 流式消息。工具错误/轮次错误提示仍走 `policy.external` 排队，再经同一 I/O 发送。（Iteration 01 时只有未绑定 Interaction 的普通静态文本经 I/O。）
 
 ## 契约
 
