@@ -74,3 +74,15 @@ test('Gateway close aborts every controller and refuses later output',()=>{
  assert.equal(t.acquire('b',1).signal.aborted,true,'nothing is handed over after close');
  t.start('b',2);t.end('b',2,true);assert.equal(t.size().sessions,0);
 });
+test('a new controller while maxTurns others are leased is kept: /stop, release and close reach it',()=>{
+ const full=()=>{const t=createTurnControls({maxTurns:8});const held=[];for(let turn=1;turn<=8;turn++){t.start('s',turn);held.push(t.acquire('s',turn));}return {t,held};};
+ {const {t,held}=full();t.start('s',9);const ninth=t.acquire('s',9),turnless=t.acquire('s',undefined);
+  assert.equal(t.latest('s'),9,'the running Turn stays the latest');
+  t.cancel('s');for(const l of [...held,ninth,turnless])assert.equal(l.signal.aborted,true,'/stop reaches the 9th Turn and turnless output');}
+ {const {t}=full();t.end('s',9,true);assert.equal(t.acquire('s',9).signal.aborted,true,'the aborted Turn\'s tombstone survives');}
+ {const {t}=full();const ninth=t.acquire('s',9);t.release('s');assert.equal(ninth.signal.aborted,true,'Session release');}
+ {const {t}=full();const ninth=t.acquire('s',9);t.close();assert.equal(ninth.signal.aborted,true,'Gateway close');}
+ {const {t,held}=full();for(let turn=9;turn<=40;turn++){t.start('s',turn);t.end('s',turn,false);}
+  assert(t.size().controllers<=9,'still bounded: the leased ones plus at most the newest');
+  for(const l of held)l.release();t.start('s',41);assert(t.size().controllers<=8);}
+});

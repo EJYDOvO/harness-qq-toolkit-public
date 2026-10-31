@@ -1,6 +1,6 @@
 import { errorHandler, messageFilter, accessPolicy, mentionGate, contentSanitizer, rateLimiter, concurrencyGuard, typingIndicator, quoteRef, historyBuffer, envelopeFormatter, } from '@tencent-connect/qqbot-nodejs';
 import { buildCommandList } from "../commands/index.js";
-import { attachmentProcessor } from "../middleware/attachment.js";
+import { downloadMediaAttachments } from "../transport/attachment.js";
 import { questionAnswer } from "../middleware/question-answer.js";
 import { getHistoryStore, historyGroupKey } from "../features/history-store.js";
 /**
@@ -46,6 +46,35 @@ export function commandGate(router) {
         if (result.status === 'pass') return next();
         if (result.status === 'failed') ctx.log?.error?.(`[command] /${result.command} failed`);
         ctx.stop(`command:${result.status}${result.command ? ':' + result.command : ''}`);
+    };
+}
+/**
+ * Attachment downloads (current message and quoted message) tagged with the
+ * index of the attachment they belong to, so each attachment gets its own file.
+ * The upstream attachmentProcessor returns downloads by file name only, which
+ * gave two attachments of one name (or quoted ones without a name, or a failed
+ * one and a later one of the same name) the same file. One download per
+ * attachment, in order; a skipped or failed one has no entry and only that one
+ * is lost.
+ */
+export function attachmentDownloads(config, logger) {
+    const each = async list => {
+        const out = [];
+        for (const [attachment, raw] of (list ?? []).entries()) {
+            try {
+                const [file] = await downloadMediaAttachments([raw], config.media, logger);
+                if (file) out.push({ ...file, attachment });
+            }
+            catch (err) { logger.warn(`im-qqbot: attachment download failed: ${err instanceof Error ? err.message : String(err)}`); }
+        }
+        return out;
+    };
+    return async (ctx, next) => {
+        ctx.state.downloadedFiles = await each(ctx.message.attachments?.map(a => ({ ...a, filename: a.filename ?? '' })));
+        // Quoted attachments in the raw attachment shape (voice and URL-less ones are skipped by the download).
+        const quoted = ctx.state.quote?.attachments;
+        if (quoted?.length) ctx.state.downloadedQuoteFiles = await each(quoted.map(a => ({ content_type: a.contentType ?? '', filename: a.filename ?? '', size: 0, url: a.url })));
+        await next();
     };
 }
 export function setupMiddlewares(bot, config, manager, logger, conversation) {
@@ -156,7 +185,7 @@ export function setupMiddlewares(bot, config, manager, logger, conversation) {
         preferMsgElements: true,
     }));
     // 11.5. 附件下载（file 附件下载到本地，供 @提及 / 工具访问）
-    bot.use(attachmentProcessor(config, logger));
+    bot.use(attachmentDownloads(config, logger));
     // 12. 上下文组装（将 history + quote + sender 组成 envelope）
     bot.use(envelopeFormatter({
         historyLimit: config.historyLimit,

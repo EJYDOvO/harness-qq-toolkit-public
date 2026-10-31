@@ -88,10 +88,12 @@ export function createTurnControls({ maxTurns = 8, maxSessions = 256 } = {}) {
     const ANY = '*';
     let closed = false;
     const held = session => [...session.values()].some(c => c.refs > 0);
-    function prune(session) {
+    // `keep`: the controller just created, not yet leased by its caller; pruning
+    // it would detach it from /stop, release and close.
+    function prune(session, keep) {
         for (const [turn, c] of session) {
             if (session.size <= maxTurns) break;
-            if (c.refs === 0) session.delete(turn);
+            if (c.refs === 0 && c !== keep) session.delete(turn);
         }
         for (const [id, s] of sessions) {
             if (sessions.size <= maxSessions) break;
@@ -104,7 +106,7 @@ export function createTurnControls({ maxTurns = 8, maxSessions = 256 } = {}) {
         let session = sessions.get(sessionId);
         if (!session) { session = new Map(); sessions.set(sessionId, session); }
         let c = session.get(key);
-        if (!c) { c = { controller: new AbortController(), refs: 0 }; session.set(key, c); prune(session); }
+        if (!c) { c = { controller: new AbortController(), refs: 0 }; session.set(key, c); prune(session, c); }
         return c;
     }
     function abortAll(session) { for (const c of session.values()) c.controller.abort(); }

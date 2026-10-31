@@ -22,22 +22,23 @@ function qqAttachment({ contentType, filename, size, url, asr }, downloaded) {
         ...(local ? { resource: { type: 'local', path: local } } : remote ? { resource: { type: 'remote', url: remote } } : {}),
     };
 }
-// 下载结果按文件名关联（与原组装逻辑一致）；每个下载只用于一个同名附件。
-function byName(downloads) {
+// 下载结果按所属附件的序号关联（attachmentDownloads 标注），不按文件名：同名或无名的
+// 附件各自对应自己的文件；没有序号的下载结果不关联。
+function byIndex(downloads) {
     const map = new Map();
-    for (const d of downloads ?? []) if (d?.filename !== undefined && !map.has(d.filename)) map.set(d.filename, d);
+    for (const d of downloads ?? []) if (Number.isSafeInteger(d?.attachment) && !map.has(d.attachment)) map.set(d.attachment, d);
     return map;
 }
 function qqAttachments(attachments, downloads) {
-    const found = byName(downloads);
-    return (attachments ?? []).slice(0, 20).map(a => qqAttachment({ contentType: a.content_type, filename: a.filename, size: a.size, url: a.url, asr: a.asr_refer_text }, found.get(a.filename)));
+    const found = byIndex(downloads);
+    return (attachments ?? []).slice(0, 20).map((a, i) => qqAttachment({ contentType: a.content_type, filename: a.filename, size: a.size, url: a.url, asr: a.asr_refer_text }, found.get(i)));
 }
 /** 引用消息：被引用原文与其附件（与当前消息附件分开，带各自的下载结果）。 */
 function qqQuote(quote, downloads) {
     if (!quote) return undefined;
     const text = quote.text || quote.entry?.content;
-    const found = byName(downloads);
-    const attachments = (quote.attachments ?? []).slice(0, 20).map(a => qqAttachment({ contentType: a.contentType, filename: a.filename, url: a.url, asr: a.asrText }, found.get(a.filename ?? '')));
+    const found = byIndex(downloads);
+    const attachments = (quote.attachments ?? []).slice(0, 20).map((a, i) => qqAttachment({ contentType: a.contentType, filename: a.filename, url: a.url, asr: a.asrText }, found.get(i)));
     if (!text && !attachments.length) return undefined;
     return { ...(typeof text === 'string' && text ? { text } : {}), ...(attachments.length ? { attachments } : {}) };
 }

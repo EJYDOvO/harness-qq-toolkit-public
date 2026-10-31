@@ -374,14 +374,15 @@ index dc2e41f..0757387 100644
                      // 同一题的选项共享分组：点一个后其余变灰（单选互斥）
                      group_id: `q-${question.id}`,
 diff --git a/dist/gateway/middleware-setup.js b/dist/gateway/middleware-setup.js
-index ca4b002..acad714 100644
+index ca4b002..ea7991b 100644
 --- a/dist/gateway/middleware-setup.js
 +++ b/dist/gateway/middleware-setup.js
-@@ -1,9 +1,54 @@
+@@ -1,9 +1,83 @@
 -import { errorHandler, messageFilter, accessPolicy, mentionGate, contentSanitizer, rateLimiter, slashCommand, concurrencyGuard, typingIndicator, quoteRef, historyBuffer, envelopeFormatter, } from '@tencent-connect/qqbot-nodejs';
 +import { errorHandler, messageFilter, accessPolicy, mentionGate, contentSanitizer, rateLimiter, concurrencyGuard, typingIndicator, quoteRef, historyBuffer, envelopeFormatter, } from '@tencent-connect/qqbot-nodejs';
  import { buildCommandList } from "../commands/index.js";
- import { attachmentProcessor } from "../middleware/attachment.js";
+-import { attachmentProcessor } from "../middleware/attachment.js";
++import { downloadMediaAttachments } from "../transport/attachment.js";
  import { questionAnswer } from "../middleware/question-answer.js";
  import { getHistoryStore, historyGroupKey } from "../features/history-store.js";
 -export function setupMiddlewares(bot, config, manager, logger) {
@@ -430,11 +431,40 @@ index ca4b002..acad714 100644
 +        ctx.stop(`command:${result.status}${result.command ? ':' + result.command : ''}`);
 +    };
 +}
++/**
++ * Attachment downloads (current message and quoted message) tagged with the
++ * index of the attachment they belong to, so each attachment gets its own file.
++ * The upstream attachmentProcessor returns downloads by file name only, which
++ * gave two attachments of one name (or quoted ones without a name, or a failed
++ * one and a later one of the same name) the same file. One download per
++ * attachment, in order; a skipped or failed one has no entry and only that one
++ * is lost.
++ */
++export function attachmentDownloads(config, logger) {
++    const each = async list => {
++        const out = [];
++        for (const [attachment, raw] of (list ?? []).entries()) {
++            try {
++                const [file] = await downloadMediaAttachments([raw], config.media, logger);
++                if (file) out.push({ ...file, attachment });
++            }
++            catch (err) { logger.warn(`im-qqbot: attachment download failed: ${err instanceof Error ? err.message : String(err)}`); }
++        }
++        return out;
++    };
++    return async (ctx, next) => {
++        ctx.state.downloadedFiles = await each(ctx.message.attachments?.map(a => ({ ...a, filename: a.filename ?? '' })));
++        // Quoted attachments in the raw attachment shape (voice and URL-less ones are skipped by the download).
++        const quoted = ctx.state.quote?.attachments;
++        if (quoted?.length) ctx.state.downloadedQuoteFiles = await each(quoted.map(a => ({ content_type: a.contentType ?? '', filename: a.filename ?? '', size: 0, url: a.url })));
++        await next();
++    };
++}
 +export function setupMiddlewares(bot, config, manager, logger, conversation) {
      // 1. 错误兜底（最外层洋葱皮）
      bot.use(errorHandler());
      // 2. 消息过滤：bot 回声 + 消息去重
-@@ -12,11 +57,11 @@ export function setupMiddlewares(bot, config, manager, logger) {
+@@ -12,11 +86,11 @@ export function setupMiddlewares(bot, config, manager, logger) {
      bot.use(accessPolicy({
          c2c: {
              mode: config.access.c2cMode,
@@ -448,7 +478,7 @@ index ca4b002..acad714 100644
          },
          onBlock: (_mCtx, reason) => {
              if (config.debug) {
-@@ -41,22 +86,62 @@ export function setupMiddlewares(bot, config, manager, logger) {
+@@ -41,22 +115,62 @@ export function setupMiddlewares(bot, config, manager, logger) {
      bot.use(mentionGate({
          requireMentionInGroup: config.requireMention,
      }));
@@ -519,7 +549,16 @@ index ca4b002..acad714 100644
      // 9. 并发串行 + 消息合并（同 peer 排队，避免 session 冲突）
      bot.use(concurrencyGuard({
          strategy: 'merge',
-@@ -79,4 +164,4 @@ export function setupMiddlewares(bot, config, manager, logger) {
+@@ -71,7 +185,7 @@ export function setupMiddlewares(bot, config, manager, logger) {
+         preferMsgElements: true,
+     }));
+     // 11.5. 附件下载（file 附件下载到本地，供 @提及 / 工具访问）
+-    bot.use(attachmentProcessor(config, logger));
++    bot.use(attachmentDownloads(config, logger));
+     // 12. 上下文组装（将 history + quote + sender 组成 envelope）
+     bot.use(envelopeFormatter({
+         historyLimit: config.historyLimit,
+@@ -79,4 +193,4 @@ export function setupMiddlewares(bot, config, manager, logger) {
          includeSender: true,
      }));
  }
@@ -747,7 +786,7 @@ index c4998d0..71ed35a 100644
 \ No newline at end of file
 +//# sourceMappingURL=index.js.map
 diff --git a/dist/gateway/bootstrap.js b/dist/gateway/bootstrap.js
-index 070f21e..571060f 100644
+index 070f21e..ce934a8 100644
 --- a/dist/gateway/bootstrap.js
 +++ b/dist/gateway/bootstrap.js
 @@ -1,6 +1,12 @@
@@ -812,7 +851,7 @@ index 070f21e..571060f 100644
  /**
   * interaction 统一分发器：按 button_data 的顶层 `t` 判别字段，路由到对应
   * channel（question / approval）。QQ 只有一个 interaction 入口，集中路由
-@@ -30,8 +74,260 @@ function dispatchInteraction(event, manager) {
+@@ -30,8 +74,262 @@ function dispatchInteraction(event, manager) {
          return manager.approvalChannel?.handleInteraction(event) ?? false;
      return false;
  }
@@ -830,10 +869,12 @@ index 070f21e..571060f 100644
 +    const ANY = '*';
 +    let closed = false;
 +    const held = session => [...session.values()].some(c => c.refs > 0);
-+    function prune(session) {
++    // `keep`: the controller just created, not yet leased by its caller; pruning
++    // it would detach it from /stop, release and close.
++    function prune(session, keep) {
 +        for (const [turn, c] of session) {
 +            if (session.size <= maxTurns) break;
-+            if (c.refs === 0) session.delete(turn);
++            if (c.refs === 0 && c !== keep) session.delete(turn);
 +        }
 +        for (const [id, s] of sessions) {
 +            if (sessions.size <= maxSessions) break;
@@ -846,7 +887,7 @@ index 070f21e..571060f 100644
 +        let session = sessions.get(sessionId);
 +        if (!session) { session = new Map(); sessions.set(sessionId, session); }
 +        let c = session.get(key);
-+        if (!c) { c = { controller: new AbortController(), refs: 0 }; session.set(key, c); prune(session); }
++        if (!c) { c = { controller: new AbortController(), refs: 0 }; session.set(key, c); prune(session, c); }
 +        return c;
 +    }
 +    function abortAll(session) { for (const c of session.values()) c.controller.abort(); }
@@ -1073,7 +1114,7 @@ index 070f21e..571060f 100644
      // ── 初始化 QQ Bot SDK ──
      const userAgent = buildUserAgent();
      const bot = new QQBot({
-@@ -45,8 +341,10 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+@@ -45,8 +343,10 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
      });
      logger.info(`QQBot SDK initialized (UA: ${userAgent})`);
      // ── 中间件链 ──
@@ -1086,7 +1127,7 @@ index 070f21e..571060f 100644
      bot.on('message', async (mCtx) => {
          const msg = mCtx.message;
          // 记录最近 msgId，供无上下文的出站发送（文件发送显式 target、主动推送等）获取被动回复目标
-@@ -54,7 +352,7 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+@@ -54,7 +354,7 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
          if (config.debug) {
              logger.debug(`← message (post-middleware): ${JSON.stringify(msg, null, 2).slice(0, 500)}`);
          }
@@ -1095,7 +1136,7 @@ index 070f21e..571060f 100644
      });
      // ── 出站：dsh session/event → QQ 消息 ──
      // 获取 tools 服务（工具结果结构化展示），可选
-@@ -65,20 +363,32 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+@@ -65,20 +365,32 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
      catch {
          toolsRegistry = undefined;
      }
@@ -1138,7 +1179,7 @@ index 070f21e..571060f 100644
      ctx
          .on('session/event', outboundHandler);
      // ── 问答通道（ask_user_question → QQ 文本 + 按钮） ──
-@@ -89,6 +399,10 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+@@ -89,6 +401,10 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
      const approvalChannel = new ApprovalChannel(manager, sender, logger);
      manager.approvalChannel = approvalChannel;
      approvalChannel.install(ctx);
@@ -1149,7 +1190,7 @@ index 070f21e..571060f 100644
      // ── 按钮点击回调（interaction）：统一分发到问答/审批通道 ──
      bot.on('interaction', async (_iCtx, event) => {
          // scope/targetId 推导对齐消息事件（inbound.ts）：按 scene 判定类型，群用 group_openid，私聊用 user_openid
-@@ -130,15 +444,9 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+@@ -130,15 +446,9 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
      ensureVisionInputModal(config.vision, logger);
      registerDescribeImageTool(ctx, config.vision, logger);
      // ── 附件发送工具注册（qqbot_send_file） ──
@@ -1168,7 +1209,7 @@ index 070f21e..571060f 100644
      // ── 生命周期 ──
      ctx
          .effect(() => {
-@@ -146,11 +454,12 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+@@ -146,11 +456,12 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
          bot.start().catch((err) => {
              logger.error(`Bot start failed: ${err instanceof Error ? err.message : String(err)}`);
          });
@@ -1915,10 +1956,10 @@ index 36a81a2..4970410 100644
              continue;
          if (limiter.checkLimit(c.id).allowed) {
 diff --git a/dist/transport/inbound.js b/dist/transport/inbound.js
-index 1006265..bd1f584 100644
+index 1006265..62963ce 100644
 --- a/dist/transport/inbound.js
 +++ b/dist/transport/inbound.js
-@@ -1,32 +1,131 @@
+@@ -1,32 +1,132 @@
 -import { createUserMessage } from '@deepseek-ai/dsh-llm';
 -import { classifyContentType, isVoiceContentType, } from "./attachment.js";
 +import { classifyContentType, } from "./attachment.js";
@@ -1945,22 +1986,23 @@ index 1006265..bd1f584 100644
 +        ...(local ? { resource: { type: 'local', path: local } } : remote ? { resource: { type: 'remote', url: remote } } : {}),
 +    };
 +}
-+// 下载结果按文件名关联（与原组装逻辑一致）；每个下载只用于一个同名附件。
-+function byName(downloads) {
++// 下载结果按所属附件的序号关联（attachmentDownloads 标注），不按文件名：同名或无名的
++// 附件各自对应自己的文件；没有序号的下载结果不关联。
++function byIndex(downloads) {
 +    const map = new Map();
-+    for (const d of downloads ?? []) if (d?.filename !== undefined && !map.has(d.filename)) map.set(d.filename, d);
++    for (const d of downloads ?? []) if (Number.isSafeInteger(d?.attachment) && !map.has(d.attachment)) map.set(d.attachment, d);
 +    return map;
 +}
 +function qqAttachments(attachments, downloads) {
-+    const found = byName(downloads);
-+    return (attachments ?? []).slice(0, 20).map(a => qqAttachment({ contentType: a.content_type, filename: a.filename, size: a.size, url: a.url, asr: a.asr_refer_text }, found.get(a.filename)));
++    const found = byIndex(downloads);
++    return (attachments ?? []).slice(0, 20).map((a, i) => qqAttachment({ contentType: a.content_type, filename: a.filename, size: a.size, url: a.url, asr: a.asr_refer_text }, found.get(i)));
 +}
 +/** 引用消息：被引用原文与其附件（与当前消息附件分开，带各自的下载结果）。 */
 +function qqQuote(quote, downloads) {
 +    if (!quote) return undefined;
 +    const text = quote.text || quote.entry?.content;
-+    const found = byName(downloads);
-+    const attachments = (quote.attachments ?? []).slice(0, 20).map(a => qqAttachment({ contentType: a.contentType, filename: a.filename, url: a.url, asr: a.asrText }, found.get(a.filename ?? '')));
++    const found = byIndex(downloads);
++    const attachments = (quote.attachments ?? []).slice(0, 20).map((a, i) => qqAttachment({ contentType: a.contentType, filename: a.filename, url: a.url, asr: a.asrText }, found.get(i)));
 +    if (!text && !attachments.length) return undefined;
 +    return { ...(typeof text === 'string' && text ? { text } : {}), ...(attachments.length ? { attachments } : {}) };
 +}
@@ -2068,7 +2110,7 @@ index 1006265..bd1f584 100644
          logger.error(`ERROR creating session: ${err instanceof Error ? err.message : String(err)}`);
          // 兜底回复：会话创建失败时告知用户，避免静默无响应
          try {
-@@ -35,27 +134,33 @@ export async function handleInbound(ctx, manager, config, logger) {
+@@ -35,27 +135,33 @@ export async function handleInbound(ctx, manager, config, logger) {
          catch (sendErr) {
              logger.error(`fallback reply failed: ${sendErr instanceof Error ? sendErr.message : String(sendErr)}`);
          }
@@ -2118,7 +2160,7 @@ index 1006265..bd1f584 100644
  }
  // ══════════════════════════════════════════════════════════════
  // Body Assembly（5 层组装）
-@@ -63,15 +168,16 @@ export async function handleInbound(ctx, manager, config, logger) {
+@@ -63,15 +169,16 @@ export async function handleInbound(ctx, manager, config, logger) {
  /**
   * 组装 agentBody — AI 实际看到的完整上下文
   */
@@ -2140,7 +2182,7 @@ index 1006265..bd1f584 100644
      const base = dynamicCtx ? `${dynamicCtx}${userMessage}` : userMessage;
      const agentBody = buildAgentBody(base, state.history, isGroup, wasMentioned);
      return agentBody;
-@@ -92,21 +198,17 @@ function isEmptyMessage(userContent, attachments, isGroup, wasMentioned) {
+@@ -92,21 +199,17 @@ function isEmptyMessage(userContent, attachments, isGroup, wasMentioned) {
  /**
   * Layer 1: 用户文本内容 + 语音转录 + 附件类型标签（媒体路径由 buildDynamicCtx 提供）
   */
@@ -2167,7 +2209,7 @@ index 1006265..bd1f584 100644
      if (attachmentTags) {
          parts.push(attachmentTags);
      }
-@@ -116,9 +218,9 @@ function buildUserContent(msg, state, logger) {
+@@ -116,9 +219,9 @@ function buildUserContent(msg, state, logger) {
   * Layer 2: 引用消息块
   */
  function buildQuotePart(quote) {
@@ -2179,7 +2221,7 @@ index 1006265..bd1f584 100644
      return `[Quoted message begins]\n${quoteText}\n[Quoted message ends]\n[Current message]\n`;
  }
  /**
-@@ -136,48 +238,44 @@ function buildUserMessage(userContent, quotePart, senderId, senderName, isGroup,
+@@ -136,48 +239,44 @@ function buildUserMessage(userContent, quotePart, senderId, senderName, isGroup,
  /**
   * Layer 4: 媒体元数据上下文（图片/视频/文件本地路径 + 语音 ASR + 引用附件）
   */
@@ -2242,7 +2284,7 @@ index 1006265..bd1f584 100644
          }
      }
      return lines.length > 0 ? lines.join('\n') + '\n\n' : '';
-@@ -222,31 +320,6 @@ function buildAgentBody(base, history, isGroup, wasMentioned) {
+@@ -222,31 +321,6 @@ function buildAgentBody(base, history, isGroup, wasMentioned) {
          base,
      ].join('\n');
  }
@@ -2274,7 +2316,7 @@ index 1006265..bd1f584 100644
  /**
   * 附件类型标签（Layer 1 用户消息主体里的轻量提示）。
   * 只标注「带了什么类型的附件」，去重；媒体本地路径在 buildDynamicCtx 提供。
-@@ -262,7 +335,7 @@ function buildAttachmentTags(attachments) {
+@@ -262,7 +336,7 @@ function buildAttachmentTags(attachments) {
      const seen = new Set();
      const tags = [];
      for (const att of attachments) {
@@ -2283,7 +2325,7 @@ index 1006265..bd1f584 100644
          if (kind === 'voice' || seen.has(kind))
              continue;
          seen.add(kind);
-@@ -285,4 +358,4 @@ const SENDER_SHORT_ID_LEN = 8;
+@@ -285,4 +359,4 @@ const SENDER_SHORT_ID_LEN = 8;
  function shortSenderId(senderId) {
      return senderId.slice(0, SENDER_SHORT_ID_LEN);
  }

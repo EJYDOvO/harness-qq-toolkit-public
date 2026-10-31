@@ -187,8 +187,8 @@ const inbound=vm.runInNewContext(strip(read('transport/inbound.js'))+'\n;({norma
 const qqCtx=({content='看看',attachments=[],downloaded=[],quote,downloadedQuote}={})=>({message:{kind:'c2c',senderId:'owner',messageId:'in-1',content,attachments},state:{downloadedFiles:downloaded,...(quote?{quote}:{}),...(downloadedQuote?{downloadedQuoteFiles:downloadedQuote}:{})},bot:{sendMarkdown:async()=>{},sendTyping:async()=>{}}});
 const sample={
  attachments:[{content_type:'image/png',filename:'p.png',size:10,url:'https://qq.example/p'},{content_type:'application/pdf',filename:'b.pdf',size:1024,url:'https://qq.example/b'},{content_type:'voice',filename:'v.silk',url:'https://qq.example/v',asr_refer_text:' 你好 '}],
- downloaded:[{filename:'p.png',contentType:'image',localPath:'/media/p_1.png'}],
- quote:{text:'原话',attachments:[{contentType:'image/jpeg',filename:'q.jpg',url:'https://qq.example/q'}]},downloadedQuote:[{filename:'q.jpg',localPath:'/media/q_1.jpg'}],
+ downloaded:[{filename:'p.png',contentType:'image',localPath:'/media/p_1.png',attachment:0}],
+ quote:{text:'原话',attachments:[{contentType:'image/jpeg',filename:'q.jpg',url:'https://qq.example/q'}]},downloadedQuote:[{filename:'q.jpg',localPath:'/media/q_1.jpg',attachment:0}],
 };
 test('inbound: QQ attachments and the quote become descriptors with trusted resources, no raw platform fields',()=>{
  const s=inbound.normalizeQQMessage(qqCtx(sample));
@@ -218,4 +218,49 @@ test('inbound: the I/O accepts and freezes descriptors; the model-visible body i
  // A message with only an attachment is still input.
  const only=inbound.normalizeQQMessage(qqCtx({content:'',attachments:[{content_type:'video/mp4',filename:'m.mp4',url:'https://qq.example/m'}]}));only.message.id='in-2';only.platformData.hold={};
  assert.equal((await channel.receive(only)).status,'accepted');assert.match(inputs[1].content[0].text,/Video: m\.mp4 \(download failed\)[\s\S]*\[视频\]/);
+});
+
+// Downloads are associated by attachment index, never by file name.
+const downloadsFor=downloadMediaAttachments=>vm.runInNewContext(strip(read('gateway/middleware-setup.js'))+'\n;attachmentDownloads',{downloadMediaAttachments})({media:{enabled:true}},{warn(){},debug(){}});
+const collide={
+ attachments:[{content_type:'image/png',filename:'image.png',size:1,url:'https://qq.example/A'},{content_type:'image/png',filename:'image.png',size:1,url:'https://qq.example/B'},
+  {content_type:'file',filename:'r.pdf',size:1,url:'https://qq.example/C'},{content_type:'file',filename:'r.pdf',size:1,url:'https://qq.example/D'},{content_type:'image/png',size:1,url:'https://qq.example/N'}],
+ quote:{text:'q',attachments:[{contentType:'image/jpeg',url:'https://qq.example/Q1'},{contentType:'voice',url:'https://qq.example/QV'},{contentType:'image/jpeg',url:'https://qq.example/Q2'}]},
+};
+async function associate(download){
+ const ctx={message:{kind:'c2c',senderId:'owner',messageId:'in-9',content:'看',attachments:collide.attachments},state:{quote:collide.quote}};
+ await downloadsFor(download)(ctx,async()=>{});
+ const s=inbound.normalizeQQMessage(ctx),own=s.message.attachments.map(a=>a.resource),quoted=s.message.quote.attachments.map(a=>a.resource);
+ return {own,quoted};
+}
+function assertOwnFiles({own,quoted},content){
+ assert.equal(content(own[0]),'https://qq.example/A');assert.equal(content(own[1]),'https://qq.example/B','same name, different file');
+ assert.deepEqual({...own[2]},{type:'remote',url:'https://qq.example/C'},'a failed download keeps its platform URL, never another attachment\'s file');
+ assert.equal(content(own[3]),'https://qq.example/D');assert.equal(content(own[4]),'https://qq.example/N','an attachment without a name is downloaded on its own');
+ assert.equal(content(quoted[0]),'https://qq.example/Q1');assert.equal(quoted[1].type,'remote','quoted voice is not downloaded');
+ assert.equal(content(quoted[2]),'https://qq.example/Q2','quoted attachments without names get their own files');
+}
+test('inbound downloads: same-name, nameless, failed and quoted attachments each keep their own file',async()=>{
+ // Stand-in with the upstream result shape: {filename, contentType, localPath}, nothing for a failure.
+ const files=new Map();let n=0;
+ const result=await associate(async list=>{
+  if(list.length!==1)throw Error('one attachment per download');
+  const [a]=list;if(!a.url||kinds(a.content_type)==='voice'||a.url.endsWith('/C'))return [];
+  const localPath=`/media/${a.filename||'attachment'}_${++n}`;files.set(localPath,a.url);return [{filename:a.filename,contentType:kinds(a.content_type),localPath}];
+ });
+ assertOwnFiles(result,r=>r?.type==='local'?files.get(r.path):undefined);
+ // Results without an attachment index are never associated by name.
+ const s=inbound.normalizeQQMessage(qqCtx({attachments:[{content_type:'image',filename:'p.png',url:'https://qq.example/p'}],downloaded:[{filename:'p.png',localPath:'/media/p_1.png'}]}));
+ assert.equal(s.message.attachments[0].resource.type,'remote');
+});
+const qqbotDist=path.join(process.env.QQBOT_TEST_PROFILE??new URL('../data/profiles/qqbot-validation/',import.meta.url).pathname.replace(/^\/(\w:)/,'$1'),'node_modules/@tencent-connect/dsh-qqbot/dist');
+test('inbound downloads with the installed dsh-qqbot download helper (network stubbed)',{skip:fs.existsSync(path.join(qqbotDist,'transport/attachment.js'))?false:'no validation profile with the installed dsh-qqbot'},async()=>{
+ const mediaRoot=fs.mkdtempSync(path.join(os.tmpdir(),'qq-dl-'));
+ const crypto=await import('node:crypto');
+ const helper=vm.runInNewContext(strip(fs.readFileSync(path.join(qqbotDist,'transport/attachment.js'),'utf8').replaceAll('\r\n','\n'))+'\n;downloadMediaAttachments',{
+  mkdirSync:fs.mkdirSync,writeFileSync:fs.writeFileSync,basename:path.basename,extname:path.extname,join:path.join,sep:path.sep,randomBytes:crypto.randomBytes,
+  MEDIA_ROOT:mediaRoot,Buffer,URL,AbortSignal,dns:{promises:{resolve4:async()=>['203.0.113.7']}},
+  fetch:async url=>url.endsWith('/C')?{ok:false,status:500}:{ok:true,arrayBuffer:async()=>new TextEncoder().encode(url).buffer}});
+ try{assertOwnFiles(await associate((list,media,logger)=>helper(list,media,logger)),r=>r?.type==='local'?fs.readFileSync(r.path,'utf8'):undefined);}
+ finally{fs.rmSync(mediaRoot,{recursive:true,force:true});}
 });
