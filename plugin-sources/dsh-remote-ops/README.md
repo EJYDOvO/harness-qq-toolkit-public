@@ -52,4 +52,4 @@ stateDirectory/jobs 下的 result.json 可接入现有维护通知（action/ok/r
 更新前备份配置、状态和旧安装包，固定依赖及补丁哈希，独立 Profile 验证后单活切换。基础 QQ 审批/问答不经过本插件。启动仅恢复 Owner Session，不自动执行模型请求；/new 不迁移旧提醒，应先管理原提醒。
 ## Interaction 兼容
 
-当前源码版本 `1.1.1-test.2`（Iteration 07：通知只经 Agent I/O 通知器或 Character Outbox，未部署；运行实例为 `1.1.1-test.1`，与新 Character 兼容）。`1.1.1-test.1` 曾配套 Character test.10 部署。目标 Agent 存在可选 Interaction 服务时让出普通等待提示，保留维护、超时、故障与任务完成通知；原生流式帧更新活动时间。旧 `1.1.0` 恢复包未被覆盖。详见 [适配说明](../../docs/INTERACTION.md)。
+当前源码版本 `1.1.1-test.2`（Iteration 07：通知只经 Agent I/O 通知器或 Character Outbox），2026-11-01 已配套 Character test.26 / Agent I/O test.7 授权部署，启动与既有账本保留检查通过；真实 QQ 通知仍待验收。`1.1.1-test.1` 曾配套 Character test.10 部署。目标 Agent 存在可选 Interaction 服务时让出普通等待提示，保留维护、超时、故障与任务完成通知；原生流式帧更新活动时间。旧 `1.1.0` 恢复包未被覆盖。详见 [适配说明](../../docs/INTERACTION.md)。
