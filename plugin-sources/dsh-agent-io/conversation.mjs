@@ -36,6 +36,9 @@ export function createConversations(io,host){
   if(!scopes.size)throw Error('Conversation requires at least one scope');
   const onInput=typeof options.onInput==='function'?options.onInput:undefined;
   let inbound,release,commands,hitl,closed=false;
+  // Notification grants issued by this wiring's notifiers (openNotifications);
+  // an origin carrying anything else is not a notification.
+  const grants=new WeakSet();
 
   const allowed=(scope,peer)=>{try{return admits(scope,peer)===true;}catch{return false;}};
   // undefined: no Interaction for this Agent. null: the lookup failed; callers
@@ -123,6 +126,45 @@ export function createConversations(io,host){
    return {ok:true,record};
   }
 
+  /**
+   * The stable-target route of a notification (ADR-059): no current Session is
+   * required, because a legitimate reminder may come from a rotated Session;
+   * instead the Conversation must still be admitted and the notification
+   * authority that holds the grant must re-authorize this exact target now.
+   * Chat and HITL replies never take this path.
+   */
+  function notificationRoute(to,grant){
+   if(to?.platform!==platform||to.accountId!==accountId)return {ok:false,reason:'invalid-target'};
+   const scope=scopes.get(to.conversation?.type),peer=to.conversation?.id;
+   if(!scope||!text(peer))return {ok:false,reason:'invalid-target'};
+   if(closed||grant.closed())return {ok:false,reason:'closed'};
+   if(!allowed(scope,peer))return {ok:false,reason:'unauthorized'};
+   let granted=false;try{granted=grant.authorize(Object.freeze({type:to.conversation.type,id:peer}))===true;}catch{granted=false;}
+   if(!granted)return {ok:false,reason:'unauthorized'};
+   return {ok:true,route:Object.freeze({notification:true,target:Object.freeze({type:to.conversation.type,id:peer,scope})})};
+  }
+
+  /**
+   * The account's notifier (Notification, ADR-054/057): a Host notification
+   * authority (e.g. Character Identity's durable Outbox, Remote Ops' ledger)
+   * sends explicit, already-recorded events to a stable Conversation through the
+   * same I/O queue as chat (same Conversation order, bounded queue, duplicate
+   * suppression by id, cancellation, honest result). send({id, conversation,
+   * text, authorize, signal}): authorize(target) is that authority's own check
+   * (Owner, binding, event validity), run before every part together with this
+   * wiring's admission; anything but true refuses the part. Text only.
+   */
+  function openNotifications(){
+   if(closed)throw Error('Conversation closed');
+   let stopped=false;
+   function send({id,conversation,text:body,authorize,signal}={}){
+    if(typeof id!=='string'||!id||typeof authorize!=='function')return Promise.resolve(Object.freeze({id,status:'not-sent',reason:'invalid-message',stage:'before-platform',parts:Object.freeze([])}));
+    const grant=Object.freeze({authorize,closed:()=>stopped});grants.add(grant);
+    return io.sendMessage({id,target:{platform,accountId,conversation:{type:conversation?.type,id:conversation?.id}},origin:{notification:grant},message:{text:body},...(signal?{signal}:{})});
+   }
+   return Object.freeze({send,close(){stopped=true;}});
+  }
+
   /** The account's inbound channel; deliver(standard) is the adapter's entry, normally ending in handoff(). */
   function openInbound(deliver){
    if(closed)throw Error('Conversation closed');
@@ -191,6 +233,7 @@ export function createConversations(io,host){
     // Basic media: optional; without sendAttachment the I/O refuses attachments.
     ...(typeof parts?.sendAttachment==='function'?{sendAttachment:parts.sendAttachment,...(typeof parts.accepts==='function'?{accepts:parts.accepts}:{})}:{}),
     resolve(to,origin){
+     if(origin?.notification!==undefined)return grants.has(origin.notification)?notificationRoute(to,origin.notification):{ok:false,reason:'unauthorized'};
      const r=route(to,origin);if(!r.ok)return r;
      if(check){
       let c;try{c=check(r.record,to);}catch{return {ok:false,reason:'adapter-error'};}
@@ -207,6 +250,6 @@ export function createConversations(io,host){
    closed=true;if(hitl){hitl.bridge.close();hitl.unregister();hitl=undefined;}inbound?.close();inbound=undefined;release?.();release=undefined;commands=undefined;
   }
 
-  return Object.freeze({platform,adapter,accountId,target,policy,handoff,submit,route,openInbound,openCommands,openHITL,registerAdapter,close});
+  return Object.freeze({platform,adapter,accountId,target,policy,handoff,submit,route,openInbound,openCommands,openHITL,openNotifications,registerAdapter,close});
  };
 }

@@ -14,7 +14,7 @@ QQTK 继续是独立插件与维护组件集合，不迁入 Character 仓库、�
 | Character QQ | QQTK + Character 集成 | 不变；通用 QQ 不加载 Character |
 | 会话偏好 | QQ 私有路径推导 | Manager 显式绝对 stateFile；默认项目隔离 |
 
-普通项目安装 QQ Bot、独立 `dsh-agent-io` 和 `dsh-conversation-manager`，不需要 Remote Ops、旧项目记忆或任何 Character 包。Agent I/O 的接口与语义见 [独立插件说明](../plugin-sources/dsh-agent-io/README.md)；Iteration 06 的 QQ 补丁要求 `dsh-agent-io@0.1.0-test.6` 或更新（`openCommands()`、附件与 `openHITL()`），旧包会让 Gateway 启动即报错。两份补丁须配套：
+普通项目安装 QQ Bot、独立 `dsh-agent-io` 和 `dsh-conversation-manager`，不需要 Remote Ops、旧项目记忆或任何 Character 包。Agent I/O 的接口与语义见 [独立插件说明](../plugin-sources/dsh-agent-io/README.md)；Iteration 07 的 QQ 补丁要求 `dsh-agent-io@0.1.0-test.7` 或更新（`openCommands()`、附件、`openHITL()` 与 `openNotifications()`），旧包会让 Gateway 启动即报错。两份补丁须配套：
 
 Profile 保留原生 base/web-app Bundle，`autoInstallPeers: false`，不要重复安装本体的服务包。将 `maintenance/patches/dsh-qqbot@0.5.2.patch` 放到 Profile 的 patches，配置：
 
@@ -64,6 +64,7 @@ overrides:
 - 所有 QQ 聊天输出经 Agent I/O 的 `sendMessage()` 发送（Iteration 04 起含 Interaction 气泡与等待提示，见 [Agent I/O](../plugin-sources/dsh-agent-io/README.md) 的“QQ Official 出站：Interaction 气泡”）；未绑定 Interaction 时普通回复、工具错误与轮次错误提示：逻辑消息 ID 取自原生 Session ID 与事件 seq（重复事件只发一次）；每个分片前复核对端仍被访问配置准入、来源 Session 仍是 Manager `isCurrentSession` 认可的当前 Session；`/stop` 与 `aborted`/`interrupted` 结束的 Turn 取消尚未交给 QQ 的输出。明确拒绝、结果未知与部分发送分别记录且不重发；进程内去重不跨重启。旧配置项 `streaming` 已停用，QQ 聊天不再使用 SDK 流式消息。
 - 斜杠命令（Iteration 05）：仍在并发合并之前处理，但识别、解析、一次性认领与路由由 Agent I/O 命令路由完成；命令的执行与授权（例如 Remote Ops `/ops` 的所有者检查）不变，未知命令仍作为普通聊天进入 Agent，命令消息不会再成为 Agent 输入。不再自动注册 SDK `/help`（`/bot-help` 保留）。
 - 审批与 `ask_user_question`（Iteration 06）：Agent I/O 的 HITL Bridge 经原生 `approval/request`/`user-questions/request` waterfall 接收本应用当前 Session 的请求，提示与按钮经 `sendMessage()` 发送；只接受同一 Conversation 预期作答者的按钮或文本回应（文本作答在并发合并之前，经 I/O 入站去重认领）。原生审批策略与结果语义不变。`hitl.enabled: false`（默认 `true`）时这些请求交回原生 Web/Desktop。需要 `dsh-agent-io@0.1.0-test.6` 或更新，旧包会让 Gateway 启动即报错。
+- 主动通知（Iteration 07）：Gateway 从 Agent I/O 打开一个通知器，只交给它附加的通知方（Remote Ops；有 Character 时经其包装交给 Character Identity）。通知发往稳定 Conversation，不要求当前 Session，由访问配置与通知方自己的授权在每个分片前复核；普通聊天与 HITL 的当前 Session 检查不变。独立运行时 Remote Ops 先持久记录事件键再经通知器发送；与 Character 集成时只由 Character Outbox 发送。`notifications.enabled: false`（默认 `true`）时不发送。需要 `dsh-agent-io@0.1.0-test.7`。
 - `qqbot_send_file`（Iteration 05）：只发往调用者 Agent 的当前会话，经 Agent I/O 作为附件消息发送；`target` 参数仅在与当前会话一致时接受。`sendFile.restrictPaths`/`extraRoots` 白名单不变并在发送时复核。
 - 普通聊天入站（Iteration 02 起）：SDK 中间件链（白名单、群聊禁用、@ 门控、命令、问答、更正、合并、附件下载）位置不变，附件与引用自 Iteration 05 起以标准附件描述随消息进入 I/O，走到消息处理器的消息经 Agent I/O 入站通道去重后交给 QQ 会话入口，入口按同一访问配置复核，再经 Conversation Manager 创建原生输入；I/O 不授予任何权限。去重为进程内、有界，详见 [Agent I/O](../plugin-sources/dsh-agent-io/README.md)。
 - 进程共享 appId 租约拒绝重复 Gateway，卸载等待停止后释放；只构造一套 Sender 与一个 HITL Bridge。

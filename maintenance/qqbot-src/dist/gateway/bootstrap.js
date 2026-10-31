@@ -333,6 +333,7 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
     ctx.effect(() => conversation.close);
     if (typeof conversation.openCommands !== 'function') throw new Error('dsh-agent-io 0.1.0-test.5 or later (commands and attachments) is required before QQ');
     if (typeof conversation.openHITL !== 'function') throw new Error('dsh-agent-io 0.1.0-test.6 or later (HITL Bridge) is required before QQ');
+    if (config.notifications?.enabled !== false && typeof conversation.openNotifications !== 'function') throw new Error('dsh-agent-io 0.1.0-test.7 or later (notifications) is required before QQ');
     const deliveryRecorder=createDeliveryRecorder(config.deliveryDiagnostics,logger);
     ctx.effect(()=>()=>deliveryRecorder?.close());
     // ── 初始化 QQ Bot SDK ──
@@ -402,8 +403,13 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
     // Closed with the Conversation wiring (Gateway unload); Session release cancels its requests.
     manager.hitl = openQQHITL(conversation, config, logger);
     ctx.provide('qqGateway', Object.freeze({ bot, manager, sender }));
+    // ── 主动通知：稳定目标经 Agent I/O 发送（不要求当前 Session，由通知方逐片授权） ──
+    // Handed only to the notification authorities attached below (Remote Ops, and
+    // Character Identity through its Remote Ops wrapper); off with notifications.enabled: false.
+    const notifications = config.notifications?.enabled === false ? undefined : conversation.openNotifications();
+    if (notifications) ctx.effect(() => () => notifications.close());
     // Remote Ops is an optional extension. Core messaging and approval own no ops dependency.
-    const releaseRemoteOps = ctx.get('qqRemoteOps')?.attach({ bot, manager, sender, config });
+    const releaseRemoteOps = ctx.get('qqRemoteOps')?.attach({ bot, manager, sender, config, ...(notifications ? { notifications } : {}) });
     if (typeof releaseRemoteOps === 'function') ctx.effect(() => releaseRemoteOps);
     // ── 按钮点击回调（interaction）：HITL 按钮交给 Bridge 校验与结算 ──
     bot.on('interaction', async (_iCtx, event) => {

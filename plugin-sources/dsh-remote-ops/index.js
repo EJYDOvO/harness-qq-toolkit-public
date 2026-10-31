@@ -4,31 +4,65 @@ import {resolveBackend} from './backend.js';
 export const name='qq-remote-ops';
 export const inject=['agents'];
 const read=file=>JSON.parse(fs.readFileSync(file,'utf8').replace(/^\uFEFF/,''));
+// Only the current plugin instance may write this JSON snapshot. A late result
+// from a retired HMR instance leaves its durable sending fence for review.
+const ledgerOwners=globalThis[Symbol.for('dsh.remote-ops.notification-ledger.v1')]??=new Map();
 export function apply(ctx,config){
   let runtime;
   const {state,owner,remote,atomic}=resolveBackend(ctx,config,()=>runtime);
   const outFile=path.join(state,'qq-notifications.json');
-  const ledger=fs.existsSync(outFile)?read(outFile):{enabledAt:Date.now(),deliveries:{}};
+  let durable=fs.existsSync(outFile),ledger=durable?read(outFile):{enabledAt:Date.now(),deliveries:{}};
+  const ownerToken={};ledgerOwners.set(outFile,ownerToken);let disposed=false,reloadRequired=false;
+  const ownsLedger=()=>!disposed&&ledgerOwners.get(outFile)===ownerToken;
   const active=new Map();let busy=false;
-  const persist=()=>atomic(outFile,JSON.stringify(ledger,null,2));
+  const persist=(next=ledger)=>{
+    if(!ownsLedger())throw Error('Remote Ops ledger owner retired');
+    try{atomic(outFile,JSON.stringify(next,null,2));ledger=next;durable=true;reloadRequired=false;}
+    catch(error){reloadRequired=true;throw error;}
+  };
+  const refresh=()=>{if(reloadRequired){if(durable||fs.existsSync(outFile)){ledger=read(outFile);durable=true;}reloadRequired=false;}};
   const allowed=c=>c.message.kind==='c2c'&&c.message.senderId===owner.openid;
   const saveHealth=(connected,detail)=>atomic(path.join(state,'qq-health.json'),JSON.stringify({connected,detail,at:Date.now(),pid:process.pid}));
+  // Exactly one sender per event. With Character, its durable Outbox owns the
+  // delivery (notifyEvent) and this ledger only records the key and the Outbox
+  // status; standalone, the Gateway's Agent I/O notifier sends it. There is no
+  // direct Gateway send. The key is persisted before any send: a crash leaves
+  // 'sending', which is never replayed. Statuses: sent | not-sent | partial |
+  // unknown | pending (Character Outbox still delivering) | suppressed; older
+  // ledgers may hold 'failed' (any error before this version).
   async function notify(key,text){
-    if(!runtime||ledger.deliveries[key])return;
-    if(!remote.features().notifications.enabled){ledger.deliveries[key]={status:'suppressed',at:Date.now()};persist();return;}
-    // Persist before sending. A crash with status=sending is ambiguous and never auto-replayed.
-    ledger.deliveries[key]={status:'sending',at:Date.now()};persist();
-    try{if(runtime.notifyEvent){await runtime.notifyEvent({eventId:'qqtk:'+key,kind:key.startsWith('job:')?'maintenance_result':key.startsWith('timeout:')?'task_timeout':key.startsWith('complete:')?'task_completed':key.startsWith('failed:')?'task_failed':'configured_alert',text});}else{await runtime.sender.sendMarkdown({scope:'c2c',targetId:owner.openid},text);}ledger.deliveries[key].status='sent';}
-    catch{ledger.deliveries[key].status='failed';}
-    persist();
+    const value=runtime;
+    if(!value||!ownsLedger())return;
+    // A failed atomic write may have left a durable claim. Re-read before any
+    // retry; failure to read remains fail-closed. Never erase an uncertain key.
+    refresh();
+    if(ledger.deliveries[key])return;
+    const enabled=remote.features().notifications.enabled;
+    persist({...ledger,deliveries:{...ledger.deliveries,[key]:{status:enabled?'sending':'suppressed',at:Date.now()}}});
+    if(!enabled)return;
+    const kind=key.startsWith('job:')?'maintenance_result':key.startsWith('timeout:')?'task_timeout':key.startsWith('complete:')?'task_completed':key.startsWith('failed:')?'task_failed':'configured_alert';
+    let result;
+    try{
+     if(value.notifyEvent)result=await value.notifyEvent({eventId:'qqtk:'+key,kind,text});
+     else if(value.notifications)result=await value.notifications.send({id:'qqtk:'+key,conversation:{type:'direct',id:owner.openid},text,
+      // Re-checked before the send: still this attachment and still the pinned Owner.
+      authorize:target=>ownsLedger()&&runtime===value&&target.type==='direct'&&target.id===owner.openid});
+     else result={status:'not-sent',reason:'notifications-unavailable'};
+    }catch(error){result={status:typeof error?.status==='string'?error.status:'unknown'};}
+    if(!ownsLedger())return;
+    const entry={...ledger.deliveries[key],status:typeof result?.status==='string'?result.status:'unknown'};
+    if(typeof result?.reason==='string')entry.reason=result.reason;
+    persist({...ledger,deliveries:{...ledger.deliveries,[key]:entry}});
   }
-  async function tick(){if(busy||!runtime)return;busy=true;try{
+  async function tick(){if(busy||!runtime||!ownsLedger())return;busy=true;try{
     const f=remote.features();
     for(const n of fs.readdirSync(path.join(state,'jobs')).filter(n=>n.endsWith('.result.json')).sort()){
+      if(!runtime||!ownsLedger())return;
       const v=read(path.join(state,'jobs',n));if(Date.parse(v.finishedAt)<ledger.enabledAt)continue;
       await notify('job:'+n,`维护 ${v.action}：${v.ok?'成功':'失败'}${v.rolledBack?'，已回滚':''}\n任务：${n.replace('.result.json','')}\n/ops result 查看记录。`);
     }
     if(f.remoteOps.enabled)for(const [id,v] of active){
+      if(!runtime||!ownsLedger())return;
       const agent=ctx.agents.get(id);if(!agent||agent.status!=='running'){active.delete(id);continue;}
       const elapsed=Date.now()-v.startedAt,quiet=Date.now()-v.lastAt;
       if(quiet>f.remoteOps.staleAfterSeconds*1000)await notify(`stale:${id}:${v.turn}`,`任务已有 ${Math.floor(quiet/60000)} 分钟没有新进展。可用 /ops tasks 查看，/ops stop 停止当前 QQ 任务及子 Agent。`);
@@ -46,7 +80,7 @@ export function apply(ctx,config){
     if(event.type==='turn/end'){
       const tracked=active.get(id);
       // Only long-running tracked tasks have a separate completion notification.
-      if(tracked&&Date.now()-tracked.startedAt>remote.features().remoteOps.notifyAfterSeconds*1000){const failed=!!event.data?.error||event.data?.reason?.kind!=='completed';void notify(`${failed?'failed':'complete'}:${id}:${tracked.turn}`,failed?'QQ 长任务执行失败；请查看当前会话结果。':'QQ 长任务已结束；请查看当前会话结果。');}
+      if(tracked&&Date.now()-tracked.startedAt>remote.features().remoteOps.notifyAfterSeconds*1000){const failed=!!event.data?.error||event.data?.reason?.kind!=='completed';void notify(`${failed?'failed':'complete'}:${id}:${tracked.turn}`,failed?'QQ 长任务执行失败；请查看当前会话结果。':'QQ 长任务已结束；请查看当前会话结果。').catch(()=>ctx.logger?.warn('Remote Ops notification blocked; durable state retained'));}
       active.delete(id);
     }
   });
@@ -70,7 +104,8 @@ export function apply(ctx,config){
     attach(value){
       if(runtime)throw Error('Remote Ops already attached to a QQ gateway');
       if(value.config.access?.c2cMode!=='allowlist'||!value.config.access.c2cAllow?.includes(owner.openid))throw Error('Remote Ops owner is not admitted by QQ policy');
-      runtime=value;persist();
+      if(!ownsLedger())throw Error('Remote Ops ledger owner retired');
+      refresh();persist();runtime=value;
       const ready=()=>{if(runtime===value)saveHealth(true,'ready');};
       const disconnected=e=>{if(runtime===value)saveHealth(false,e.willReconnect?'reconnecting':'permanent');};
       value.bot.on('ready',ready);value.bot.on('disconnected',disconnected);
@@ -80,5 +115,5 @@ export function apply(ctx,config){
     }
   };
   ctx.provide('qqRemoteOps',service);
-  ctx.effect(()=>{const timer=setInterval(()=>void tick(),15000);return()=>{clearInterval(timer);runtime=undefined;active.clear();};});
+  ctx.effect(()=>{const timer=setInterval(()=>void tick(),15000);return()=>{clearInterval(timer);disposed=true;runtime=undefined;active.clear();if(ledgerOwners.get(outFile)===ownerToken)ledgerOwners.delete(outFile);};});
 }
