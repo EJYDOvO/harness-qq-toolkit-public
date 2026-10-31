@@ -64,9 +64,8 @@ function gateway({io=createAgentIO(),appId='app-a',policy,streaming=false,limit=
  // The gateway's own sender, Interaction bridge and adapter registration, exactly as reviewed.
  const senderSource=slice(source,'    const replyLimiter = new ReplyLimiter({ limit: 4 });','    // Optional Agent policy. No Character');
  const {sender,diagnostics}=vm.runInNewContext('(function(){'+senderSource+';return {sender,diagnostics};})()',{ReplyLimiter,deliveryRecorder:recorder,bot,resolveReplyTarget,sendResolvedMarkdown});
- // The original outbound router and buffer with their patched static send.
- const {OutboundBuffer}=load('transport/outbound-buffer.js','OutboundBuffer');
- const {createOutboundHandler}=load('transport/outbound.js','createOutboundHandler',{OutboundBuffer,formatToolResult:name=>`工具 ${name} 失败`,parseEvent,extractTurnError});
+ // The original outbound router with its patched static send.
+ const {createOutboundHandler}=load('transport/outbound.js','createOutboundHandler',{formatToolResult:name=>`工具 ${name} 失败`,parseEvent,extractTurnError});
  const body=slice(source,'    const policyFor =','    return outboundHandler;');
  const handler=vm.runInNewContext('(function(){'+body+';return outboundHandler;})()',{
   ctx,manager,sender,config,logger,toolsRegistry:undefined,diagnostics,io,conversation,createOutboundHandler,AbortController,AbortSignal,randomUUID:()=>'0123abcd-0000-4000-8000-000000000000'});
@@ -230,12 +229,42 @@ test('cancelling an Interaction bubble: the policy signal, /stop or an aborted T
  g.ev.end({kind:'aborted',reason:{kind:'user'}},1);await assert.rejects(policy.transport.sendText('迟到',bubble()),e=>e.reason==='cancelled');
  g.ev.turn(2);await policy.transport.sendText('第二轮',bubble({turn:2}));assert.deepEqual(g.bot.sent.map(s=>s.content),['第二轮']);
 });
-test('the old streaming option opens no SDK stream: a streamed plain reply goes once through the I/O, a cancelled one not at all',async()=>{
- const streamed=gateway({streaming:true});streamed.ev.chunk('流');const message=streamed.ev.reply('流式回复');streamed.ev.end();await tick();
- streamed.emit(message);await tick();
- assert.deepEqual(streamed.bot.sent.map(s=>s.content),['流']);
- const stopped=gateway({streaming:true});stopped.ev.chunk('半');stopped.ev.end({kind:'interrupted'});await tick();
- assert.equal(stopped.bot.sent.length,0,'a cancelled Turn does not flush its buffer');
+test('a plain reply is sent from its settled assistant/message, not from accumulated chunks; the old streaming option changes nothing',async()=>{
+ for(const streaming of [false,true]){
+  const g=gateway({streaming});g.ev.turn();g.ev.chunk('流');const message=g.ev.reply('流式回复');g.ev.end();await tick();
+  g.emit(message);await tick();
+  assert.deepEqual(g.bot.sent.map(s=>s.content),['流式回复'],`streaming:${streaming} sends the complete settled text once`);
+  assert.equal(g.bot.streams?.length??0,0,'no SDK stream');
+ }
+});
+test('missing, repeated, out-of-order or divergent chunks never change the settled reply',async()=>{
+ const io=createAgentIO(),ids=[];const g=gateway({io:{...io,sendMessage:r=>{ids.push(r.id);return io.sendMessage(r);}}});
+ g.ev.turn();
+ // Chunks of an abandoned attempt, a retry repeating them, out of order and with a different join.
+ for(const piece of ['第一段','第一段','。第二','第一段'])g.ev.chunk(piece);
+ const message=g.ev.reply('',1,{message:{role:'assistant',content:[{type:'text',text:'第一段。'},{type:'tool-call',id:'c',name:'x',arguments:'{}'},{type:'text',text:'第二段。'}]}});
+ g.ev.end();await tick();
+ assert.deepEqual(g.bot.sent.map(s=>s.content),['第一段。\n第二段。'],'the settled text blocks, joined as before');
+ assert.deepEqual(ids,[`qq:s1:${message.seq}:assistant`],'the logical id is the settlement event, so a replayed settlement is a duplicate');
+ // No chunk at all before the settlement.
+ const plain=gateway();plain.ev.turn();plain.ev.reply('完整正文');plain.ev.end();await tick();
+ assert.deepEqual(plain.bot.sent.map(s=>s.content),['完整正文']);
+});
+test('unsettled chunks are never sent: not at turn/end, not after a failed attempt, not after cancellation',async()=>{
+ // Completed Turn whose deltas never settled into a message (abandoned attempt).
+ const completed=gateway();completed.ev.turn();completed.ev.chunk('半句');completed.ev.end();await tick();
+ assert.deepEqual(completed.bot.sent,[]);
+ // Failed Turn: only the turn error notice, never the partial text.
+ const failed=gateway();failed.ev.turn();failed.ev.chunk('半句');failed.ev.end({kind:'error',error:{code:'MODEL_ERROR',message:'boom'}});await tick();
+ assert.deepEqual(failed.bot.sent.map(s=>s.content),['⚠️ 本轮异常结束\n`MODEL_ERROR`: boom'],'only the error notice, no fallback to the unsettled deltas');
+ // Cancelled: an interrupted settlement and the partial deltas are both dropped.
+ for(const kind of ['interrupted','aborted']){
+  const stopped=gateway();stopped.ev.turn();stopped.ev.chunk('半');stopped.ev.reply('半截',1,{interrupted:true});stopped.ev.end({kind});await tick();
+  assert.equal(stopped.bot.sent.length,0,`${kind}: nothing from the cancelled Turn`);
+ }
+ // Chunks of one step do not leak into the next step's settled reply.
+ const steps=gateway();steps.ev.turn();steps.ev.chunk('旧');steps.ev.reply('第一步');steps.ev.chunk('新');steps.ev.reply('第二步');steps.ev.end();await tick();
+ assert.deepEqual(steps.bot.sent.map(s=>s.content),['第一步','第二步']);
 });
 test('two QQ applications on one I/O keep separate adapters, queues and targets',async()=>{
  const io=createAgentIO(),a=gateway({io,appId:'app-a'}),b=gateway({io,appId:'app-b'});
@@ -284,4 +313,5 @@ test('the QQ plugin declares the agentIO service and the gateway refuses to star
  assert.match(read('gateway/middleware-setup.js'),/manager\.cancelOutput\?\.\(record\)/,'/stop cancels unsent I/O output first');
  // The original router no longer holds a direct static sender.
  for(const file of ['transport/outbound.js','transport/outbound-buffer.js'])assert(!/\.sendMarkdown\(|chunkMarkdownText/.test(strip(read(file)).replace(/\/\*\*[\s\S]*?\*\//g,'')),file);
+ assert(!/OutboundBuffer|outbound-buffer/.test(read('transport/outbound.js')),'the router sends settled text only, no chunk buffer');
 });

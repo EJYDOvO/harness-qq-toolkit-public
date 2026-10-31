@@ -1,4 +1,3 @@
-import { OutboundBuffer } from "./outbound-buffer.js";
 import { formatToolResult } from "./tool-presenter.js";
 import { parseEvent, extractTurnError, } from "./events.js";
 /** 不展示给用户的轮次错误码（底层传输/网络错误，对用户无意义，且常被重试兜住） */
@@ -7,7 +6,6 @@ const SILENT_TURN_ERROR_CODES = new Set(['STREAM_CLOSED']);
  * 出站路由器：持有会话级状态，按事件类型分发到处理器
  */
 class OutboundRouter {
-    buffers = new Map();
     toolCalls = new Map();
     manager;
     bot;
@@ -34,17 +32,18 @@ class OutboundRouter {
         const origin = { seq: raw.seq, turn: raw.data?.turn };
         switch (event.type) {
             case 'assistant/chunk':
-                this.onChunk(session.header.id, record, event);
+                // Not a settlement: the reply is sent only from its settled
+                // assistant/message (current Hosts publish deltas on
+                // agent/assistant-stream instead, and an abandoned attempt
+                // settles none). Accumulated deltas may be partial, repeated
+                // across retries or joined differently from the final blocks.
                 break;
             case 'assistant/message':
                 // A partial settled because the Turn was cancelled (/stop, removal)
                 // is not delivered: cancellation stops output that has not started.
-                if (raw.data?.interrupted === true) {
-                    this.buffers.get(session.header.id)?.cancel();
-                    this.buffers.delete(session.header.id);
+                if (raw.data?.interrupted === true)
                     break;
-                }
-                this.onMessage(session.header.id, record, event, origin);
+                this.onMessage(record, event, origin);
                 break;
             case 'tool/call':
                 this.onToolCall(event);
@@ -57,23 +56,8 @@ class OutboundRouter {
                 break;
         }
     }
-    /** 流式文本增量：累积到会话 buffer */
-    onChunk(sessionId, record, event) {
-        let buffer = this.buffers.get(sessionId);
-        if (buffer === undefined) {
-            buffer = new OutboundBuffer(record, this.bot, this.config.textChunkLimit, this.logger);
-            this.buffers.set(sessionId, buffer);
-        }
-        buffer.append(event.text);
-    }
-    /** 完整 assistant 消息：有流式 buffer 则 flush，否则直接发送文本块 */
-    onMessage(sessionId, record, event, origin) {
-        const buffer = this.buffers.get(sessionId);
-        if (buffer !== undefined && buffer.text.trim()) {
-            void buffer.flush(origin);
-            this.buffers.delete(sessionId);
-            return;
-        }
+    /** 完整 assistant 消息：以结算正文为准，整条交给 Unified Agent I/O */
+    onMessage(record, event, origin) {
         const textParts = [];
         for (const block of event.content) {
             if (block.type === 'text' && block.text)
@@ -83,7 +67,6 @@ class OutboundRouter {
         if (!fullText.trim())
             return;
         void this.send(record, fullText, 'sendMarkdown', { ...origin, kind: 'assistant' });
-        this.buffers.delete(sessionId);
     }
     /** 工具调用：仅记录，不发送（避免刷屏，等待结果） */
     onToolCall(event) {
@@ -102,20 +85,8 @@ class OutboundRouter {
             return;
         void this.send(record, text, 'sendToolResult', { ...origin, kind: 'tool' });
     }
-    /** 轮次结束：清理 buffer，异常结束时告知用户 */
+    /** 轮次结束：异常结束时告知用户（未结算的增量不补发） */
     onTurnEnd(sessionId, record, event, origin) {
-        const buffer = this.buffers.get(sessionId);
-        // A cancelled Turn's unsent buffer is dropped, not flushed.
-        const cancelled = ['aborted', 'interrupted'].includes(event.reason?.kind);
-        if (buffer !== undefined) {
-            if (buffer.text.trim() && !cancelled) {
-                void buffer.flush(origin);
-            }
-            else {
-                buffer.cancel();
-            }
-            this.buffers.delete(sessionId);
-        }
         const failure = extractTurnError(event.reason);
         if (failure !== undefined && !SILENT_TURN_ERROR_CODES.has(failure.code)) {
             void this.send(record, `⚠️ 本轮异常结束\n\`${failure.code}\`: ${failure.message}`, 'sendTurnEndError', { ...origin, kind: 'turn-error' });
