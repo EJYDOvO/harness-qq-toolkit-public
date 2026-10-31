@@ -3,13 +3,15 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import {createAgentIO} from '../plugin-sources/dsh-agent-io/io.mjs';
+import {qqConversation} from './qq-conversation-fixture.mjs';
 const profile=process.env.QQBOT_TEST_PROFILE || path.resolve('data/profiles/qqbot-validation');
 const moduleUrl=p=>pathToFileURL(path.join(profile,'node_modules/@tencent-connect/dsh-qqbot/dist',p)).href;
 const {setupMiddlewares}=await import(moduleUrl('gateway/middleware-setup.js'));
 const {registerSendFileTool}=await import(moduleUrl('media/send-file-tool.js'));
 const logger={debug(){},info(){},warn(){},error(){}};
 const defaults={appId:'test',access:{c2cMode:'allowlist',c2cAllow:['owner-openid'],groupMode:'disabled',groupAllow:[]},historyLimit:10,requireMention:true,maxQueue:8,processingTimeoutMs:30000,media:{enabled:false}};
-function accessMiddleware(config){const middlewares=[];setupMiddlewares({use:m=>middlewares.push(m)},config,{},logger);return middlewares[2];}
+function accessMiddleware(config){const middlewares=[],manager={getOrCreate(){throw Error('unused');},getSessionRecord(){},isCurrentSession(){return false;}};const conversation=qqConversation({io:createAgentIO(),manager,config});setupMiddlewares({use:m=>middlewares.push(m)},config,manager,logger,conversation);conversation.close();return middlewares[2];}
 async function allowed(config,kind,id){let passed=false;await accessMiddleware(config)({message:{kind,senderId:id,groupOpenid:id},log:logger,stop(){}},async()=>{passed=true});return passed;}
 test('private whitelist allows owner and rejects outsiders; disabled group rejects everyone',async()=>{
   assert.equal(await allowed(defaults,'c2c','owner-openid'),true);
@@ -30,10 +32,11 @@ test('file delivery rejects a junction escape and disabled/unknown recipients',a
   fs.symlinkSync(outside,path.join(workspace,'escape'),'junction');
   t.after(()=>fs.unlinkSync(path.join(workspace,'escape')));
   let definition;const sent=[];
-  const send=async(target,source)=>{sent.push({target,source});return {upload:{file_uuid:'fixture'}}};
+  const send=async()=>{throw Error('file tool must hand over through submitOutput, never the legacy sender');};
+  const record={sessionId:'fixture-session',scope:'c2c',peerId:'owner-openid',replyTarget:{scope:'c2c',targetId:'owner-openid'},agent:{}};
   registerSendFileTool({get:()=>({register:d=>{definition=d}})},
     {sendFile:send,sendImage:send,sendVideo:send,sendVoice:send},
-    {findByAgent:()=>({replyTarget:{scope:'c2c',targetId:'owner-openid'}})},
+    {findByAgent:()=>record,submitOutput:async(r,message)=>{assert.equal(r,record);sent.push(message);return {status:'sent',parts:[{attachment:0,uploaded:'fixture'}]};}},
     {...defaults,cwd:workspace,sendFile:{restrictPaths:true,extraRoots:[]}},logger);
   await definition.execute({file_path:path.join(workspace,'ok.txt')},{agent:{}});
   assert.equal(sent.length,1);

@@ -43,6 +43,12 @@ stateDirectory/jobs 下的 result.json 可接入现有维护通知（action/ok/r
 
 每个事件只有一个发送方：与 Character 集成时（`notifyEvent`）只由 Character 的持久 Outbox 发送，账本只记事件键与 Outbox 返回的状态；独立运行时经 Gateway 交来的 Agent I/O 通知器（`runtime.notifications`）发送，目标为固定的所有者私聊，并在发送前复核仍是本次附加与所有者。两者都没有时不发送（`not-sent`，`notifications-unavailable`），不再直接调用 Gateway Sender。发送前先持久记录 `sending`（写入失败则不发送）；进程中断留下的 `sending` 永不重放。状态：`sent`（只代表平台 API 接受）、`not-sent`、`partial`、`unknown`（不重发）、`pending`（Character Outbox 仍在投递）、`suppressed`；旧账本中的 `failed` 是此前版本对任何错误的记录，保留不改。
 
+写入使用候选快照，只有成功落盘才更新内存；首次写入失败不会留下虚假的 sending。持久化异常后先重读账本，读不到则拒绝继续；已出现的 sending/unknown/partial 不会因故障恢复而删除或重发。HMR 仅当前实例可写 JSON；旧实例的迟到结果不覆盖新快照，其发送前授权也失效。终态写入失败保留磁盘上的 sending 屏障，后续 Tick/重启不重试。异步任务结束通知的存储异常明确告警，不成为未处理拒绝。
+
+这是 at-most-once handoff，结果未知需要人工核对；QQ API 接受不等于手机收到。当前单进程 HMR 防护不替代多进程锁，部署仍须单活。与 Character 集成时 SQLite Outbox 是发送权威，JSON 只记委派结果；缺少提醒来源的旧 Outbox 行继续暂缓，不以 JSON 记录补发。
+
+首次从未包含上述保护的旧版升级、或回滚到旧版时，必须停止旧 Host 并确认进程退出后切换。新代码的所有权标记无法阻止仍在执行的旧版闭包写回；不支持这样的跨版本热切换。API、事件键和历史状态不迁移，旧 sending/unknown 等记录继续保持禁止重放。
+
 更新前备份配置、状态和旧安装包，固定依赖及补丁哈希，独立 Profile 验证后单活切换。基础 QQ 审批/问答不经过本插件。启动仅恢复 Owner Session，不自动执行模型请求；/new 不迁移旧提醒，应先管理原提醒。
 ## Interaction 兼容
 

@@ -95,8 +95,8 @@ function remoteOps(t,{features={notifications:{enabled:true}}}={}){
  t.after(()=>cleanup.forEach(f=>f()));
  const job=(name,ok=true)=>fs.writeFileSync(path.join(state,'jobs',name+'.result.json'),JSON.stringify({action:'Backup',ok,finishedAt:new Date(Date.now()+1000).toISOString()}));
  const ledger=()=>JSON.parse(fs.readFileSync(path.join(state,'qq-notifications.json'),'utf8')).deliveries;
- const poll=async()=>{tick();await tick();};
- return {root,state,service:()=>service,job,ledger,poll,reload:()=>{cleanup.forEach(f=>f());cleanup.length=0;apply({agents:{get:()=>undefined},on(){},provide:(_,v)=>service=v,effect:f=>cleanup.push(f())},{root});}};
+ const poll=async()=>{tick();await new Promise(r=>setImmediate(r));await new Promise(r=>setImmediate(r));};
+ return {root,state,service:()=>service,job,ledger,poll,reload:({overlap=false}={})=>{if(!overlap){cleanup.forEach(f=>f());cleanup.length=0;}apply({agents:{get:()=>undefined},on(){},provide:(_,v)=>service=v,effect:f=>cleanup.push(f())},{root});}};
 }
 const runtimeOf=extra=>({config:{access:{c2cMode:'allowlist',c2cAllow:['owner']}},bot:{on(){},off(){}},manager:{getOrCreate:async()=>{},findBySessionId:()=>undefined},sender:{sendMarkdown:async()=>{throw Error('no direct Gateway send');}},...extra});
 function stubNotifier(result){const n={calls:[],async send(r){n.calls.push(r);if(r.authorize({type:r.conversation.type,id:r.conversation.id})!==true)return {status:'not-sent',reason:'unauthorized'};return typeof result==='function'?result(r):result;}};return n;}
@@ -118,8 +118,45 @@ test('Remote Ops ledger write failure before the send sends nothing; without a n
  // The ledger cannot be written (a directory blocks the atomic temp file): the key is not durable, so nothing is sent.
  const blocker=path.join(r.state,'qq-notifications.json.'+process.pid+'.tmp');fs.mkdirSync(blocker);r.job('job-1');await r.poll();fs.rmdirSync(blocker);
  assert.equal(n.calls.length,0,'not persisted, not sent');
+ await r.poll();await r.poll();assert.equal(n.calls.length,1,'failed claim must not strand an in-memory sending entry');
+ assert.equal(r.ledger()['job:job-1.result.json'].status,'sent');r.reload();r.service().attach(runtimeOf({notifications:n}));await r.poll();assert.equal(n.calls.length,1);
  const s=remoteOps(t);s.service().attach(runtimeOf({}));s.job('job-9');await s.poll();
  assert.deepEqual(s.ledger()['job:job-9.result.json'],{...s.ledger()['job:job-9.result.json'],status:'not-sent',reason:'notifications-unavailable'});
+});
+
+test('Remote Ops HMR cannot let a late old result overwrite newer durable keys and cause a replay',async t=>{
+ const r=remoteOps(t);let finish;const gate=new Promise(resolve=>{finish=resolve;});
+ const old=stubNotifier(()=>gate);r.service().attach(runtimeOf({notifications:old}));r.job('old');await r.poll();assert.equal(old.calls.length,1);
+ r.reload({overlap:true});assert.equal(old.calls[0].authorize(owner),false,'a replaced instance cannot authorize queued parts, even before its cleanup');
+ const fresh=stubNotifier({status:'sent'});r.service().attach(runtimeOf({notifications:fresh}));r.job('new');await r.poll();assert.equal(fresh.calls.length,1);
+ finish({status:'sent'});await tick();
+ assert.equal(r.ledger()['job:new.result.json']?.status,'sent','stale instance must never replace the new ledger snapshot');
+ r.reload();r.service().attach(runtimeOf({notifications:fresh}));await r.poll();assert.equal(fresh.calls.length,1,'neither durable sending nor a newer sent entry replays');
+});
+
+test('Remote Ops terminal write failure keeps a durable sending fence across ticks and HMR',async t=>{
+ const r=remoteOps(t);let finish;const gate=new Promise(resolve=>{finish=resolve;});const n=stubNotifier(()=>gate);
+ r.service().attach(runtimeOf({notifications:n}));r.job('terminal');await r.poll();
+ const blocker=path.join(r.state,'qq-notifications.json.'+process.pid+'.tmp');fs.mkdirSync(blocker);finish({status:'sent'});await tick();fs.rmdirSync(blocker);
+ assert.equal(r.ledger()['job:terminal.result.json'].status,'sending');await r.poll();assert.equal(n.calls.length,1);
+ r.reload();r.service().attach(runtimeOf({notifications:n}));await r.poll();assert.equal(n.calls.length,1,'unknown completion is never retried');
+});
+
+test('Remote Ops reconciles an ambiguous atomic-write error from disk without erasing a durable claim',async t=>{
+ const r=remoteOps(t),n=stubNotifier({status:'sent'});r.service().attach(runtimeOf({notifications:n}));
+ const file=path.join(r.state,'qq-notifications.json'),rename=fs.renameSync;let fail=true;
+ t.mock.method(fs,'renameSync',(from,to)=>{rename(from,to);if(to===file&&fail){fail=false;throw Error('synthetic post-rename error');}});
+ r.job('ambiguous-claim');await r.poll();assert.equal(n.calls.length,0,'a thrown persist never hands over');
+ await r.poll();assert.equal(n.calls.length,0,'read back the durable sending fence instead of dropping it');
+ r.reload();r.service().attach(runtimeOf({notifications:n}));await r.poll();assert.equal(n.calls.length,0);
+ assert.equal(r.ledger()['job:ambiguous-claim.result.json'].status,'sending');
+});
+
+test('Remote Ops can attach after the very first ledger write fails; no half-attached runtime or phantom claim',async t=>{
+ const r=remoteOps(t),n=stubNotifier({status:'sent'}),runtime=runtimeOf({notifications:n});
+ const blocker=path.join(r.state,'qq-notifications.json.'+process.pid+'.tmp');fs.mkdirSync(blocker);
+ assert.throws(()=>r.service().attach(runtime));r.job('first');await r.poll();assert.equal(n.calls.length,0);
+ fs.rmdirSync(blocker);r.service().attach(runtime);await r.poll();await r.poll();assert.equal(n.calls.length,1);
 });
 test('with Character, the durable Outbox is the only sender: the notifier is not used and the Outbox status is recorded',async t=>{
  const r=remoteOps(t),n=stubNotifier({status:'sent'}),events=[];
