@@ -2,7 +2,7 @@
 
 独立、平台无关的 Host 插件。维护 Conversation → 原生 Session 的唯一当前路由、模型/Preset 偏好、并发、恢复和可选空白轮换。QQ、Identity、Memory、Remote Ops 均不是本插件依赖。
 
-当前源码 `0.1.0-test.2`，修复 test.1 的恢复异常分类和资源关闭问题；实例版本以仓库根 README 为准。验证基线为 DSH `0.2.1-rc.3`。使用原生 `agents.create/resume`、`sessions.flush`、`sessionPersistence.open`、`agentPresets.resolve/mount`、Schedule；不实现第二套运行时、调度器或数据库。
+当前源码 `0.1.0-test.3`（Iteration 08 候选，未部署），保留恢复异常分类和关闭规则，补充 Context 活性门禁及可选脱敏观察。最近部署记录为 test.2。验证基线为 DSH `0.2.1-rc.3`；复用原生 Agent/Session/Persistence/Preset/Schedule，不实现第二套运行时、调度器或数据库。
 
 ## 安装与装配
 
@@ -81,3 +81,6 @@ Character 候选准备要求已验证的独立包 pin/哈希、有效状态文�
 从 `@tencent-connect/dsh-qqbot@0.5.2` 的 SessionManager、ModelResolver、IdleEvictor 和 PrefsStore（含 QQTK 自有兼容修复）抽离，保留腾讯 MIT 许可。去除 QQ prompt/身份/路径及私有 settings 读取；没有复制 QQ 连接或调度器。
 
 `maintenance/conversation-manager.test.mjs` / `session-lifecycle.test.mjs` 验证契约、事务失败及资源释放。Character `scripts/run-lifecycle.ps1` 使用真实 rc.3、两个 Host 进程、模拟第二平台、合成模型/Sender验证并发、冷恢复、轮换、历史提醒、Memory ACL、通知去重和服务重载。它不证明真实 QQ 收件、NapCat 协议或跨平台审批路由已实现。
+## Iteration 08 增量（test.3，未部署）
+
+持久格式、Session Key、模型/Preset 偏好及唯一当前路由不变。普通日志不再输出原始 peer/session/key 或动态异常。可信 Adapter 可选提供 `diagnostics(event, record)` 观察 route/close；异常不影响业务，接口不要求 Agent I/O、QQ 或 Character。版本和回滚仍须核对包/锁/补丁与原状态文件，不能用空路由替换。

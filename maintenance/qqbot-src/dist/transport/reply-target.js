@@ -15,11 +15,11 @@ import { getCachedReplyIds } from "./msgid-cache.js";
  *   （bot.send 的 extra），传 true；文件发送 SDK 暂不支持 event_id，传 false
  *   跳过 event 候选，降级为 msg 候选或主动推送。
  */
-export function resolveReplyTarget(target, limiter, allowEvent) {
+export function resolveReplyTarget(target, limiter, allowEvent, cache = {getCachedReplyIds}) {
     const candidates = [];
     if (target.msgId)
         candidates.push({ kind: 'msg', id: target.msgId });
-    for (const c of getCachedReplyIds(target.scope, target.targetId)) {
+    for (const c of cache.getCachedReplyIds(target.scope, target.targetId)) {
         candidates.push(c);
     }
     const seen = new Set();

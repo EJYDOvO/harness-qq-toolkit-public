@@ -54,7 +54,7 @@ export function parseAnswer(question,text){
  * @param responder (record) → the platform sender id expected to answer this record's requests
  * @param render    {approval({toolName, command, reason}), question(question, {actions, index, count, conversation}), timeout?()} → text
  */
-export function createHITLBridge({io,manager,wiring,responder,render,labels={},approvalTimeoutMs=300_000,questionTimeoutMs=300_000,logger}){
+export function createHITLBridge({io,manager,wiring,responder,render,labels={},approvalTimeoutMs=300_000,questionTimeoutMs=300_000,logger,diagnostics}){
  if(typeof responder!=='function'||typeof render?.approval!=='function'||typeof render.question!=='function')throw Error('HITL requires responder() and render.approval/question()');
  const words={allow:'✅ 允许一次',allowDone:'✓ 已允许',deny:'❌ 拒绝',denyDone:'✓ 已拒绝',chosen:'✓ 已选',...labels};
  // One open approval and one open question per Session; refs name the request
@@ -64,6 +64,7 @@ export function createHITLBridge({io,manager,wiring,responder,render,labels={},a
  const newRef=()=>randomBytes(12).toString('base64url');
  // Diagnostics name the kind and outcome only, never ids or text.
  const warn=message=>{try{logger?.warn?.('agent-io hitl: '+message);}catch{}};
+ const trace=(event,entry,status)=>{try{diagnostics?.emit('hitl',event,{sessionId:entry.sessionId,conversation:entry.conversation,requestId:entry.ref,status});}catch{}};
 
  // The current record of a native request's Session, when this wiring owns it.
  function owner(request){
@@ -77,7 +78,7 @@ export function createHITLBridge({io,manager,wiring,responder,render,labels={},a
  // Still the same current, admitted Session of the Conversation the request was shown in.
  const still=entry=>!closed&&wiring.current(entry.record)&&entry.record.sessionId===entry.sessionId&&wiring.allowed(entry.record)&&!!wiring.target(entry.record);
 
- function open(map,entry){map.set(entry.sessionId,entry);refs.set(entry.ref,entry);}
+ function open(map,entry){map.set(entry.sessionId,entry);refs.set(entry.ref,entry);trace('open',entry,'pending');}
  // Removes every trace of the request; true only for the call that finished it.
  function finish(entry){
   if(entry.done)return false;
@@ -87,6 +88,7 @@ export function createHITLBridge({io,manager,wiring,responder,render,labels={},a
   refs.delete(entry.ref);clearTimeout(entry.timer);
   entry.request.signal?.removeEventListener('abort',entry.onAbort);
   entry.sending.abort();
+  trace('close',entry,'closed');
   return true;
  }
 
@@ -101,7 +103,9 @@ export function createHITLBridge({io,manager,wiring,responder,render,labels={},a
   const own=entry.current;
   let result;
   try{
-   result=await io.sendMessage({id:`hitl:${entry.sessionId}:${entry.ref}${suffix}`,target:wiring.target(entry.record),origin:{sessionId:entry.sessionId},
+   const logicalId=`hitl:${entry.sessionId}:${entry.ref}${suffix}`;
+   diagnostics?.emit('hitl','queued',{sessionId:entry.sessionId,conversation:entry.conversation,requestId:entry.ref,logicalId,status:'pending'});
+   result=await io.sendMessage({id:logicalId,target:wiring.target(entry.record),origin:{sessionId:entry.sessionId},
     message:{text,...(actions?{actions}:{})},signal:own?AbortSignal.any([entry.sending.signal,own.signal]):entry.sending.signal});
   }catch{result={status:'unknown',parts:[]};}
   if(entry.done)return 'settled';
@@ -127,7 +131,7 @@ export function createHITLBridge({io,manager,wiring,responder,render,labels={},a
   if(typeof text!=='string'||!text.trim()){warn('approval prompt unavailable');return Promise.resolve('unavailable');}
   return new Promise(resolve=>{
    const entry={kind:'approval',record,sessionId:record.sessionId,conversation:wiring.target(record).conversation,responder:responderId,ref:newRef(),request,sending:new AbortController()};
-   entry.settle=outcome=>{if(finish(entry))resolve(outcome);};
+   entry.settle=outcome=>{if(finish(entry)){trace('settle',entry,outcome);resolve(outcome);}};
    entry.onAbort=()=>entry.settle('cancelled');
    open(approvals,entry);
    request.signal?.addEventListener('abort',entry.onAbort,{once:true});
@@ -154,8 +158,8 @@ export function createHITLBridge({io,manager,wiring,responder,render,labels={},a
   questions.get(record.sessionId)?.fail(aborted('superseded by a new question'));
   return new Promise((resolve,reject)=>{
    const entry={kind:'question',record,sessionId:record.sessionId,conversation:wiring.target(record).conversation,responder:responderId,ref:newRef(),request,index:0,collected:[],sending:new AbortController(),current:new AbortController()};
-   entry.settle=value=>{if(finish(entry))resolve(value);};
-   entry.fail=error=>{if(finish(entry))reject(error);};
+   entry.settle=value=>{if(finish(entry)){trace('settle',entry,'done');resolve(value);}};
+   entry.fail=error=>{if(finish(entry)){trace('settle',entry,'cancelled');reject(error);}};
    entry.onAbort=()=>entry.fail(aborted('ask_user_question was aborted before the user answered'));
    open(questions,entry);
    request.signal?.addEventListener('abort',entry.onAbort,{once:true});

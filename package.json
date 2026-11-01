@@ -7,7 +7,7 @@
   },
   "scripts": {
     "pretest": "node -e \"require('node:fs').mkdirSync('tmp',{recursive:true})\"",
-    "test": "node --test maintenance/agent-io.test.mjs maintenance/conversation-io.test.mjs maintenance/qq-agent-io.test.mjs maintenance/qq-inbound.test.mjs maintenance/commands.test.mjs maintenance/turn-controls.test.mjs maintenance/qq-media.test.mjs maintenance/hitl.test.mjs maintenance/notifications.test.mjs maintenance/remote-ops.test.mjs maintenance/interaction.test.mjs maintenance/delivery-diagnostics.test.mjs maintenance/session-lifecycle.test.mjs maintenance/conversation-manager.test.mjs plugin-sources/dsh-task-memory/tests/render.test.mjs maintenance/runtime.test.mjs",
+    "test": "node --test maintenance/agent-io.test.mjs maintenance/conversation-io.test.mjs maintenance/qq-agent-io.test.mjs maintenance/qq-inbound.test.mjs maintenance/commands.test.mjs maintenance/turn-controls.test.mjs maintenance/qq-media.test.mjs maintenance/hitl.test.mjs maintenance/notifications.test.mjs maintenance/remote-ops.test.mjs maintenance/interaction.test.mjs maintenance/delivery-diagnostics.test.mjs maintenance/integration-hardening.test.mjs maintenance/diagnostics.test.mjs maintenance/session-lifecycle.test.mjs maintenance/conversation-manager.test.mjs plugin-sources/dsh-task-memory/tests/render.test.mjs maintenance/runtime.test.mjs",
     "test:audit": "node --test maintenance/audit/*.test.mjs"
   }
 }

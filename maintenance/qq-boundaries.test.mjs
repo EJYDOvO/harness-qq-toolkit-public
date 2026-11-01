@@ -23,6 +23,14 @@ test('empty whitelist fails closed for private and group messages',async()=>{
   assert.equal(await allowed(config,'c2c','stranger-openid'),false);
   assert.equal(await allowed(config,'group','stranger-openid'),false);
 });
+
+test('debug access rejection never logs the SDK reason containing an OpenID',async()=>{
+ const lines=[],config={...defaults,debug:true},chain=[],manager={getOrCreate(){throw Error('unused');},getSessionRecord(){},isCurrentSession(){return false;}};
+ const conversation=qqConversation({io:createAgentIO(),manager,config});
+ setupMiddlewares({use:m=>chain.push(m)},config,manager,{...logger,debug:t=>lines.push(t)},conversation);conversation.close();
+ let passed=false;await chain[2]({message:{kind:'c2c',senderId:'PRIVATE_OPENID'},log:logger,stop(){}},async()=>{passed=true;});
+ assert.equal(passed,false);assert(lines.length);assert(!JSON.stringify(lines).includes('PRIVATE_OPENID'));
+});
 test('file delivery rejects a junction escape and disabled/unknown recipients',async(t)=>{
   const dir=fs.mkdtempSync(path.resolve('tmp/qq-file-boundary-'));
   const workspace=path.join(dir,'workspace'),outside=path.join(dir,'outside');

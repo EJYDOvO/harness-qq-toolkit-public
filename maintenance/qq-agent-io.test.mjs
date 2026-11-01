@@ -10,7 +10,7 @@ import path from 'node:path';
 import vm from 'node:vm';
 import {fileURLToPath} from 'node:url';
 import {createAgentIO} from '../plugin-sources/dsh-agent-io/io.mjs';
-import {qqAdapter as adapterModule,qqConversation,createTurnControls} from './qq-conversation-fixture.mjs';
+import {qqAdapter as adapterModule,qqConversation,createTurnControls,createReplyIdCache} from './qq-conversation-fixture.mjs';
 
 const dist=new URL('./qqbot-src/dist/',import.meta.url);
 const read=file=>fs.readFileSync(new URL(file,dist),'utf8').replaceAll('\r\n','\n');
@@ -63,7 +63,7 @@ function gateway({io=createAgentIO(),appId='app-a',policy,streaming=false,limit=
  const chunkMarkdownText=(text,max)=>chunker(text,max);
  // The gateway's own sender, Interaction bridge and adapter registration, exactly as reviewed.
  const senderSource=slice(source,'    const replyLimiter = new ReplyLimiter({ limit: 4 });','    // Optional Agent policy. No Character');
- const {sender,diagnostics}=vm.runInNewContext('(function(){'+senderSource+';return {sender,diagnostics};})()',{ReplyLimiter,deliveryRecorder:recorder,bot,resolveReplyTarget,sendResolvedMarkdown});
+ const {sender,diagnostics}=vm.runInNewContext('(function(){'+senderSource+';return {sender,diagnostics};})()',{ReplyLimiter,deliveryRecorder:recorder,bot,resolveReplyTarget,sendResolvedMarkdown,replyIds:createReplyIdCache()});
  // The original outbound router with its patched static send.
  const {createOutboundHandler}=load('transport/outbound.js','createOutboundHandler',{formatToolResult:name=>`工具 ${name} 失败`,parseEvent,extractTurnError});
  const body=slice(source,'    const policyFor =','    return outboundHandler;');
@@ -104,7 +104,7 @@ test('a repeated native event or a second settlement of the same message is sent
 });
 test('the same logical id with different text or another Conversation is a conflict, not the earlier success',async()=>{
  const g=gateway();g.sessions.set('group:grp',{...g.record,sessionKey:'k2',scope:'group',peerId:'grp',replyTarget:{scope:'group',targetId:'grp',msgId:'g1'}});
- const base={id:'qq:s1:7:assistant',target:{platform:'qq-official',accountId:'app-a',conversation:{type:'direct',id:'owner'}},origin:{sessionId:'s1'},message:{text:'原文'}};
+ const base={id:'qq:s1:7:assistant',target:{platform:'qq-official',adapter:'qq-official-gateway',accountId:'app-a',conversation:{type:'direct',id:'owner'}},origin:{sessionId:'s1'},message:{text:'原文'}};
  assert.equal((await g.io.sendMessage(base)).status,'sent');
  const changed=await g.io.sendMessage({...base,message:{text:'改写'}});assert.deepEqual([changed.status,changed.reason,changed.duplicate],['not-sent','id-conflict',undefined]);
  const moved=await g.io.sendMessage({...base,target:{...base.target,conversation:{type:'group',id:'grp'}}});assert.equal(moved.reason,'id-conflict');
@@ -156,7 +156,7 @@ test('queued output stops after Session rotation, Agent disposal or revoked acce
  revoked.config.access.c2cAllow=[];gate();await tick();
  assert.deepEqual(revoked.bot.sent.map(s=>s.content),['允许时']);assert.deepEqual(warns(revoked),[['warn','im-qqbot: sendMarkdown not-sent (unauthorized)']]);
  const closed=gateway({access:{c2cMode:'allowlist',c2cAllow:['owner'],groupMode:'disabled',groupAllow:[]}});closed.sessions.set('group:grp',{...closed.record,scope:'group',peerId:'grp',replyTarget:{scope:'group',targetId:'grp',msgId:'g1'}});
- const r=await closed.io.sendMessage({target:{platform:'qq-official',accountId:'app-a',conversation:{type:'group',id:'grp'}},origin:{sessionId:'s1'},message:{text:'群'}});
+ const r=await closed.io.sendMessage({target:{platform:'qq-official',adapter:'qq-official-gateway',accountId:'app-a',conversation:{type:'group',id:'grp'}},origin:{sessionId:'s1'},message:{text:'群'}});
  assert.deepEqual([r.status,r.reason],['not-sent','unauthorized'],'disabled group scope is never written to');
 });
 test('the QQ adapter chunks long text, keeps order and falls back to proactive after the passive quota',async()=>{
@@ -206,7 +206,7 @@ test('with Interaction bound, every bubble, hang-on line and tool error is a log
  const t=policy.transport;assert.equal(t.openStream,undefined,'no stream capability is offered');
  const first=await t.sendText('旧任务的气泡',bubble({input:'in-1'}));
  assert.equal(first.status,'sent');assert.match(calls[0].id,/^qq:s1:1:0123abcd:1\.1:assistant$/,'Session, Turn, policy instance, reply and bubble');
- assert.deepEqual({...calls[0].origin},{sessionId:'s1'});assert.equal(calls[0].signal.aborted,false);
+ assert.deepEqual({...calls[0].origin},{sessionId:'s1',turn:1});assert.equal(calls[0].signal.aborted,false);
  // The same bubble handed over again is the same logical message: sent once.
  const again=await t.sendText('旧任务的气泡',bubble({input:'in-1'}));assert.equal(again.duplicate,true);
  await t.sendText('新输入的气泡',bubble({input:'in-2',reply:2}));
@@ -291,10 +291,10 @@ test('two QQ applications on one I/O keep separate adapters, queues and targets'
 });
 test('a group Conversation maps to the QQ group scope and its own record',async()=>{
  const g=gateway();g.sessions.clear();const group={...g.record,scope:'group',peerId:'grp',replyTarget:{scope:'group',targetId:'grp',msgId:'g1'}};g.sessions.set('group:grp',group);
- assert.deepEqual(JSON.parse(JSON.stringify(g.conversation.target(group))),{platform:'qq-official',accountId:'app-a',conversation:{type:'group',id:'grp'}});
- const r=await g.io.sendMessage({target:{platform:'qq-official',accountId:'app-a',conversation:{type:'group',id:'grp'}},origin:{sessionId:'s1'},message:{text:'群消息'}});
+ assert.deepEqual(JSON.parse(JSON.stringify(g.conversation.target(group))),{platform:'qq-official',adapter:'qq-official-gateway',accountId:'app-a',conversation:{type:'group',id:'grp'}});
+ const r=await g.io.sendMessage({target:{platform:'qq-official',adapter:'qq-official-gateway',accountId:'app-a',conversation:{type:'group',id:'grp'}},origin:{sessionId:'s1'},message:{text:'群消息'}});
  assert.equal(r.status,'sent');assert.deepEqual(g.bot.sent,[{msgId:'g1',eventId:undefined,targetId:'grp',content:'群消息'}]);
- const wrong=await g.io.sendMessage({target:{platform:'qq-official',accountId:'app-a',conversation:{type:'direct',id:'grp'}},origin:{sessionId:'s1'},message:{text:'x'}});
+ const wrong=await g.io.sendMessage({target:{platform:'qq-official',adapter:'qq-official-gateway',accountId:'app-a',conversation:{type:'direct',id:'grp'}},origin:{sessionId:'s1'},message:{text:'x'}});
  assert.equal(wrong.reason,'unauthorized','a direct target never reaches a group: grp is not an admitted C2C peer');
 });
 test('delivery diagnostics carry the Session hash, part index and bubble numbers, never text',async()=>{

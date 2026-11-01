@@ -14,7 +14,22 @@ const {ApiClient}=await import(pathToFileURL(path.join(sdk,'protocol/api/api-cli
 const {ApiError}=await import(pathToFileURL(path.join(sdk,'protocol/types.js')));
 const {concurrencyGuard}=await import(pathToFileURL(path.join(sdk,'middleware/concurrency-guard.js')));
 const {ReplyLimiter}=await import(pathToFileURL(path.join(qq,'transport/reply-limiter.js')));
-const {cacheMsgId,getCachedReplyIds}=await import(pathToFileURL(path.join(qq,'transport/msgid-cache.js')));
+const {cacheMsgId,getCachedReplyIds,createReplyIdCache}=await import(pathToFileURL(path.join(qq,'transport/msgid-cache.js')));
+test('I08 passive reply candidates belong to one Gateway, not a shared peer namespace',async()=>{
+ const module=await import(new URL('../qqbot-src/dist/transport/msgid-cache.js',import.meta.url));
+ const {resolveReplyTarget:resolveScoped}=await import(pathToFileURL(path.join(qq,'transport/reply-target.js')));
+ // Legacy module exports reproduce the old shared namespace on an unpatched checkout.
+ const factory=module.createReplyIdCache??(()=>module),a=factory(),b=factory();
+ a.cacheMsgId('c2c','same-peer','account-a-message');
+ assert.deepEqual(b.getCachedReplyIds('c2c','same-peer'),[]);
+ b.cacheEventId('c2c','same-peer','account-b-event');
+ assert.deepEqual(a.getCachedReplyIds('c2c','same-peer'),[{kind:'msg',id:'account-a-message'}]);
+ const target={scope:'c2c',targetId:'same-peer'};
+ assert.equal(resolveScoped(target,new ReplyLimiter({limit:4}),true,a).msgId,'account-a-message');
+ assert.equal(resolveScoped(target,new ReplyLimiter({limit:4}),true,b).eventId,'INTERACTION_CREATE:account-b-event');
+ a.clear();assert.deepEqual(a.getCachedReplyIds('c2c','same-peer'),[]);
+ assert.equal(b.getCachedReplyIds('c2c','same-peer').length,1);
+});
 const {ConfigSchema}=await import(pathToFileURL(path.join(qq,'config.js')));
 // The reviewed QQ text adapter (no imports) from this checkout.
 const {createQQTextAdapter,classifyQQError}=await import(new URL('../qqbot-src/dist/transport/qq-text-adapter.js',import.meta.url));
@@ -22,7 +37,7 @@ const source=fs.readFileSync(new URL('../qqbot-src/dist/gateway/bootstrap.js',im
 const targetSource=fs.readFileSync(path.join(qq,'transport/reply-target.js'),'utf8').replace(/^import .*;\r?\n/gm,'').replaceAll('export function','function');
 const {resolveReplyTarget,sendResolvedMarkdown}=vm.runInNewContext(targetSource+'\n;({resolveReplyTarget,sendResolvedMarkdown});',{getCachedReplyIds,MsgType:{MARKDOWN:2}});
 const slice=(start,end)=>{const a=source.indexOf(start),b=source.indexOf(end,a);assert(a>=0&&b>a,start);return source.slice(a,b);};
-const makeSender=vm.runInNewContext('(function(bot,deliveryRecorder){'+slice('    const replyLimiter =','    // Optional Agent policy')+'return {sender,replyLimiter};})',{ReplyLimiter,resolveReplyTarget,sendResolvedMarkdown});
+const makeSender=vm.runInNewContext('(function(bot,deliveryRecorder,replyIds=createReplyIdCache()){'+slice('    const replyLimiter =','    // Optional Agent policy')+'return {sender,replyLimiter,replyIds};})',{ReplyLimiter,resolveReplyTarget,sendResolvedMarkdown,createReplyIdCache});
 const makeOutbound=vm.runInNewContext(slice('export function createInteractionOutbound','export async function bootstrapGateway').replace(/^export (async )?function/gm,'$1function')+';createInteractionOutbound;',{AbortController,AbortSignal,createTurnControls,randomUUID:()=> 'fixture-0000-4000',createOutboundHandler:()=>()=>{}});
 // The gateway's own Unified Agent I/O adapter registration (the only chat output path).
 const registerAdapter=vm.runInNewContext('(function(conversation,config,chunkMarkdownText,sender,diagnostics,outboundHandler,ctx){'+slice('    // Unified Agent I/O text adapter',"    ctx\n        .on('session/event'")+'})',{createQQTextAdapter});
@@ -273,7 +288,7 @@ function hitlFixture(t,{fail}={}){
  conversation.openInbound(()=>({status:'accepted'}));
  registerAdapter(conversation,config,text=>[text],sender,undefined,{delivery:()=>undefined},{effect(){}});
  manager.hitl=openQQHITL(conversation,config,{warn(){},info(){}});
- const handlers={};vm.runInNewContext(interactionHandler,{bot:{on:(n,fn)=>{handlers[n]=fn;},acknowledgeInteraction:(id,code)=>bot.acknowledgeInteraction(id,code)},cacheEventId(){},hitlResponse,manager});
+ const handlers={};vm.runInNewContext(interactionHandler,{bot:{on:(n,fn)=>{handlers[n]=fn;},acknowledgeInteraction:(id,code)=>bot.acknowledgeInteraction(id,code)},replyIds:createReplyIdCache(),hitlResponse,manager});
  // A raw INTERACTION_CREATE payload through the SDK dispatcher to the Gateway handler.
  const press=async raw=>{const routed=dispatchEvent('INTERACTION_CREATE',raw,'fixture');assert.equal(routed.action,'interaction');await handlers.interaction({},routed.event);return requests.at(-1);};
  const approve=r=>listeners.get('approval/request')({agent:r.agent,toolName:'bash'},()=>Promise.resolve('native'));
@@ -322,13 +337,13 @@ test('Q24 a notification is one markdown message to the stable target: proactive
   const requests=[],creds={appId:'fixture',clientSecret:'dummy'};
   const client={async request(_token,method,route,body){requests.push({method,route,body:structuredClone(body)});const f=fail?.(route);if(f)throw f;return {id:'synthetic-'+requests.length};}};
   const bot=Object.assign(Object.create(botMethods),{creds,messageApi:new MessageApi(client,{getAccessToken:async()=>'synthetic-token'},{markdownSupport:true})});
-  const {sender}=makeSender(bot,undefined);
+  const {sender,replyIds}=makeSender(bot,undefined);
   const manager={getOrCreate:async()=>{throw Error('unused');},getSessionRecord:()=>undefined,isCurrentSession:()=>false};
   const io=createAgentIO(),config={appId:'fixture',textChunkLimit:4500};
   const conversation=createConversations(io,{createInput:m=>m,interactionPolicy:()=>undefined})({platform:'qq-official',adapter:'qq-official-gateway',accountId:'fixture',manager,scopes:{direct:'c2c',group:'group'},admits:(s,p)=>s==='c2c'&&p==='fixture-owner'});
   t.after(()=>conversation.close());
   registerAdapter(conversation,config,text=>[text],sender,undefined,{delivery:()=>undefined},{effect(){}});
-  if(cached)cacheMsgId('c2c','fixture-owner',cached);
+  if(cached)replyIds.cacheMsgId('c2c','fixture-owner',cached);
   const notifier=conversation.openNotifications();
   const result=await notifier.send({id:'notify:fixture',conversation:{type:'direct',id:'fixture-owner'},text:'[提醒到期]\n喝水',authorize:()=>true});
   return {result,requests};

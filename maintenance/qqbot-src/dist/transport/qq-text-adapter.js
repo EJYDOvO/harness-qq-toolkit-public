@@ -138,8 +138,8 @@ export function createQQTextAdapter({ send, split, limit = 4500, replyTarget, se
             // A notification goes to its stable Conversation (no input to reply to):
             // the gateway sender reuses a cached passive reply id within quota, or
             // pushes proactively, exactly as the former direct notification send did.
-            if (route.notification) {
-                const result = await send({ scope: route.target.scope, targetId: route.target.id }, text, { index: info.index, messageId: info.messageId, notification: true });
+            if (route.notification || route.inputReply) {
+                const result = await send({ scope: route.target.scope, targetId: route.target.id, ...(route.inputReply ? { msgId: route.inputId } : {}) }, text, { index: info.index, messageId: info.messageId, notification: !!route.notification });
                 return { receipt: typeof result?.id === 'string' ? result.id : undefined };
             }
             const record = route.record;

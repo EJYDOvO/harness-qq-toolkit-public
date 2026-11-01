@@ -5,6 +5,7 @@
 import fs from 'node:fs';
 import vm from 'node:vm';
 import {createConversations} from '../plugin-sources/dsh-agent-io/conversation.mjs';
+export {createReplyIdCache} from './qqbot-src/dist/transport/msgid-cache.js';
 
 const dist=new URL('./qqbot-src/dist/',import.meta.url);
 const read=file=>fs.readFileSync(new URL(file,dist),'utf8').replaceAll('\r\n','\n');

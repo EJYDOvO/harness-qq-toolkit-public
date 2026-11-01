@@ -2,6 +2,8 @@
 
 为 DeepSeek Harness 提供 **QQ 接入兼容补丁、可选 Remote Ops 插件和维护工具**。普通 DSH Agent 可以独立使用 QQ 接入，不需要 Character Agent、角色 Preset 或记忆插件。
 
+**Iteration 08 候选（未部署）：** Agent I/O test.8、Conversation Manager test.3、Remote Ops `1.1.1-test.3`。完整平台/Adapter/账号范围、旧发送实例围栏、命令/错误提示统一出站、Host 生命周期接入与可选脱敏关联；不新增服务或数据库。接口及限制见 [Diagnostics](docs/DIAGNOSTICS.md)、[通用接入](docs/GENERIC-INTEGRATION.md)。下文 Iteration 07 是最近部署记录，不代表本候选已上线。
+
 **Iteration 07（2026-11-01 已授权部署）：** Agent I/O `0.1.0-test.7`、Remote Ops `1.1.1-test.2` 与配套补丁已随 Character test.26 冷切换上线，冻结锁文件、代码哈希、单一 Gateway 和 QQ connected 检查通过；角色、Memory、Session、Schedule 与通知账本保留。独立通用安装、真实 QQ 通知、审批按钮与手机显示仍未验收。
 
 Notification：`conversation.openNotifications()` 发往稳定 Conversation，不要求当前 Session，由访问配置与通知方自己的 `authorize(target)` 在每个分片前复核，与聊天共用同一 Conversation 队列。Gateway 只把通知器交给 Remote Ops（及经其包装的 Character Identity）。Remote Ops 独立运行时经通知器发送并如实记录 sent/not-sent/partial/unknown；与 Character 集成时只由 Character 持久 Outbox 发送，同一事件不会有第二个发送方。`notifications.enabled: false` 可关闭。
@@ -20,17 +22,17 @@ Notification 定向修复已包含在本次部署：Remote Ops 在落盘成功�
 
 **Iteration 01（已配套 Character test.24 授权部署，现为 Agent I/O `0.1.0-test.3`）：** 新增独立 [Agent I/O](plugin-sources/dsh-agent-io/README.md) `0.1.0-test.2`，提供与 QQ SDK 解耦的 `sendMessage()`；未绑定 Interaction 时的普通文本出站（回复、Streaming 静态降级、工具错误、轮次错误提示）改经它交给 QQ Official 文本 Adapter。每条消息带由原生事件派生的稳定 ID（重复事件/settlement 只发一次，同 ID 异内容判冲突），并关联原生 Turn：`/stop` 或被取消的 Turn 不再发出未开始的输出。发送前按 Conversation Manager 的 `isCurrentSession` 与访问配置复核。QQ 补丁原生依赖该服务，需与 Manager 成套安装；Interaction、审批/问答和通知的发送路径本轮未变。
 
-**当前源码配套 Character test.22 / Manager test.2：** 恢复只接受原生同 Session 的缺失错误；关闭等待旧句柄并显式报告失败。已配套 Character test.23 / Interaction test.8 在现有 rc.3 实例授权部署，单一 QQ Gateway 健康；手机验收仍待完成。 新增独立 [Conversation Manager](plugin-sources/dsh-conversation-manager/README.md) `0.1.0-test.1`。最新 QQ 补丁原生依赖该服务，必须成套安装；下面的 test.14～test.20 是历史部署记录。路由由 Host 显式配置 `stateFile`；上线前审查旧提醒、任务及通知账本，禁止用空文件静默替代旧路由。
+**历史恢复修复（Character test.22 / Manager test.2）：** 恢复只接受原生同 Session 的缺失错误；关闭等待旧句柄并显式报告失败。已配套 Character test.23 / Interaction test.8 在现有 rc.3 实例授权部署，单一 QQ Gateway 健康；手机验收仍待完成。 新增独立 [Conversation Manager](plugin-sources/dsh-conversation-manager/README.md) `0.1.0-test.1`。最新 QQ 补丁原生依赖该服务，必须成套安装；下面的 test.14～test.20 是历史部署记录。路由由 Host 显式配置 `stateFile`；上线前审查旧提醒、任务及通知账本，禁止用空文件静默替代旧路由。
 
 源码提供默认关闭的 [QQ 主 Session 生命周期](docs/GENERIC-INTEGRATION.md#可选主-session-生命周期)：真实 Host 重启或 12 小时无用户输入后，下次安全交互创建空白根 Session，不 Fork 聊天。繁忙、审批和已有提醒有保护，启动预热不算用户输入。test.13 首次部署并启用，test.14 保留；真实 QQ 收件与手机验收仍待完成。
 
 配套 test.14 的补丁已部署，增加 Host 当前 Session 核验及 rc.2 模型切换适配：Session/模型偏好原子提交，失败保留原路由；供 Character 将历史根收窄为提醒用途。QQTK 本身不增加 Character、Memory 或 Remote Ops 依赖，详见[生命周期契约](docs/GENERIC-INTEGRATION.md#可选主-session-生命周期)。
 
-本仓库是扩展源码与维护材料，不包含 DSH 本体，也不是一键安装器。当前 Character 集成实例已验证 **Windows、DSH 0.2.1-rc.2、QQ Bot 0.5.2**；Remote Ops 为 **1.1.1-test.1**。原独立接入基线为 0.2.0-rc.2，新版本的适配范围与限制见 [兼容说明](docs/DSH-0.2.1.md)。其他版本和平台需要重新验证。
+本仓库是扩展源码与维护材料，不包含 DSH 本体，也不是一键安装器。最近 Character 部署记录为 **Windows、DSH 0.2.1-rc.3、QQ Bot 0.5.2 / SDK 1.0.5**，Remote Ops **1.1.1-test.2**；本轮未读取生产数据或重新核验在线状态。旧 rc.2/rc.2.0 记录只是历史，其他版本和平台需要重新验证。
 
 本次增加 [Interaction 可选适配](docs/INTERACTION.md)，Remote Ops 为 **1.1.1-test.1**。它不强制安装 Interaction；没有该插件时沿用原 QQ 流程。配套 Character 实例已部署，原生 Session 恢复和单 Gateway 检查通过；手机验收单独记录。仓库旧恢复包不包含这些新增改动。
 
-当前配套 Interaction **0.1.0-test.5**：支持默认 8 秒无自然回复发送确认提示（5.5 秒起由 Agent 侧插件经原生模型生成 Persona 风格短句，QQTK 只负责发送）、长结果语义分泡与只观察的 SDK 回执钩子。QQ 配置 `deliveryDiagnostics:true` 可开启限量脱敏投递关联日志，默认关闭；不需要开启 debug，不保存私聊正文或原始身份。QQ 补丁与 Agent 插件须同步更新；重复完整气泡仍待真实复现，详见 [Interaction 契约](docs/INTERACTION.md)。已配套并部署 Interaction **0.1.0-test.6**：回复按输入 ID 选择 QQ 回复目标、Worker 续轮投递、运行期新消息交给 Interaction 的 intervene 处理（入站不再等待整轮结束），并补充回退失败与抑制来源诊断。
+历史 Interaction **0.1.0-test.5** 阶段：支持默认 8 秒无自然回复发送确认提示（5.5 秒起由 Agent 侧插件经原生模型生成 Persona 风格短句，QQTK 只负责发送）、长结果语义分泡与只观察的 SDK 回执钩子。QQ 配置 `deliveryDiagnostics:true` 可开启限量脱敏投递关联日志，默认关闭；不需要开启 debug，不保存私聊正文或原始身份。QQ 补丁与 Agent 插件须同步更新；重复完整气泡仍待真实复现，详见 [Interaction 契约](docs/INTERACTION.md)。已配套并部署 Interaction **0.1.0-test.6**：回复按输入 ID 选择 QQ 回复目标、Worker 续轮投递、运行期新消息交给 Interaction 的 intervene 处理（入站不再等待整轮结束），并补充回退失败与抑制来源诊断。
 
 后续[Interaction 隔离审计](docs/AUDIT-INTERACTION-test10.md)的复现问题已进行[修复及隔离复测](docs/INTERACTION-AUDIT-FIXES.md)。36/36 自动测试及 10/10 SDK 边界测试通过；新增 qqbot-nodejs 1.0.5 补丁，须与 QQ Bot 补丁配套。已随 Character test.11 部署，新宿主及 QQ ready 检查通过；实机投递、完整 HMR 与生产回滚演练尚未验收。
 

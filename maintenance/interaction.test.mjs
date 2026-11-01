@@ -28,7 +28,7 @@ test('QQ bridge absent policy keeps the original router, whose static text goes 
  const f=outbound();await f.handler(f.session,{type:'assistant/message'});await f.handler(f.session,{type:'tool/result'});assert.deepEqual(f.legacy,['assistant/message','tool/result']);
  assert.equal(f.sent.length,0,'no direct sendMarkdown');assert.equal(f.delivered.length,1);
  const {signal,...request}=f.delivered[0];
- assert.deepEqual(JSON.parse(JSON.stringify(request)),{target:{platform:'qq-official',accountId:'app',conversation:{type:'direct',id:'owner'}},origin:{sessionId:'fixture'},message:{text:'tool error'}});
+ assert.deepEqual(JSON.parse(JSON.stringify(request)),{target:{platform:'qq-official',adapter:'qq-official-gateway',accountId:'app',conversation:{type:'direct',id:'owner'}},origin:{sessionId:'fixture'},message:{text:'tool error'}});
  assert.equal(signal?.aborted,false,'output without a Turn still carries the Session controller, so /stop reaches it');
 });
 test('QQ bridge delegates policy output once, keeps tool errors on ordered external channel',async()=>{
@@ -72,7 +72,7 @@ function middleware(enabled=true){
  };
  for(const name of ['errorHandler','messageFilter','mentionGate','contentSanitizer','rateLimiter','typingIndicator','quoteRef','historyBuffer','envelopeFormatter','attachmentProcessor'])sandbox[name]=()=>async(_c,next)=>next();
  const setup=vm.runInNewContext(source+';setupMiddlewares;',sandbox);
- setup({use:f=>chain.push(f)},{access:{c2cMode:'allowlist',c2cAllow:['owner'],groupMode:'disabled',groupAllow:[]}},manager,{},conversation);
+ setup({use:f=>chain.push(f)},{access:{c2cMode:'allowlist',c2cAllow:['owner'],groupMode:'disabled',groupAllow:[]}},manager,{},conversation,{cacheMsgId(){}});
  let seq=0;
  const run=async(content,extra={})=>{const c={message:{content,kind:'c2c',senderId:'owner',messageId:'m'+(++seq),...extra.message},replyTarget:{scope:'c2c',targetId:'owner',msgId:'m'+seq},state:{},bot:{sendText:async()=>{}},stop(){this.stopped=true;},...extra};let i=0;const next=async()=>{if(i<chain.length)await chain[i++](c,next);else events.push(['inbound']);};await next();};
  return {run,events,agent,manager,record};

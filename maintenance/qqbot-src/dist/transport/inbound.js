@@ -88,7 +88,7 @@ export async function handleInbound(ctx, logger, channel) {
             await hold.idle;
         }
         catch (err) {
-            logger.warn(`whenIdle rejected: ${err instanceof Error ? err.message : String(err)}`);
+            logger.warn('QQ Agent idle wait failed');
         }
     }
 }
@@ -127,13 +127,13 @@ export async function deliverInbound(standard, conversation, config, logger) {
     const result = await conversation.handoff(standard, { replyTarget, content: agentBody });
     if (result.reason === 'session-unavailable') {
         const err = result.error;
-        logger.error(`ERROR creating session: ${err instanceof Error ? err.message : String(err)}`);
+        logger.error('QQ Session acquisition failed; input was not handed over');
         // 兜底回复：会话创建失败时告知用户，避免静默无响应
         try {
-            await bot.sendMarkdown(replyTarget, '⚠️ 处理消息时出现异常，请稍后重试。');
+            await conversation.reply(standard, '⚠️ 处理消息时出现异常，请稍后重试。');
         }
         catch (sendErr) {
-            logger.error(`fallback reply failed: ${sendErr instanceof Error ? sendErr.message : String(sendErr)}`);
+            logger.error('QQ error reply was not confirmed; no direct send fallback');
         }
     }
     if (result.status !== 'accepted')

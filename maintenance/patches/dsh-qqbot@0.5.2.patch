@@ -1,3 +1,153 @@
+diff --git a/dist/features/approval-channel.js b/dist/features/approval-channel.js
+index 15182b6..73f8102 100644
+--- a/dist/features/approval-channel.js
++++ b/dist/features/approval-channel.js
+@@ -1,142 +1,4 @@
+-import { decodeButtonData } from "./button-utils.js";
+-import { buildApprovalKeyboard, buildApprovalText } from "./approval-renderer.js";
+-const COMMAND_CLIP = 500;
+-/**
+- * 从 session log 按 callId 找回被 gate 的命令（审批请求本身不重复携带 arguments）。
+- * 对齐 TUI/web 的 `commandOf` 语义。
+- */
+-function commandOf(req) {
+-    if (req.callId === undefined)
+-        return undefined;
+-    const events = req.agent.session.events;
+-    for (let i = events.length - 1; i >= 0; i -= 1) {
+-        const event = events[i];
+-        if (!event || event.type !== 'tool/call')
+-            continue;
+-        const data = event.data;
+-        if (String(data?.callId) !== String(req.callId))
+-            continue;
+-        const raw = data?.arguments;
+-        if (typeof raw !== 'string')
+-            return undefined;
+-        try {
+-            const parsed = JSON.parse(raw);
+-            if (parsed !== null && typeof parsed === 'object' && 'command' in parsed) {
+-                const command = parsed.command;
+-                if (typeof command === 'string')
+-                    return command;
+-            }
+-        }
+-        catch {
+-            // 非 JSON，回退到原始字符串
+-        }
+-        return raw.length <= COMMAND_CLIP ? raw : `${raw.slice(0, COMMAND_CLIP)}…`;
+-    }
+-    return undefined;
+-}
++// Retired internal entry: native Approval now uses Agent I/O openHITL().
+ export class ApprovalChannel {
+-    pending = new Map();
+-    manager;
+-    sender;
+-    logger;
+-    constructor(manager, sender, logger) {
+-        this.manager = manager;
+-        this.sender = sender;
+-        this.logger = logger;
+-    }
+-    /**
+-     * 注册 approval/request waterfall answerer。approval 服务未挂载时优雅禁用。
+-     */
+-    install(ctx) {
+-        let hasApproval = false;
+-        try {
+-            hasApproval = ctx.get('approval') !== undefined;
+-        }
+-        catch {
+-            hasApproval = false;
+-        }
+-        if (!hasApproval) {
+-            this.logger.debug('im-qqbot: approval service unavailable — approval channel disabled');
+-            return;
+-        }
+-        const self = this;
+-        ctx.on('approval/request', (req, next) => {
+-            const request = req;
+-            const nextFn = next;
+-            const record = self.manager.findBySessionId(request.agent.id);
+-            if (record)
+-                return self.park(record, request);
+-            return nextFn();
+-        }, { prepend: true });
+-        this.logger.info('im-qqbot: QQ approval channel installed');
+-    }
+-    /** 会话回收时清理其 pending 审批，避免 Promise 悬挂 */
+-    cancelPending(sessionKey) {
+-        const entry = this.pending.get(sessionKey);
+-        if (!entry)
+-            return;
+-        this.pending.delete(sessionKey);
+-        this.removeAbort(entry);
+-        entry.resolve('cancelled');
+-    }
+-    /** 按钮点击决策：解码 button_data，settle pending 审批 */
+-    handleInteraction(event) {
+-        const peerId = event.group_openid ?? event.user_openid;
+-        if (!peerId)
+-            return false;
+-        const scope = event.group_openid ? 'group' : 'c2c';
+-        const record = this.manager.getSessionRecord(scope, peerId);
+-        if (!record)
+-            return false;
+-        const entry = this.pending.get(record.sessionKey);
+-        if (!entry)
+-            return false;
+-        const data = event.data?.resolved?.button_data;
+-        if (!data)
+-            return false;
+-        const button = decodeButtonData(data);
+-        if (!button || button.t !== 'approval')
+-            return false;
+-        this.pending.delete(record.sessionKey);
+-        this.removeAbort(entry);
+-        entry.resolve(button.d === 'allow' ? 'allowed-once' : 'rejected');
+-        return true;
+-    }
+-    /** 走 QQ 通道：发审批消息 + 挂起 Promise，等待用户决策 */
+-    async park(record, request) {
+-        const key = record.sessionKey;
+-        // 会话回收/取消可能在发送前发生：signal 已 abort 则直接失败
+-        if (request.signal?.aborted)
+-            return 'cancelled';
+-        const command = commandOf(request);
+-        try {
+-            await this.sender.sendMarkdown(record.replyTarget, buildApprovalText(request, command), { keyboard: buildApprovalKeyboard() });
+-        }
+-        catch (err) {
+-            const msg = err instanceof Error ? err.message : String(err);
+-            this.logger.error(`im-qqbot: approval send failed key=${key}: ${msg}`);
+-            return 'unavailable'; // 无法呈现审批，fail-closed
+-        }
+-        return new Promise((resolve) => {
+-            const entry = { record, request, resolve };
+-            if (request.signal) {
+-                const onAbort = () => {
+-                    if (this.pending.get(key) !== entry)
+-                        return;
+-                    this.pending.delete(key);
+-                    resolve('cancelled');
+-                };
+-                entry.onAbort = onAbort;
+-                request.signal.addEventListener('abort', onAbort, { once: true });
+-            }
+-            this.pending.set(key, entry);
+-            this.logger.info(`im-qqbot: approval sent to QQ, waiting for decision key=${key}`);
+-        });
+-    }
+-    removeAbort(entry) {
+-        if (entry.onAbort && entry.request.signal) {
+-            entry.request.signal.removeEventListener('abort', entry.onAbort);
+-        }
+-    }
++    constructor() { throw new Error('Legacy QQ ApprovalChannel is retired; use conversation.openHITL'); }
+ }
+-//# sourceMappingURL=approval-channel.js.map
+\ No newline at end of file
 diff --git a/dist/features/approval-renderer.js b/dist/features/approval-renderer.js
 index ad00ad3..0d9965d 100644
 --- a/dist/features/approval-renderer.js
@@ -50,6 +200,248 @@ index ad00ad3..0d9965d 100644
 -    return { content: { rows: [{ buttons: [allow, deny] }] } };
 -}
 -//# sourceMappingURL=approval-renderer.js.map
+\ No newline at end of file
+diff --git a/dist/features/question-channel.js b/dist/features/question-channel.js
+index 3d2811c..4927485 100644
+--- a/dist/features/question-channel.js
++++ b/dist/features/question-channel.js
+@@ -1,234 +1,4 @@
+-import { parseAnswer } from "./answer-parser.js";
+-import { buildKeyboard, formatQuestion } from "./question-renderer.js";
+-import { decodeButtonData } from "./button-utils.js";
+-// ── 错误语义（对齐 dsh-user-questions 的 UserQuestionError code 约定） ──
+-/** 问答中断错误码：上层（如 plan-mode）按 code 区分「用户未作答」与普通发送/网络错误 */
+-const ASK_ABORTED = 'ASK_ABORTED';
+-class QuestionChannelError extends Error {
+-    code;
+-    constructor(message, code) {
+-        super(message);
+-        this.code = code;
+-        this.name = 'QuestionChannelError';
+-    }
+-}
++// Retired internal entry: native questions now use Agent I/O openHITL().
+ export class QuestionChannel {
+-    pending = new Map();
+-    uq;
+-    origAsk;
+-    manager;
+-    sender;
+-    config;
+-    logger;
+-    constructor(manager, sender, config, logger) {
+-        this.manager = manager;
+-        this.sender = sender;
+-        this.config = config;
+-        this.logger = logger;
+-    }
+-    /**
+-     * 包装 userQuestions.ask：QQ 会话走 QQ 通道，其余委托原实现。
+-     * 幂等（已 patch 则跳过）；服务缺失或 ask 非函数时优雅禁用。
+-     */
+-    install(ctx) {
+-        const uq = ctx.get('userQuestions');
+-        if (!uq || uq.__qqQuestionPatched)
+-            return;
+-        if (typeof uq.ask !== 'function') {
+-            this.logger.warn('im-qqbot: userQuestions service lacks ask() — QQ question channel disabled');
+-            return;
+-        }
+-        const self = this;
+-        this.origAsk = uq.ask.bind(uq);
+-        uq.ask = async function qqRoutedAsk(request) {
+-            const sessionId = request?.agent?.id;
+-            const record = sessionId ? self.manager.findBySessionId(sessionId) : undefined;
+-            if (record)
+-                return self.askViaQQ(record, request);
+-            return self.origAsk(request);
+-        };
+-        Object.defineProperty(uq, '__qqQuestionPatched', { value: true, configurable: true, enumerable: false });
+-        this.uq = uq;
+-        this.logger.info('im-qqbot: QQ question channel installed');
+-    }
+-    uninstall() {
+-        if (this.uq && this.origAsk) {
+-            this.uq.ask = this.origAsk;
+-            delete this.uq.__qqQuestionPatched;
+-            this.uq = undefined;
+-            this.origAsk = undefined;
+-        }
+-        for (const [, entry] of this.pending) {
+-            this.clearTimer(entry);
+-            this.removeAbort(entry);
+-            entry.reject(new QuestionChannelError('QQ question channel was unloaded before the user answered', ASK_ABORTED));
+-        }
+-        this.pending.clear();
+-    }
+-    /** 会话回收时清理其待答问题，避免 pending 悬挂导致 Promise 与闭包泄漏 */
+-    cancelPending(sessionKey) {
+-        const entry = this.pending.get(sessionKey);
+-        if (!entry)
+-            return;
+-        this.pending.delete(sessionKey);
+-        this.clearTimer(entry);
+-        this.removeAbort(entry);
+-        entry.reject(new QuestionChannelError('ask_user_question was cancelled before the user answered', ASK_ABORTED));
+-    }
+-    /** 入站文本作答：该会话若有待答问题且本条消息有文本，解析为答案并推进 */
+-    tryAnswer(scope, peerId, text) {
+-        const record = this.manager.getSessionRecord(scope, peerId);
+-        if (!record)
+-            return false;
+-        const key = record.sessionKey;
+-        const entry = this.pending.get(key);
+-        if (!entry)
+-            return false;
+-        if (!text)
+-            return false; // 纯图片/表情等：继续等待，消息走常规流程
+-        const current = entry.request.questions[entry.index];
+-        if (!current)
+-            return false;
+-        const answer = parseAnswer(current, text);
+-        this.advance(entry, key, answer);
+-        return true;
+-    }
+-    /** 按钮点击作答：解码 button_data 选项下标，推进状态机 */
+-    handleInteraction(event) {
+-        const peerId = event.group_openid ?? event.user_openid;
+-        if (!peerId)
+-            return false;
+-        const scope = event.group_openid ? 'group' : 'c2c';
+-        const record = this.manager.getSessionRecord(scope, peerId);
+-        if (!record)
+-            return false;
+-        const entry = this.pending.get(record.sessionKey);
+-        if (!entry)
+-            return false;
+-        const data = event.data?.resolved?.button_data;
+-        if (!data)
+-            return false;
+-        const button = decodeButtonData(data);
+-        if (!button || button.t !== 'question')
+-            return false;
+-        const current = entry.request.questions[entry.index];
+-        if (!current)
+-            return false;
+-        // 校验按钮归属题：旧题按钮在新题推进后被点击（误点/延迟事件），
+-        // 其 q 不等于当前题 id，直接忽略，避免错位映射到当前题选项。
+-        if (button.q !== current.id)
+-            return false;
+-        const idx = button.i;
+-        const opts = current.options ?? [];
+-        if (idx < 0 || idx >= opts.length)
+-            return false;
+-        this.advance(entry, record.sessionKey, { id: current.id, selected: [opts[idx].label] });
+-        return true;
+-    }
+-    /** 走 QQ 通道：发送首题 + 挂起 Promise，等待逐题作答 */
+-    async askViaQQ(record, request) {
+-        const key = record.sessionKey;
+-        // 会话回收/取消可能在发送前发生：signal 已 abort 则直接失败，避免悬挂
+-        if (request.signal?.aborted) {
+-            throw new QuestionChannelError('ask_user_question was aborted before delivery', ASK_ABORTED);
+-        }
+-        // 同会话已有待答问题（理论上不会发生：回合阻塞在第一个问题上）→ 拒绝旧的
+-        const prev = this.pending.get(key);
+-        if (prev) {
+-            this.pending.delete(key);
+-            this.clearTimer(prev);
+-            this.removeAbort(prev);
+-            prev.reject(new QuestionChannelError('superseded by a new question', ASK_ABORTED));
+-        }
+-        const first = request.questions[0];
+-        if (!first)
+-            throw new Error('ask_user_question with empty questions');
+-        await this.sendQuestion(record, first);
+-        return new Promise((resolve, reject) => {
+-            const entry = { record, request, resolve, reject, index: 0, collected: [] };
+-            if (request.signal) {
+-                const onAbort = () => {
+-                    if (this.pending.get(key) !== entry)
+-                        return;
+-                    this.pending.delete(key);
+-                    this.clearTimer(entry);
+-                    reject(new QuestionChannelError('ask_user_question was aborted before the user answered', ASK_ABORTED));
+-                };
+-                entry.onAbort = onAbort;
+-                request.signal.addEventListener('abort', onAbort, { once: true });
+-            }
+-            entry.timer = setTimeout(() => this.onTimeout(key), this.config.askTimeoutMs);
+-            this.pending.set(key, entry);
+-            this.logger.info(`im-qqbot: question sent to QQ, waiting for answer key=${key}`);
+-        });
+-    }
+-    /** 推进状态机：收集答案 → 有下一题则发送，否则 resolve 全部答案 */
+-    advance(entry, key, answer) {
+-        entry.collected.push(answer);
+-        entry.index += 1;
+-        if (entry.index < entry.request.questions.length) {
+-            const next = entry.request.questions[entry.index];
+-            this.resetTimer(entry, key);
+-            void this.sendQuestion(entry.record, next).catch((err) => {
+-                this.pending.delete(key);
+-                this.clearTimer(entry);
+-                this.removeAbort(entry);
+-                entry.reject(err instanceof Error ? err : new Error(String(err)));
+-            });
+-            return;
+-        }
+-        this.pending.delete(key);
+-        this.clearTimer(entry);
+-        this.removeAbort(entry);
+-        this.logger.info(`im-qqbot: question answered via QQ key=${key}`);
+-        entry.resolve({ answers: entry.collected });
+-    }
+-    /** 发送单个问题：优先带按钮，按钮发送失败降级纯文本 */
+-    async sendQuestion(record, question) {
+-        const hint = record.scope === 'group' && this.config.requireMention === true;
+-        const keyboard = buildKeyboard(question);
+-        try {
+-            if (keyboard) {
+-                try {
+-                    await this.sender.sendMarkdown(record.replyTarget, formatQuestion(question, hint, true), { keyboard });
+-                    return;
+-                }
+-                catch (err) {
+-                    this.logger.warn(`im-qqbot: keyboard send failed, fallback to text: ${err instanceof Error ? err.message : String(err)}`);
+-                }
+-            }
+-            await this.sender.sendMarkdown(record.replyTarget, formatQuestion(question, hint, false));
+-        }
+-        catch (err) {
+-            const msg = err instanceof Error ? err.message : String(err);
+-            this.logger.error(`im-qqbot: question send failed key=${record.sessionKey}: ${msg}`);
+-            throw new Error(`failed to deliver question to QQ: ${msg}`);
+-        }
+-    }
+-    onTimeout(key) {
+-        const entry = this.pending.get(key);
+-        if (!entry)
+-            return;
+-        this.pending.delete(key);
+-        this.removeAbort(entry);
+-        entry.timer = undefined;
+-        void this.sender.sendMarkdown(entry.record.replyTarget, '⚠️ 提问已超时，未收到回答。').catch(() => { });
+-        entry.reject(new QuestionChannelError('ask_user_question timed out before the user answered', ASK_ABORTED));
+-    }
+-    resetTimer(entry, key) {
+-        if (entry.timer)
+-            clearTimeout(entry.timer);
+-        entry.timer = setTimeout(() => this.onTimeout(key), this.config.askTimeoutMs);
+-    }
+-    clearTimer(entry) {
+-        if (entry.timer)
+-            clearTimeout(entry.timer);
+-        entry.timer = undefined;
+-    }
+-    removeAbort(entry) {
+-        if (entry.onAbort && entry.request.signal) {
+-            entry.request.signal.removeEventListener('abort', entry.onAbort);
+-        }
+-    }
++    constructor() { throw new Error('Legacy QQ QuestionChannel is retired; use conversation.openHITL'); }
+ }
+-//# sourceMappingURL=question-channel.js.map
 \ No newline at end of file
 diff --git a/dist/features/question-renderer.js b/dist/features/question-renderer.js
 index dc2e41f..d41b48f 100644
@@ -112,17 +504,16 @@ index dc2e41f..d41b48f 100644
      opts.forEach((o, i) => {
          lines.push(`${i + 1}. ${o.label}${o.description ? ` · ${o.description}` : ''}`);
 diff --git a/dist/gateway/middleware-setup.js b/dist/gateway/middleware-setup.js
-index ca4b002..b0af073 100644
+index ca4b002..08f426c 100644
 --- a/dist/gateway/middleware-setup.js
 +++ b/dist/gateway/middleware-setup.js
-@@ -1,9 +1,106 @@
+@@ -1,26 +1,131 @@
 -import { errorHandler, messageFilter, accessPolicy, mentionGate, contentSanitizer, rateLimiter, slashCommand, concurrencyGuard, typingIndicator, quoteRef, historyBuffer, envelopeFormatter, } from '@tencent-connect/qqbot-nodejs';
-+import { errorHandler, messageFilter, accessPolicy, mentionGate, contentSanitizer, rateLimiter, concurrencyGuard, typingIndicator, quoteRef, historyBuffer, envelopeFormatter, } from '@tencent-connect/qqbot-nodejs';
++import { messageFilter, accessPolicy, mentionGate, contentSanitizer, rateLimiter, concurrencyGuard, typingIndicator, quoteRef, historyBuffer, envelopeFormatter, } from '@tencent-connect/qqbot-nodejs';
  import { buildCommandList } from "../commands/index.js";
 -import { attachmentProcessor } from "../middleware/attachment.js";
 -import { questionAnswer } from "../middleware/question-answer.js";
 +import { downloadMediaAttachments } from "../transport/attachment.js";
-+import { cacheMsgId } from "../transport/msgid-cache.js";
  import { getHistoryStore, historyGroupKey } from "../features/history-store.js";
 -export function setupMiddlewares(bot, config, manager, logger) {
 +/**
@@ -164,7 +555,7 @@ index ca4b002..b0af073 100644
 +            sender: { id: msg.senderId },
 +            message: { ...(typeof msg.messageId === 'string' && msg.messageId ? { id: msg.messageId } : {}), text: cleaned },
 +        };
-+        const result = await router.dispatch(input, { context: ctx, reply: text => ctx.bot.sendText(ctx.replyTarget, text) });
++        const result = await router.dispatch(input, { context: ctx });
 +        if (result.status === 'pass') return next();
 +        if (result.status === 'failed') ctx.log?.error?.(`[command] /${result.command} failed`);
 +        ctx.stop(`command:${result.status}${result.command ? ':' + result.command : ''}`);
@@ -180,14 +571,20 @@ index ca4b002..b0af073 100644
 + * is lost.
 + */
 +export function attachmentDownloads(config, logger) {
++    // Upstream download logs contain filenames, local paths and raw errors.
++    const downloadLog = {
++        debug: () => logger.debug?.('QQ attachment download state changed'),
++        warn: () => logger.warn?.('QQ attachment download unavailable'),
++        error: () => logger.error?.('QQ attachment download failed'),
++    };
 +    const each = async list => {
 +        const out = [];
 +        for (const [attachment, raw] of (list ?? []).entries()) {
 +            try {
-+                const [file] = await downloadMediaAttachments([raw], config.media, logger);
++                const [file] = await downloadMediaAttachments([raw], config.media, downloadLog);
 +                if (file) out.push({ ...file, attachment });
 +            }
-+            catch (err) { logger.warn(`im-qqbot: attachment download failed: ${err instanceof Error ? err.message : String(err)}`); }
++            catch (err) { logger.warn('im-qqbot: attachment download failed'); }
 +        }
 +        return out;
 +    };
@@ -206,7 +603,7 @@ index ca4b002..b0af073 100644
 + * question of this Conversation only for the expected person and claims the
 + * platform message once. Anything else continues as ordinary chat input.
 + */
-+export function hitlAnswers(manager) {
++export function hitlAnswers(manager, replyIds) {
 +    return async (ctx, next) => {
 +        const hitl = manager.hitl, msg = ctx.message;
 +        if (!hitl) return next();
@@ -218,15 +615,20 @@ index ca4b002..b0af073 100644
 +        });
 +        if (result.status === 'pass') return next();
 +        // The answer never reaches bot.on('message'): keep its msgId as a passive-reply candidate.
-+        if (result.status === 'answered') cacheMsgId(ctx.replyTarget.scope, ctx.replyTarget.targetId, ctx.replyTarget.msgId);
++        if (result.status === 'answered') replyIds.cacheMsgId(ctx.replyTarget.scope, ctx.replyTarget.targetId, ctx.replyTarget.msgId);
 +        ctx.stop(`hitl:${result.status}`);
 +    };
 +}
-+export function setupMiddlewares(bot, config, manager, logger, conversation) {
++export function setupMiddlewares(bot, config, manager, logger, conversation, replyIds) {
      // 1. 错误兜底（最外层洋葱皮）
-     bot.use(errorHandler());
+-    bot.use(errorHandler());
++    // The SDK errorHandler directly sends raw exception text. Before an input
++    // has entered I/O there is no scoped reply grant: fail closed, never revive
++    // that sender. Admitted Session acquisition errors use conversation.reply.
++    bot.use(async (_ctx, next) => { try { await next(); } catch (error) { try { logger.error?.('QQ inbound pipeline failed; no direct fallback'); } catch {} throw error; } });
      // 2. 消息过滤：bot 回声 + 消息去重
-@@ -12,11 +109,11 @@ export function setupMiddlewares(bot, config, manager, logger) {
+     bot.use(messageFilter({ skipSelfEcho: false }));
+     // 3. 访问控制（白名单/开放/禁用）
      bot.use(accessPolicy({
          c2c: {
              mode: config.access.c2cMode,
@@ -240,7 +642,12 @@ index ca4b002..b0af073 100644
          },
          onBlock: (_mCtx, reason) => {
              if (config.debug) {
-@@ -41,22 +138,62 @@ export function setupMiddlewares(bot, config, manager, logger) {
+-                logger.debug(`Access blocked: ${reason}`);
++                logger.debug('Access blocked by configured policy');
+             }
+         },
+     }));
+@@ -41,22 +146,65 @@ export function setupMiddlewares(bot, config, manager, logger) {
      bot.use(mentionGate({
          requireMentionInGroup: config.requireMention,
      }));
@@ -287,7 +694,7 @@ index ca4b002..b0af073 100644
 +    for (const cmd of commands) router.register(qqCommand(cmd));
 +    bot.use(commandGate(router));
 +    // 8.5. 待答问题文本作答（HITL Bridge；在 concurrencyGuard 之前，答案消息不排队直接作答）
-+    bot.use(hitlAnswers(manager));
++    bot.use(hitlAnswers(manager, replyIds));
 +    // Explicit correction only, after access/question admission but before merge.
 +    // Ordinary messages and /stop retain their existing native paths.
 +    bot.use(async (mCtx, next) => {
@@ -303,7 +710,10 @@ index ca4b002..b0af073 100644
 +        }
 +        record.replyTarget = { scope: 'c2c', targetId: msg.senderId, msgId: msg.messageId };
 +        // The shared handoff re-checks the current Session and creates the native input.
-+        const handed = conversation.submit(record, msg.content, { revise: true });
++        const handed = conversation.submit(record, msg.content, { revise: true, input: {
++            platform: conversation.platform, adapter: conversation.adapter, accountId: conversation.accountId,
++            conversation: { type: 'direct', id: msg.senderId }, sender: { id: msg.senderId }, message: { id: msg.messageId, text: msg.content },
++        } });
 +        if (handed.status !== 'accepted') throw new Error('Interaction Session changed during admission');
      });
 -    bot.use(slash.middleware);
@@ -312,7 +722,7 @@ index ca4b002..b0af073 100644
      // 9. 并发串行 + 消息合并（同 peer 排队，避免 session 冲突）
      bot.use(concurrencyGuard({
          strategy: 'merge',
-@@ -71,7 +208,7 @@ export function setupMiddlewares(bot, config, manager, logger) {
+@@ -71,7 +219,7 @@ export function setupMiddlewares(bot, config, manager, logger) {
          preferMsgElements: true,
      }));
      // 11.5. 附件下载（file 附件下载到本地，供 @提及 / 工具访问）
@@ -321,7 +731,7 @@ index ca4b002..b0af073 100644
      // 12. 上下文组装（将 history + quote + sender 组成 envelope）
      bot.use(envelopeFormatter({
          historyLimit: config.historyLimit,
-@@ -79,4 +216,4 @@ export function setupMiddlewares(bot, config, manager, logger) {
+@@ -79,4 +227,4 @@ export function setupMiddlewares(bot, config, manager, logger) {
          includeSender: true,
      }));
  }
@@ -528,31 +938,56 @@ index 553fd46..1f88852 100644
 \ No newline at end of file
 +//# sourceMappingURL=send-file-tool.js.map
 diff --git a/dist/index.js b/dist/index.js
-index c4998d0..71ed35a 100644
+index c4998d0..a47bcfd 100644
 --- a/dist/index.js
 +++ b/dist/index.js
-@@ -4,7 +4,8 @@ import { getProfileDir, resolveEnv } from "./shared/index.js";
+@@ -4,10 +4,12 @@ import { getProfileDir, resolveEnv } from "./shared/index.js";
  import { ensureCredentials, persistCredentialsToProfile, registerBoundCredentialRoutes } from "./setup/index.js";
  // ── Cordis 插件元数据 ──
  export const name = 'im-qqbot';
 -export const inject = ['agents'];
++export const gatewayLifecycleContractVersion = 1;
 +// Harness 0.2 uses a service-name map/array, not upstream Cordis required/optional metadata.
 +export const inject = ['agents', 'conversationManager', 'agentIO'];
  export const Config = ConfigSchema;
  // ── 插件主体 ──
- export async function apply(ctx, config) {
-@@ -58,4 +59,4 @@ export async function apply(ctx, config) {
+-export async function apply(ctx, config) {
++export async function apply(ctx, config, integration) {
+     const agents = ctx.agents;
+     const logger = ctx.logger ?? console;
+     let appId = resolveEnv(config.appId, 'QQBOT_APPID');
+@@ -42,13 +44,13 @@ export async function apply(ctx, config) {
+                 ...config,
+                 appId: credentials.appId,
+                 appSecret: credentials.appSecret,
+-            }, logger).catch((err) => {
+-                logger.error(`网关启动失败: ${err instanceof Error ? err.message : String(err)}`);
++            }, logger, integration).catch((err) => {
++                logger.error('QQ Gateway startup failed; private exception details omitted');
+             });
+         })
+             .catch((err) => {
+             // 全兜：unhandled rejection 会被宿主 fail-loud 判致命
+-            logger.error(`扫码绑定流程异常: ${err instanceof Error ? err.message : String(err)}`);
++            logger.error('QQ credential setup failed; private exception details omitted');
+         });
+         // apply 立即完成，插件 fiber 进入 ACTIVE，Host ready 不再被阻塞
+         return;
+@@ -56,6 +58,6 @@ export async function apply(ctx, config) {
+     // 已绑定：注册常驻路由（状态回显 + 手动编辑/更换凭据 + 配置编辑）
+     registerBoundCredentialRoutes(ctx, logger, appId, { ...config });
      const resolvedConfig = { ...config, appId, appSecret };
-     await bootstrapGateway(ctx, agents, resolvedConfig, logger);
+-    await bootstrapGateway(ctx, agents, resolvedConfig, logger);
++    await bootstrapGateway(ctx, agents, resolvedConfig, logger, integration);
  }
 -//# sourceMappingURL=index.js.map
 \ No newline at end of file
 +//# sourceMappingURL=index.js.map
 diff --git a/dist/gateway/bootstrap.js b/dist/gateway/bootstrap.js
-index 070f21e..cfd057c 100644
+index 070f21e..02492ee 100644
 --- a/dist/gateway/bootstrap.js
 +++ b/dist/gateway/bootstrap.js
-@@ -1,37 +1,341 @@
+@@ -1,37 +1,359 @@
 -import { QQBot } from '@tencent-connect/qqbot-nodejs';
 +import { QQBot, MediaFileType } from '@tencent-connect/qqbot-nodejs';
 +import { createHmac, randomBytes, randomUUID } from 'node:crypto';
@@ -565,7 +1000,8 @@ index 070f21e..cfd057c 100644
 +import { QQ_OFFICIAL, QQ_SCOPES, accessAllows, createQQTextAdapter, hitlResponse } from "../transport/qq-text-adapter.js";
 +import { deliverInbound } from "../transport/inbound.js";
  import { ReplyLimiter } from "../transport/reply-limiter.js";
- import { cacheMsgId, cacheEventId } from "../transport/msgid-cache.js";
+-import { cacheMsgId, cacheEventId } from "../transport/msgid-cache.js";
++import { createReplyIdCache } from "../transport/msgid-cache.js";
  import { resolveReplyTarget, sendResolvedMarkdown } from "../transport/reply-target.js";
 -import { QuestionChannel } from "../features/question-channel.js";
 -import { ApprovalChannel } from "../features/approval-channel.js";
@@ -580,9 +1016,15 @@ index 070f21e..cfd057c 100644
 +import { registerSendFileTool, verifyLocalFile } from "../media/send-file-tool.js";
 +// Shared across duplicate module copies in the same Host process.
 +const gatewayLeases = globalThis[Symbol.for('dsh.qqGateway.leases.v1')] ??= new Map();
++// The SDK logs dynamic peer keys and exception messages. Keep its protocol
++// observations, but never forward arbitrary strings to Host logs.
++export function privateSDKLogger(logger) {
++    const write=(level,text)=>{try{logger?.[level]?.(text);}catch{}};
++    return Object.freeze({debug(){},info(text){if(text==='[qqbot] gateway RESUMED')write('info','QQ transport resumed');},warn(){write('warn','QQ SDK warning');},error(){write('error','QQ SDK error; private details omitted');}});
++}
 +// Opt-in bounded local diagnostics. HMAC keys live only in this Gateway instance;
 +// neither source text, raw identifiers, errors nor credentials enter this file.
-+export function createDeliveryRecorder(enabled, logger, directory) {
++export function createDeliveryRecorder(enabled, logger, directory, hub, context) {
 +    if(!enabled)return null;
 +    const home=process.env.DSH_HOME?.trim();
 +    const dir=directory??(home?diagnosticPath(home,'qqbot','diagnostics'):diagnosticPath(diagnosticHome(),'.dsh-qqbot','diagnostics'));
@@ -614,7 +1056,13 @@ index 070f21e..cfd057c 100644
 +        pending.push(JSON.stringify(row)+'\n');
 +        if(!timer){timer=setTimeout(flush,100);timer.unref?.();}
 +    };
-+    return {hash,trace,flush,async close(){closed=true;await flush();}};
++    const account=hub?.scope(context).hash(context?.accountId);
++    const unsubscribe=hub?.subscribe(row=>{
++        if(!closed&&pending.length<512&&row.account===account&&row.platform===context?.platform&&row.adapter===context?.adapter){
++            pending.push(JSON.stringify(row)+'\n');if(!timer){timer=setTimeout(flush,100);timer.unref?.();}
++        }
++    });
++    return {hash,trace,flush,async close(){closed=true;unsubscribe?.();await flush();}};
 +}
 +/**
 + * QQ side of the Agent I/O HITL Bridge: the QQ Markdown of approvals, questions
@@ -772,7 +1220,8 @@ index 070f21e..cfd057c 100644
 +        const signals=[lease.signal,signal].filter(s=>s instanceof AbortSignal);
 +        const own=typeof input==='string'?record.interactionTargets?.get(input):undefined;
 +        const mine=id!==undefined&&!deliveries.has(id);if(mine)deliveries.set(id,{target:own&&{...own},input:typeof input==='string'?input:undefined,delivery});
-+        try{return await io.sendMessage({...(id?{id}:{}),target:conversation.target(record),origin:{sessionId:record.sessionId},message:typeof text==='string'?{text}:text,...(signals.length?{signal:signals.length>1?AbortSignal.any(signals):signals[0]}:{})});}
++        conversation.diagnostics?.emit('interaction','queued',{sessionId:record.sessionId,conversation:conversation.target(record)?.conversation,inputId:input,logicalId:id,turn,reply:delivery?.reply,bubble:delivery?.bubble,kind:delivery?.kind,status:'pending'});
++        try{return await io.sendMessage({...(id?{id}:{}),target:conversation.target(record),origin:{sessionId:record.sessionId,...(Number.isSafeInteger(turn)?{turn}:{})},message:typeof text==='string'?{text}:text,...(signals.length?{signal:signals.length>1?AbortSignal.any(signals):signals[0]}:{})});}
 +        finally{lease.release();if(mine)deliveries.delete(id);}
 +    }
 +    manager.submitOutput=submit;
@@ -807,11 +1256,15 @@ index 070f21e..cfd057c 100644
 +    const outboundHandler = (session, event) => {
 +        observeTurn(session.header.id, event);
 +        const record = manager.findBySessionId(session.header.id);
++        if(record&&['turn/start','turn/end'].includes(event.type))conversation.diagnostics?.emit('conversation','state',{sessionId:session.header.id,conversation:conversation.target(record)?.conversation,turn:event.data?.turn,status:event.type==='turn/start'?'running':'idle'});
 +        const policy = policyFor(record);
 +        if(policy===null)return;
 +        if (policy) {
 +            const scope={session:diagnostics?.hash(session.header.id)};
-+            const trace=(event,fields)=>diagnostics?.trace(event,{...scope,...fields,...(fields.attempt===undefined?{}:{attempt:diagnostics?.hash(fields.attempt)})});
++            const trace=(event,fields)=>{
++                diagnostics?.trace(event,{...scope,...fields,...(fields.attempt===undefined?{}:{attempt:diagnostics?.hash(fields.attempt)})});
++                conversation.diagnostics?.emit('interaction','state',{sessionId:session.header.id,conversation:conversation.target(record)?.conversation,...fields});
++            };
 +            if(event.type==='user/message'){
 +                const message=event.data?.message??event.data,source=message?.source;
 +                // Native projections are context within the admitted turn, not
@@ -869,11 +1322,11 @@ index 070f21e..cfd057c 100644
 -    if (button.t === 'approval')
 -        return manager.approvalChannel?.handleInteraction(event) ?? false;
 -    return false;
-+export async function sendMedia(bot, replyLimiter, config, target, attachment) {
++export async function sendMedia(bot, replyLimiter, config, target, attachment, replyIds) {
 +    let file;
 +    try { file = await verifyLocalFile(attachment?.resource?.path, config.sendFile, config.cwd || process.cwd(), { expectReal: true }); }
 +    catch (error) { throw Object.assign(new Error('QQ media resource refused'), { qqStage: 'resource', reason: error?.reason }); }
-+    const resolved = resolveReplyTarget(target, replyLimiter, false);
++    const resolved = resolveReplyTarget(target, replyLimiter, false, replyIds);
 +    const fileType = MediaFileType[MEDIA_TYPES[attachment.kind]];
 +    if (typeof bot.uploadMedia !== 'function' || typeof bot.mediaApi?.sendMediaMessage !== 'function') {
 +        // An SDK without the two public stages: one combined call, classified as a message request.
@@ -889,7 +1342,8 @@ index 070f21e..cfd057c 100644
 +    }
 +    catch (error) { throw Object.assign(new Error('QQ media message failed'), { qqStage: 'message', cause: error }); }
  }
- export async function bootstrapGateway(ctx, agents, config, logger) {
+-export async function bootstrapGateway(ctx, agents, config, logger) {
++export async function bootstrapGateway(ctx, agents, config, logger, options) {
 +    if (gatewayLeases.has(config.appId)) throw new Error('Duplicate QQ Gateway for this application');
 +    const lease = {};
 +    gatewayLeases.set(config.appId, lease);
@@ -905,39 +1359,49 @@ index 070f21e..cfd057c 100644
 +    // and the outbound text adapter. The access configuration admits both ways.
 +    const conversation = io.openConversation({ platform: QQ_OFFICIAL, adapter: 'qq-official-gateway', accountId: config.appId, manager, scopes: QQ_SCOPES,
 +        admits: (scope, peer) => accessAllows(config.access, scope, peer),
-+        onInput: (record, message, policy) => { if (policy) manager.trackInteractionInput?.(record, message); } });
++        onInput: (record, message, policy, input) => { manager.admitInput?.(record, input); if (policy) manager.trackInteractionInput?.(record, message); } });
 +    ctx.effect(() => conversation.close);
 +    if (typeof conversation.openCommands !== 'function') throw new Error('dsh-agent-io 0.1.0-test.5 or later (commands and attachments) is required before QQ');
 +    if (typeof conversation.openHITL !== 'function') throw new Error('dsh-agent-io 0.1.0-test.6 or later (HITL Bridge) is required before QQ');
++    if (typeof conversation.reply !== 'function') throw new Error('dsh-agent-io 0.1.0-test.8 or later (scoped input replies) is required before QQ');
 +    if (config.notifications?.enabled !== false && typeof conversation.openNotifications !== 'function') throw new Error('dsh-agent-io 0.1.0-test.7 or later (notifications) is required before QQ');
-+    const deliveryRecorder=createDeliveryRecorder(config.deliveryDiagnostics,logger);
++    const deliveryRecorder=createDeliveryRecorder(config.deliveryDiagnostics,logger,undefined,io.diagnostics,{platform:QQ_OFFICIAL,adapter:'qq-official-gateway',accountId:config.appId});
 +    ctx.effect(()=>()=>deliveryRecorder?.close());
      // ── 初始化 QQ Bot SDK ──
      const userAgent = buildUserAgent();
      const bot = new QQBot({
-@@ -45,8 +349,10 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+@@ -41,20 +363,24 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+         baseUrl: process.env.QQBOT_BASE_URL?.replace(/\/+$/, '') || 'https://api.bot.qq.com',
+         tokenBaseUrl: process.env.QQBOT_TOKEN_BASE_URL?.replace(/\/+$/, '') || 'https://api.bot.qq.com',
+         userAgent,
+-        logger,
++        logger: privateSDKLogger(logger),
      });
      logger.info(`QQBot SDK initialized (UA: ${userAgent})`);
      // ── 中间件链 ──
 -    setupMiddlewares(bot, config, manager, logger);
 -    // ── 入站：经过中间件链后的消息交给 dsh agent ──
-+    setupMiddlewares(bot, config, manager, logger, conversation);
++    const replyIds = createReplyIdCache();
++    ctx.effect(() => () => replyIds.clear());
++    setupMiddlewares(bot, config, manager, logger, conversation, replyIds);
 +    // ── 入站：经过中间件链后的普通聊天消息 → Unified Agent I/O 入站通道（去重）→ 可信会话入口 → 共享交接 → dsh agent ──
 +    const inbound = conversation.openInbound(standard => deliverInbound(standard, conversation, config, logger));
 +    ctx.effect(() => inbound.close);
      bot.on('message', async (mCtx) => {
          const msg = mCtx.message;
          // 记录最近 msgId，供无上下文的出站发送（文件发送显式 target、主动推送等）获取被动回复目标
-@@ -54,7 +360,7 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+-        cacheMsgId(mCtx.replyTarget.scope, mCtx.replyTarget.targetId, mCtx.replyTarget.msgId);
++        replyIds.cacheMsgId(mCtx.replyTarget.scope, mCtx.replyTarget.targetId, mCtx.replyTarget.msgId);
          if (config.debug) {
-             logger.debug(`← message (post-middleware): ${JSON.stringify(msg, null, 2).slice(0, 500)}`);
+-            logger.debug(`← message (post-middleware): ${JSON.stringify(msg, null, 2).slice(0, 500)}`);
++            logger.debug('Inbound QQ message accepted by middleware');
          }
 -        await handleInbound(mCtx, manager, config, logger);
 +        await handleInbound(mCtx, logger, inbound);
      });
      // ── 出站：dsh session/event → QQ 消息 ──
      // 获取 tools 服务（工具结果结构化展示），可选
-@@ -65,38 +371,55 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+@@ -65,49 +391,72 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
      catch {
          toolsRegistry = undefined;
      }
@@ -956,7 +1420,7 @@ index 070f21e..cfd057c 100644
 -            },
 -        }),
 +        sendMarkdown: async (target, content, opts) => {
-+            const resolved=resolveReplyTarget(target, replyLimiter, true),meta=opts?.delivery??{},fields={...meta,input:diagnostics?.hash(resolved.msgId??resolved.eventId),length:content.length,textHash:diagnostics?.hash(content),passive:!!(resolved.msgId||resolved.eventId)};
++            const resolved=resolveReplyTarget(target, replyLimiter, true, replyIds),meta=opts?.delivery??{},fields={...meta,input:diagnostics?.hash(resolved.msgId??resolved.eventId),length:content.length,textHash:diagnostics?.hash(content),passive:!!(resolved.msgId||resolved.eventId)};
 +            diagnostics?.trace('static-request',fields);
 +            try{const result=await sendResolvedMarkdown(bot,resolved,content,opts);diagnostics?.trace('static-receipt',{...fields,receipt:diagnostics?.hash(result?.id),missingReceipt:!result?.id});return result;}
 +            catch(error){diagnostics?.trace('static-failure',{...fields,httpStatus:error?.httpStatus,bizCode:error?.bizCode});throw error;}
@@ -974,7 +1438,7 @@ index 070f21e..cfd057c 100644
 +        split: text => chunkMarkdownText(text, config.textChunkLimit ?? 4500),
 +        replyTarget: (_record, messageId) => outboundHandler.delivery(messageId)?.target,
 +        send: (target, text, info) => sender.sendMarkdown(target, text, { delivery: { ...outboundHandler.delivery(info.messageId)?.delivery, session: diagnostics?.hash(info.sessionId), index: info.index }, ...(info.keyboard ? { keyboard: info.keyboard } : {}) }),
-+        sendMedia: (target, attachment) => sendMedia(bot, replyLimiter, config, target, attachment),
++        sendMedia: (target, attachment) => sendMedia(bot, replyLimiter, config, target, attachment, replyIds),
 +    }));
 +    ctx.effect(() => releaseTextAdapter);
      ctx
@@ -998,7 +1462,13 @@ index 070f21e..cfd057c 100644
 +    const notifications = config.notifications?.enabled === false ? undefined : conversation.openNotifications();
 +    if (notifications) ctx.effect(() => () => notifications.close());
 +    // Remote Ops is an optional extension. Core messaging and approval own no ops dependency.
-+    const releaseRemoteOps = ctx.get('qqRemoteOps')?.attach({ bot, manager, sender, config, ...(notifications ? { notifications } : {}) });
++    const runtime = { platform: QQ_OFFICIAL, adapter: 'qq-official-gateway', accountId: config.appId, diagnostics: conversation.diagnostics, bot, manager, sender, config, ...(notifications ? { notifications } : {}) };
++    // Optional Host lifecycle hook; ordinary QQ has no Character/Remote Ops prerequisite.
++    const integration = options?.qqGatewayLifecycle;
++    if (integration && (integration.contractVersion !== 1 || typeof integration.attach !== 'function')) throw Error('Unsupported QQ Gateway lifecycle contract');
++    const attached = integration?.attach(runtime);
++    if (attached?.close) ctx.effect(() => attached.close);
++    const releaseRemoteOps = ctx.get('qqRemoteOps')?.attach({ ...runtime, ...(attached?.notifyEvent ? { notifyEvent: attached.notifyEvent } : {}) });
 +    if (typeof releaseRemoteOps === 'function') ctx.effect(() => releaseRemoteOps);
 +    // ── 按钮点击回调（interaction）：HITL 按钮交给 Bridge 校验与结算 ──
      bot.on('interaction', async (_iCtx, event) => {
@@ -1006,14 +1476,41 @@ index 070f21e..cfd057c 100644
          const scope = event.scene === 'group' ? 'group' : 'c2c';
          const targetId = scope === 'group' ? (event.group_openid ?? event.user_openid) : event.user_openid;
          // 记录互动事件 id，作为后续被动回复候选（event_id）
-         cacheEventId(scope, targetId, event.id);
+-        cacheEventId(scope, targetId, event.id);
 -        const matched = dispatchInteraction(event, manager);
++        replyIds.cacheEventId(scope, targetId, event.id);
 +        const response = hitlResponse(event);
 +        const matched = !!response && manager.hitl?.respond(response).status === 'accepted';
          await bot.acknowledgeInteraction(event.id, matched ? 0 : 3).catch(() => { });
      });
      bot.on('error', (err) => {
-@@ -130,15 +453,9 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+-        logger.error(`bot error: ${err instanceof Error ? err.message : String(err)}`);
++        logger.error('QQ SDK error; private exception details omitted');
+     });
+     // 掉线可观测：willReconnect=false 表示不会再重连（随后 bot.start() 的 Promise 会失败）。
+     // disconnected 事件为 SDK 1.0.5+ 新增：旧版 handlers 表缺该键，bot.on 会抛
+     // TypeError（profiles 增量安装可能残留旧版 SDK）——降级为跳过监听而非崩溃
+     try {
+         bot.on('disconnected', (event) => {
+-            const detail = `code=${event.code}${event.reason ? ` reason=${event.reason}` : ''}`;
++            const detail = `code=${Number.isFinite(event.code) ? event.code : 'unknown'}`;
+             if (event.willReconnect) {
+                 logger.warn(`Bot disconnected (${detail}), reconnecting...`);
+             }
+@@ -117,10 +466,10 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+         });
+     }
+     catch (err) {
+-        logger.warn(`qqbot-nodejs SDK 不支持 disconnected 事件（请升级 @tencent-connect/qqbot-nodejs 至 1.0.5+）: ${err instanceof Error ? err.message : String(err)}`);
++        logger.warn('qqbot-nodejs SDK disconnected events unavailable; version 1.0.5+ is required');
+     }
+     bot.on('ready', () => {
+-        console.log(`[im-qqbot] Bot ready! appId=${config.appId}`);
++        logger.info('Bot ready');
+     });
+     // ── 富媒体过期清理 ──
+     if (config.media.enabled) {
+@@ -130,27 +479,22 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
      ensureVisionInputModal(config.vision, logger);
      registerDescribeImageTool(ctx, config.vision, logger);
      // ── 附件发送工具注册（qqbot_send_file） ──
@@ -1032,9 +1529,11 @@ index 070f21e..cfd057c 100644
      // ── 生命周期 ──
      ctx
          .effect(() => {
-@@ -146,11 +463,12 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+-        logger.info(`Starting bot (appId=${config.appId})`);
++        logger.info('Starting QQ bot');
          bot.start().catch((err) => {
-             logger.error(`Bot start failed: ${err instanceof Error ? err.message : String(err)}`);
+-            logger.error(`Bot start failed: ${err instanceof Error ? err.message : String(err)}`);
++            logger.error('QQ Bot start failed; private exception details omitted');
          });
 -        return async () => {
 +        let stopping;
@@ -1052,10 +1551,10 @@ index 070f21e..cfd057c 100644
 \ No newline at end of file
 +//# sourceMappingURL=bootstrap.js.map
 diff --git a/dist/session/session-manager.js b/dist/session/session-manager.js
-index 5eae070..7999a59 100644
+index 5eae070..3a4790a 100644
 --- a/dist/session/session-manager.js
 +++ b/dist/session/session-manager.js
-@@ -1,536 +1,18 @@
+@@ -1,536 +1,19 @@
 -/**
 - * SessionManager — 管理 QQ peer → dsh Agent 的映射和生命周期
 - *
@@ -1589,7 +2088,8 @@ index 5eae070..7999a59 100644
 +   waitingForUser:record=>manager.hitl?.waiting(record)===true,
 +   cancelPending(record){manager.hitl?.cancel(record);},
 +   prompt:record=>record.scope==='group'?config.groupPrompt:config.directPrompt,
-+   release(record){if(record.typingKeepAlive){clearInterval(record.typingKeepAlive);record.typingKeepAlive=undefined;}manager.releaseOutput?.(record);},
++   diagnostics(event,record){ctx.get('agentIO')?.diagnostics?.scope({platform:'qq-official',adapter:'qq-official-gateway',accountId:config.appId,conversation:record.peerId?{type:record.scope==='c2c'?'direct':'group',id:record.peerId}:undefined}).emit('conversation',event,{sessionId:record.sessionId,status:record.status});},
++   release(record){if(record.typingKeepAlive){clearInterval(record.typingKeepAlive);record.typingKeepAlive=undefined;}manager.releaseOutput?.(record);try{ctx.get('agentIO')?.diagnostics?.scope({platform:'qq-official',adapter:'qq-official-gateway',accountId:config.appId,conversation:{type:record.scope==='c2c'?'direct':'group',id:record.peerId}}).emit('conversation','close',{sessionId:record.sessionId,status:'closed'});}catch{}},
 +  }});
 +  return manager;
 + }
@@ -1764,11 +2264,20 @@ index bf09220..45e8ed1 100644
          this.messages.set(messageId, { count: 1, firstSeenAt: now });
      }
 diff --git a/dist/transport/reply-target.js b/dist/transport/reply-target.js
-index 36a81a2..4970410 100644
+index 36a81a2..d23378b 100644
 --- a/dist/transport/reply-target.js
 +++ b/dist/transport/reply-target.js
-@@ -22,7 +22,10 @@ export function resolveReplyTarget(target, limiter, allowEvent) {
-     for (const c of getCachedReplyIds(target.scope, target.targetId)) {
+@@ -15,14 +15,17 @@ import { getCachedReplyIds } from "./msgid-cache.js";
+  *   （bot.send 的 extra），传 true；文件发送 SDK 暂不支持 event_id，传 false
+  *   跳过 event 候选，降级为 msg 候选或主动推送。
+  */
+-export function resolveReplyTarget(target, limiter, allowEvent) {
++export function resolveReplyTarget(target, limiter, allowEvent, cache = {getCachedReplyIds}) {
+     const candidates = [];
+     if (target.msgId)
+         candidates.push({ kind: 'msg', id: target.msgId });
+-    for (const c of getCachedReplyIds(target.scope, target.targetId)) {
++    for (const c of cache.getCachedReplyIds(target.scope, target.targetId)) {
          candidates.push(c);
      }
 +    const seen = new Set();
@@ -1778,11 +2287,18 @@ index 36a81a2..4970410 100644
          if (c.kind === 'event' && !allowEvent)
              continue;
          if (limiter.checkLimit(c.id).allowed) {
+@@ -52,4 +55,4 @@ export function sendResolvedMarkdown(bot, target, content, opts) {
+     }
+     return bot.sendMarkdown(target, content, opts);
+ }
+-//# sourceMappingURL=reply-target.js.map
+\ No newline at end of file
++//# sourceMappingURL=reply-target.js.map
 diff --git a/dist/transport/inbound.js b/dist/transport/inbound.js
-index 1006265..62963ce 100644
+index 1006265..87ac57c 100644
 --- a/dist/transport/inbound.js
 +++ b/dist/transport/inbound.js
-@@ -1,32 +1,132 @@
+@@ -1,61 +1,167 @@
 -import { createUserMessage } from '@deepseek-ai/dsh-llm';
 -import { classifyContentType, isVoiceContentType, } from "./attachment.js";
 +import { classifyContentType, } from "./attachment.js";
@@ -1876,7 +2392,7 @@ index 1006265..62963ce 100644
 +            await hold.idle;
 +        }
 +        catch (err) {
-+            logger.warn(`whenIdle rejected: ${err instanceof Error ? err.message : String(err)}`);
++            logger.warn('QQ Agent idle wait failed');
 +        }
 +    }
 +}
@@ -1920,6 +2436,7 @@ index 1006265..62963ce 100644
 -        record = await manager.getOrCreate(scope, peerId, msg.senderId, replyTarget);
 -    }
 -    catch (err) {
+-        logger.error(`ERROR creating session: ${err instanceof Error ? err.message : String(err)}`);
 +    // ── 组装 agentBody（下载结果经 mwState.downloadedFiles 提供），准入之后才组装 ──
 +    const agentBody = () => {
 +        const body = assembleAgentBody(standard.message, msg, mwState, scope);
@@ -1930,12 +2447,15 @@ index 1006265..62963ce 100644
 +    const result = await conversation.handoff(standard, { replyTarget, content: agentBody });
 +    if (result.reason === 'session-unavailable') {
 +        const err = result.error;
-         logger.error(`ERROR creating session: ${err instanceof Error ? err.message : String(err)}`);
++        logger.error('QQ Session acquisition failed; input was not handed over');
          // 兜底回复：会话创建失败时告知用户，避免静默无响应
          try {
-@@ -35,27 +135,33 @@ export async function handleInbound(ctx, manager, config, logger) {
+-            await bot.sendMarkdown(replyTarget, '⚠️ 处理消息时出现异常，请稍后重试。');
++            await conversation.reply(standard, '⚠️ 处理消息时出现异常，请稍后重试。');
+         }
          catch (sendErr) {
-             logger.error(`fallback reply failed: ${sendErr instanceof Error ? sendErr.message : String(sendErr)}`);
+-            logger.error(`fallback reply failed: ${sendErr instanceof Error ? sendErr.message : String(sendErr)}`);
++            logger.error('QQ error reply was not confirmed; no direct send fallback');
          }
 -        return;
      }
@@ -2199,7 +2719,7 @@ index cc39029..4bd9377 100644
 \ No newline at end of file
 +//# sourceMappingURL=config.js.map
 diff --git a/dist/transport/outbound.js b/dist/transport/outbound.js
-index f50e4b2..7539e60 100644
+index f50e4b2..d6fd0f7 100644
 --- a/dist/transport/outbound.js
 +++ b/dist/transport/outbound.js
 @@ -1,5 +1,3 @@
@@ -2325,7 +2845,8 @@ index f50e4b2..7539e60 100644
 -            void this.send(record, `⚠️ 本轮异常结束\n\`${failure.code}\`: ${failure.message}`, 'sendTurnEndError');
 +            void this.send(record, `⚠️ 本轮异常结束\n\`${failure.code}\`: ${failure.message}`, 'sendTurnEndError', { ...origin, kind: 'turn-error' });
          }
-         this.logger.debug(`im-qqbot: turn/end sessionId=${sessionId}`);
+-        this.logger.debug(`im-qqbot: turn/end sessionId=${sessionId}`);
++        this.logger.debug('im-qqbot: turn/end');
      }
 -    /** 统一发送：切分 + 逐 chunk 发送 + 错误记录 */
 -    async send(record, text, tag) {
@@ -2344,11 +2865,69 @@ index f50e4b2..7539e60 100644
      }
  }
  /**
+@@ -140,4 +108,4 @@ export function createOutboundHandler(manager, bot, config, logger, toolsRegistr
+     const router = new OutboundRouter(manager, bot, config, logger, toolsRegistry);
+     return (session, event) => router.route(session, event);
+ }
+-//# sourceMappingURL=outbound.js.map
+\ No newline at end of file
++//# sourceMappingURL=outbound.js.map
+diff --git a/dist/transport/msgid-cache.js b/dist/transport/msgid-cache.js
+index 8a37124..95e3ac3 100644
+--- a/dist/transport/msgid-cache.js
++++ b/dist/transport/msgid-cache.js
+@@ -3,9 +3,12 @@ const TTL_GROUP = 5 * 60 * 1000; // 群消息被动回复窗口 5 分钟
+ const TTL_C2C = 30 * 60 * 1000; // 私聊 30 分钟
+ const MAX_TARGETS = 200;
+ const EVENT_PREFIX = 'INTERACTION_CREATE:';
++// Each active Gateway owns its cache. The legacy exports below are retained
++// only for callers outside bootstrap; active accounts never share that store.
++export function createReplyIdCache() {
+ const cache = new Map();
+ function cacheKey(scope, targetId) {
+-    return `${scope}:${targetId}`;
++    return JSON.stringify([scope, targetId]);
+ }
+ function push(scope, targetId, target) {
+     if (!scope || !targetId || !target.id)
+@@ -28,19 +31,19 @@ function push(scope, targetId, target) {
+     }
+ }
+ /** 记录普通消息 msgId */
+-export function cacheMsgId(scope, targetId, msgId) {
++function cacheMsgId(scope, targetId, msgId) {
+     if (!msgId)
+         return;
+     push(scope, targetId, { kind: 'msg', id: msgId });
+ }
+ /** 记录互动事件 eventId（内部拼 INTERACTION_CREATE 前缀） */
+-export function cacheEventId(scope, targetId, eventId) {
++function cacheEventId(scope, targetId, eventId) {
+     if (!eventId)
+         return;
+     push(scope, targetId, { kind: 'event', id: `${EVENT_PREFIX}${eventId}` });
+ }
+ /** 获取所有未过期的被动回复目标（按时间倒序，最新在前） */
+-export function getCachedReplyIds(scope, targetId) {
++function getCachedReplyIds(scope, targetId) {
+     const list = cache.get(cacheKey(scope, targetId));
+     if (!list || list.length === 0)
+         return [];
+@@ -54,4 +57,7 @@ export function getCachedReplyIds(scope, targetId) {
+     }
+     return result;
+ }
+-//# sourceMappingURL=msgid-cache.js.map
+\ No newline at end of file
++return Object.freeze({cacheMsgId, cacheEventId, getCachedReplyIds, clear: () => cache.clear()});
++}
++export const {cacheMsgId, cacheEventId, getCachedReplyIds} = createReplyIdCache();
++//# sourceMappingURL=msgid-cache.js.map
 diff --git a/dist/transport/outbound-buffer.js b/dist/transport/outbound-buffer.js
-index f69cedb..6ff2378 100644
+index f69cedb..23ca7be 100644
 --- a/dist/transport/outbound-buffer.js
 +++ b/dist/transport/outbound-buffer.js
-@@ -1,50 +1,34 @@
+@@ -1,63 +1,46 @@
 -import { chunkMarkdownText } from "./chunker.js";
 -import { StreamingWriter } from "./streaming-writer.js";
 -/** 流式输出节流间隔(ms)：连续 chunk 累积后停顿该间隔才推送 */
@@ -2405,8 +2984,11 @@ index f69cedb..6ff2378 100644
 +            await this.bot.deliverText(this.record, this.buffer, 'flush', { ...origin, kind: 'assistant' });
          }
          catch (err) {
-             this.logger.error(`im-qqbot: flush failed: ${err instanceof Error ? err.message : String(err)}`);
-@@ -54,10 +38,9 @@ export class OutboundBuffer {
+-            this.logger.error(`im-qqbot: flush failed: ${err instanceof Error ? err.message : String(err)}`);
++            this.logger.error('im-qqbot: flush failed');
+         }
+         finally {
+             this.buffer = '';
              this.flushing = false;
          }
      }
@@ -2422,7 +3004,7 @@ index f69cedb..6ff2378 100644
 +//# sourceMappingURL=outbound-buffer.js.map
 diff --git a/dist/transport/qq-text-adapter.js b/dist/transport/qq-text-adapter.js
 new file mode 100644
-index 0000000..e398969
+index 0000000..7e5fa86
 --- /dev/null
 +++ b/dist/transport/qq-text-adapter.js
 @@ -0,0 +1,163 @@
@@ -2566,8 +3148,8 @@ index 0000000..e398969
 +            // A notification goes to its stable Conversation (no input to reply to):
 +            // the gateway sender reuses a cached passive reply id within quota, or
 +            // pushes proactively, exactly as the former direct notification send did.
-+            if (route.notification) {
-+                const result = await send({ scope: route.target.scope, targetId: route.target.id }, text, { index: info.index, messageId: info.messageId, notification: true });
++            if (route.notification || route.inputReply) {
++                const result = await send({ scope: route.target.scope, targetId: route.target.id, ...(route.inputReply ? { msgId: route.inputId } : {}) }, text, { index: info.index, messageId: info.messageId, notification: !!route.notification });
 +                return { receipt: typeof result?.id === 'string' ? result.id : undefined };
 +            }
 +            const record = route.record;

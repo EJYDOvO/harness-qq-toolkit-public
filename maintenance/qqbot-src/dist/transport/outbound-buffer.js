@@ -31,7 +31,7 @@ export class OutboundBuffer {
             await this.bot.deliverText(this.record, this.buffer, 'flush', { ...origin, kind: 'assistant' });
         }
         catch (err) {
-            this.logger.error(`im-qqbot: flush failed: ${err instanceof Error ? err.message : String(err)}`);
+            this.logger.error('im-qqbot: flush failed');
         }
         finally {
             this.buffer = '';
