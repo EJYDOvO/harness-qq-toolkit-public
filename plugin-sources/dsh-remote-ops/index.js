@@ -15,6 +15,7 @@ export function apply(ctx,config){
   const ownerToken={};ledgerOwners.set(outFile,ownerToken);let disposed=false,reloadRequired=false;
   const ownsLedger=()=>!disposed&&ledgerOwners.get(outFile)===ownerToken;
   const active=new Map();let busy=false;
+  const trace=(value,event,fields)=>{try{value.diagnostics?.emit('remote-ops',event,fields);}catch{}};
   const persist=(next=ledger)=>{
     if(!ownsLedger())throw Error('Remote Ops ledger owner retired');
     try{atomic(outFile,JSON.stringify(next,null,2));ledger=next;durable=true;reloadRequired=false;}
@@ -39,6 +40,7 @@ export function apply(ctx,config){
     if(ledger.deliveries[key])return;
     const enabled=remote.features().notifications.enabled;
     persist({...ledger,deliveries:{...ledger.deliveries,[key]:{status:enabled?'sending':'suppressed',at:Date.now()}}});
+    trace(value,'enqueue',{notificationId:'qqtk:'+key,status:enabled?'sending':'suppressed'});
     if(!enabled)return;
     const kind=key.startsWith('job:')?'maintenance_result':key.startsWith('timeout:')?'task_timeout':key.startsWith('complete:')?'task_completed':key.startsWith('failed:')?'task_failed':'configured_alert';
     let result;
@@ -53,6 +55,7 @@ export function apply(ctx,config){
     const entry={...ledger.deliveries[key],status:typeof result?.status==='string'?result.status:'unknown'};
     if(typeof result?.reason==='string')entry.reason=result.reason;
     persist({...ledger,deliveries:{...ledger.deliveries,[key]:entry}});
+    trace(value,'settle',{notificationId:'qqtk:'+key,status:entry.status});
   }
   async function tick(){if(busy||!runtime||!ownsLedger())return;busy=true;try{
     const f=remote.features();
@@ -69,7 +72,7 @@ export function apply(ctx,config){
       else if(elapsed>f.remoteOps.notifyAfterSeconds*1000&&!ctx.get?.('agentPresets')?.serviceFor?.(agent,'interactionPolicy'))await notify(`progress:${id}:${v.turn}`,'任务仍在执行。/ops tasks 可查看主 Agent 和子 Agent 状态。');
       if(elapsed>f.remoteOps.maxTurnSeconds*1000){await remote.stop();await notify(`timeout:${id}:${v.turn}`,'QQ 任务达到运行时限，已停止当前任务；请缩小任务后继续。');active.delete(id);}
     }
-  }catch(error){ctx.logger?.warn('Remote operations tick failed: '+error.message);}finally{busy=false;}}
+  }catch(error){ctx.logger?.warn('Remote operations tick failed; durable state retained');}finally{busy=false;}}
   // Native 0.2.1 frames are transient rather than session assistant/chunk events.
   ctx.on('agent/assistant-stream',({agent})=>{if(active.has(agent.id))active.get(agent.id).lastAt=Date.now();});
   ctx.on('session/event',(session,event)=>{
@@ -110,7 +113,7 @@ export function apply(ctx,config){
       const disconnected=e=>{if(runtime===value)saveHealth(false,e.willReconnect?'reconnecting':'permanent');};
       value.bot.on('ready',ready);value.bot.on('disconnected',disconnected);
       // Reconnect the persisted owner session so native scheduled follow-ups can reach QQ after restart.
-      void value.manager.getOrCreate('c2c',owner.openid,owner.openid,{scope:'c2c',targetId:owner.openid}).catch(e=>ctx.logger?.warn('QQ owner session restore failed: '+e.message));
+      void value.manager.getOrCreate('c2c',owner.openid,owner.openid,{scope:'c2c',targetId:owner.openid}).catch(()=>ctx.logger?.warn('QQ owner session restore failed; no new authorization granted'));
       return ()=>{if(runtime===value){runtime=undefined;active.clear();}value.bot.off?.('ready',ready);value.bot.off?.('disconnected',disconnected);};
     }
   };

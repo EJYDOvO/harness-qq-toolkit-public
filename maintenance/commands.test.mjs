@@ -10,9 +10,10 @@ import {createConversations} from '../plugin-sources/dsh-agent-io/conversation.m
 import {createCommandRouter} from '../plugin-sources/dsh-agent-io/commands.mjs';
 
 const manager=()=>({getOrCreate:async()=>{throw Error('unused');},getSessionRecord:()=>undefined,isCurrentSession:()=>false});
-function wiring({io=createAgentIO(),accountId='acct',admits=()=>true,inbound=true}={}){
+function wiring({io=createAgentIO(),accountId='acct',admits=()=>true,inbound=true,replies=[],sendError=false}={}){
  const delivered=[];
  const c=createConversations(io,{createInput:m=>m,interactionPolicy:()=>undefined})({platform:'synthetic',adapter:'synthetic-adapter',accountId,manager:manager(),scopes:{direct:'dm',group:'room'},admits});
+ c.registerAdapter({split:t=>[t],async send(_route,t){if(sendError)throw Error('network');replies.push(t);}});
  const channel=inbound?c.openInbound(s=>{delivered.push(s);return {status:'accepted'};}):undefined;
  return {io,c,channel,delivered,router:c.openCommands({prefixes:['/']})};
 }
@@ -65,7 +66,7 @@ test('admission comes from the wiring: a Conversation the platform no longer adm
  assert.equal(delivered.length,0);void channel;
 });
 test('authorization belongs to the command: refusals reply, never execute, and cannot be granted by the input',async()=>{
- const replies=[],{router}=wiring(),run=[];
+ const replies=[],{router}=wiring({replies}),run=[];
  const reply=t=>{replies.push(t);};
  router.register({name:'ops',authorize:call=>call.sender.id==='owner'||'仅部署所有者可执行运维命令。',execute:call=>{run.push(call.sender.id);return 'ok';}});
  router.register({name:'deny',authorize:()=>false,execute:()=>run.push('deny')});
@@ -77,7 +78,7 @@ test('authorization belongs to the command: refusals reply, never execute, and c
  assert.equal((await router.dispatch(input('/ops status',{id:'o1',sender:'owner',peer:'owner'}),{reply})).status,'handled');assert.deepEqual(run,['owner']);
 });
 test('scope restriction, results and failures map to replies; the call is frozen and carries no platform data',async()=>{
- const replies=[],{router}=wiring(),seen=[];const reply=t=>{replies.push(t);};
+ const replies=[],{router}=wiring({replies}),seen=[];const reply=t=>{replies.push(t);};
  router.register({name:'dm-only',scopes:['direct'],execute:()=>'私聊'});
  router.register({name:'noop',execute:call=>{seen.push(call);return {kind:'noop'};}});
  router.register({name:'obj',execute:()=>({kind:'text',content:'对象结果'})});
@@ -91,8 +92,8 @@ test('scope restriction, results and failures map to replies; the call is frozen
  assert.deepEqual(Object.keys(call).sort(),['args','context','conversation','message','name','raw','sender']);assert.deepEqual(call.context,{opaque:1});
 });
 test('a failed reply is reported once and the command is not executed again',async()=>{
- const {router}=wiring(),{runs,spec}=counter();router.register(spec);
- const r=await router.dispatch(input('/ping'),{reply:async()=>{throw Error('network');}});
+ const {router}=wiring({sendError:true}),{runs,spec}=counter();router.register(spec);
+ const r=await router.dispatch(input('/ping'));
  assert.deepEqual([r.status,r.replied],['handled',false]);
  assert.equal((await router.dispatch(input('/ping'),{reply:async()=>{}})).status,'duplicate');assert.equal(runs.length,1);
 });

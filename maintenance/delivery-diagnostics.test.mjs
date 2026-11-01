@@ -7,6 +7,13 @@ import {resolve} from 'node:path';
 import {homedir} from 'node:os';
 import vm from 'node:vm';
 const source=readFileSync(new URL('./qqbot-src/dist/gateway/bootstrap.js',import.meta.url),'utf8');
+test('SDK dynamic log text never reaches the Host logger',()=>{
+ const begin=source.indexOf('export function privateSDKLogger'),end=source.indexOf('// Opt-in bounded',begin);
+ const make=vm.runInNewContext(source.slice(begin,end).replace('export function','function')+';privateSDKLogger;');
+ const rows=[],logger=Object.fromEntries(['debug','info','warn','error'].map(level=>[level,text=>rows.push([level,text])]));const sdk=make(logger);
+ for(const level of ['debug','info','warn','error'])sdk[level]('PRIVATE_OPENID_TOKEN_BODY');sdk.info('[qqbot] gateway RESUMED');
+ assert(!JSON.stringify(rows).includes('PRIVATE_'));assert(rows.some(([,text])=>text==='QQ transport resumed'));assert.equal(rows.length,3);
+});
 const start=source.indexOf('export function createDeliveryRecorder'),end=source.indexOf('/**',start);
 const create=vm.runInNewContext(source.slice(start,end).replace('export function','function')+';createDeliveryRecorder;',{
  diagnosticFs:fs,diagnosticPath:resolve,diagnosticHome:homedir,createHmac,randomBytes,randomUUID,setTimeout,clearTimeout,process,
@@ -48,7 +55,7 @@ test('a failed proactive send is traced with its bubble fields and still rejects
  const traces=[],diagnostics={hash:v=>v===undefined?undefined:'a'.repeat(24),trace:(e,f)=>traces.push([e,f])};
  const failure=Object.assign(new Error('rejected'),{httpStatus:403,bizCode:22009});
  const sender=vm.runInNewContext('(function(){'+source.slice(begin,stop)+';return sender;})()',{
-  diagnostics,replyLimiter:{},resolveReplyTarget:t=>({...t,msgId:undefined}),
+  diagnostics,replyLimiter:{},replyIds:{},resolveReplyTarget:t=>({...t,msgId:undefined}),
   sendResolvedMarkdown:async()=>{throw failure;},bot:{},
  });
  assert.equal(sender.openStream,undefined,'the gateway sender offers no SDK stream');

@@ -8,7 +8,7 @@ import { handleInbound, createOutboundHandler, chunkMarkdownText } from "../tran
 import { QQ_OFFICIAL, QQ_SCOPES, accessAllows, createQQTextAdapter, hitlResponse } from "../transport/qq-text-adapter.js";
 import { deliverInbound } from "../transport/inbound.js";
 import { ReplyLimiter } from "../transport/reply-limiter.js";
-import { cacheMsgId, cacheEventId } from "../transport/msgid-cache.js";
+import { createReplyIdCache } from "../transport/msgid-cache.js";
 import { resolveReplyTarget, sendResolvedMarkdown } from "../transport/reply-target.js";
 import { buildApprovalText } from "../features/approval-renderer.js";
 import { formatQuestion } from "../features/question-renderer.js";
@@ -19,9 +19,15 @@ import { ensureVisionInputModal, registerDescribeImageTool } from "../media/visi
 import { registerSendFileTool, verifyLocalFile } from "../media/send-file-tool.js";
 // Shared across duplicate module copies in the same Host process.
 const gatewayLeases = globalThis[Symbol.for('dsh.qqGateway.leases.v1')] ??= new Map();
+// The SDK logs dynamic peer keys and exception messages. Keep its protocol
+// observations, but never forward arbitrary strings to Host logs.
+export function privateSDKLogger(logger) {
+    const write=(level,text)=>{try{logger?.[level]?.(text);}catch{}};
+    return Object.freeze({debug(){},info(text){if(text==='[qqbot] gateway RESUMED')write('info','QQ transport resumed');},warn(){write('warn','QQ SDK warning');},error(){write('error','QQ SDK error; private details omitted');}});
+}
 // Opt-in bounded local diagnostics. HMAC keys live only in this Gateway instance;
 // neither source text, raw identifiers, errors nor credentials enter this file.
-export function createDeliveryRecorder(enabled, logger, directory) {
+export function createDeliveryRecorder(enabled, logger, directory, hub, context) {
     if(!enabled)return null;
     const home=process.env.DSH_HOME?.trim();
     const dir=directory??(home?diagnosticPath(home,'qqbot','diagnostics'):diagnosticPath(diagnosticHome(),'.dsh-qqbot','diagnostics'));
@@ -53,7 +59,13 @@ export function createDeliveryRecorder(enabled, logger, directory) {
         pending.push(JSON.stringify(row)+'\n');
         if(!timer){timer=setTimeout(flush,100);timer.unref?.();}
     };
-    return {hash,trace,flush,async close(){closed=true;await flush();}};
+    const account=hub?.scope(context).hash(context?.accountId);
+    const unsubscribe=hub?.subscribe(row=>{
+        if(!closed&&pending.length<512&&row.account===account&&row.platform===context?.platform&&row.adapter===context?.adapter){
+            pending.push(JSON.stringify(row)+'\n');if(!timer){timer=setTimeout(flush,100);timer.unref?.();}
+        }
+    });
+    return {hash,trace,flush,async close(){closed=true;unsubscribe?.();await flush();}};
 }
 /**
  * QQ side of the Agent I/O HITL Bridge: the QQ Markdown of approvals, questions
@@ -211,7 +223,8 @@ export function createInteractionOutbound(ctx, manager, sender, config, logger, 
         const signals=[lease.signal,signal].filter(s=>s instanceof AbortSignal);
         const own=typeof input==='string'?record.interactionTargets?.get(input):undefined;
         const mine=id!==undefined&&!deliveries.has(id);if(mine)deliveries.set(id,{target:own&&{...own},input:typeof input==='string'?input:undefined,delivery});
-        try{return await io.sendMessage({...(id?{id}:{}),target:conversation.target(record),origin:{sessionId:record.sessionId},message:typeof text==='string'?{text}:text,...(signals.length?{signal:signals.length>1?AbortSignal.any(signals):signals[0]}:{})});}
+        conversation.diagnostics?.emit('interaction','queued',{sessionId:record.sessionId,conversation:conversation.target(record)?.conversation,inputId:input,logicalId:id,turn,reply:delivery?.reply,bubble:delivery?.bubble,kind:delivery?.kind,status:'pending'});
+        try{return await io.sendMessage({...(id?{id}:{}),target:conversation.target(record),origin:{sessionId:record.sessionId,...(Number.isSafeInteger(turn)?{turn}:{})},message:typeof text==='string'?{text}:text,...(signals.length?{signal:signals.length>1?AbortSignal.any(signals):signals[0]}:{})});}
         finally{lease.release();if(mine)deliveries.delete(id);}
     }
     manager.submitOutput=submit;
@@ -246,11 +259,15 @@ export function createInteractionOutbound(ctx, manager, sender, config, logger, 
     const outboundHandler = (session, event) => {
         observeTurn(session.header.id, event);
         const record = manager.findBySessionId(session.header.id);
+        if(record&&['turn/start','turn/end'].includes(event.type))conversation.diagnostics?.emit('conversation','state',{sessionId:session.header.id,conversation:conversation.target(record)?.conversation,turn:event.data?.turn,status:event.type==='turn/start'?'running':'idle'});
         const policy = policyFor(record);
         if(policy===null)return;
         if (policy) {
             const scope={session:diagnostics?.hash(session.header.id)};
-            const trace=(event,fields)=>diagnostics?.trace(event,{...scope,...fields,...(fields.attempt===undefined?{}:{attempt:diagnostics?.hash(fields.attempt)})});
+            const trace=(event,fields)=>{
+                diagnostics?.trace(event,{...scope,...fields,...(fields.attempt===undefined?{}:{attempt:diagnostics?.hash(fields.attempt)})});
+                conversation.diagnostics?.emit('interaction','state',{sessionId:session.header.id,conversation:conversation.target(record)?.conversation,...fields});
+            };
             if(event.type==='user/message'){
                 const message=event.data?.message??event.data,source=message?.source;
                 // Native projections are context within the admitted turn, not
@@ -293,11 +310,11 @@ const MEDIA_TYPES = { image: 'IMAGE', video: 'VIDEO', voice: 'VOICE', file: 'FIL
  * (the SDK retries uploads; an upload alone is invisible to the user), then the
  * media message is sent. Passive-reply quota as for files before (no event_id).
  */
-export async function sendMedia(bot, replyLimiter, config, target, attachment) {
+export async function sendMedia(bot, replyLimiter, config, target, attachment, replyIds) {
     let file;
     try { file = await verifyLocalFile(attachment?.resource?.path, config.sendFile, config.cwd || process.cwd(), { expectReal: true }); }
     catch (error) { throw Object.assign(new Error('QQ media resource refused'), { qqStage: 'resource', reason: error?.reason }); }
-    const resolved = resolveReplyTarget(target, replyLimiter, false);
+    const resolved = resolveReplyTarget(target, replyLimiter, false, replyIds);
     const fileType = MediaFileType[MEDIA_TYPES[attachment.kind]];
     if (typeof bot.uploadMedia !== 'function' || typeof bot.mediaApi?.sendMediaMessage !== 'function') {
         // An SDK without the two public stages: one combined call, classified as a message request.
@@ -313,7 +330,7 @@ export async function sendMedia(bot, replyLimiter, config, target, attachment) {
     }
     catch (error) { throw Object.assign(new Error('QQ media message failed'), { qqStage: 'message', cause: error }); }
 }
-export async function bootstrapGateway(ctx, agents, config, logger) {
+export async function bootstrapGateway(ctx, agents, config, logger, options) {
     if (gatewayLeases.has(config.appId)) throw new Error('Duplicate QQ Gateway for this application');
     const lease = {};
     gatewayLeases.set(config.appId, lease);
@@ -329,12 +346,13 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
     // and the outbound text adapter. The access configuration admits both ways.
     const conversation = io.openConversation({ platform: QQ_OFFICIAL, adapter: 'qq-official-gateway', accountId: config.appId, manager, scopes: QQ_SCOPES,
         admits: (scope, peer) => accessAllows(config.access, scope, peer),
-        onInput: (record, message, policy) => { if (policy) manager.trackInteractionInput?.(record, message); } });
+        onInput: (record, message, policy, input) => { manager.admitInput?.(record, input); if (policy) manager.trackInteractionInput?.(record, message); } });
     ctx.effect(() => conversation.close);
     if (typeof conversation.openCommands !== 'function') throw new Error('dsh-agent-io 0.1.0-test.5 or later (commands and attachments) is required before QQ');
     if (typeof conversation.openHITL !== 'function') throw new Error('dsh-agent-io 0.1.0-test.6 or later (HITL Bridge) is required before QQ');
+    if (typeof conversation.reply !== 'function') throw new Error('dsh-agent-io 0.1.0-test.8 or later (scoped input replies) is required before QQ');
     if (config.notifications?.enabled !== false && typeof conversation.openNotifications !== 'function') throw new Error('dsh-agent-io 0.1.0-test.7 or later (notifications) is required before QQ');
-    const deliveryRecorder=createDeliveryRecorder(config.deliveryDiagnostics,logger);
+    const deliveryRecorder=createDeliveryRecorder(config.deliveryDiagnostics,logger,undefined,io.diagnostics,{platform:QQ_OFFICIAL,adapter:'qq-official-gateway',accountId:config.appId});
     ctx.effect(()=>()=>deliveryRecorder?.close());
     // ── 初始化 QQ Bot SDK ──
     const userAgent = buildUserAgent();
@@ -345,20 +363,22 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
         baseUrl: process.env.QQBOT_BASE_URL?.replace(/\/+$/, '') || 'https://api.bot.qq.com',
         tokenBaseUrl: process.env.QQBOT_TOKEN_BASE_URL?.replace(/\/+$/, '') || 'https://api.bot.qq.com',
         userAgent,
-        logger,
+        logger: privateSDKLogger(logger),
     });
     logger.info(`QQBot SDK initialized (UA: ${userAgent})`);
     // ── 中间件链 ──
-    setupMiddlewares(bot, config, manager, logger, conversation);
+    const replyIds = createReplyIdCache();
+    ctx.effect(() => () => replyIds.clear());
+    setupMiddlewares(bot, config, manager, logger, conversation, replyIds);
     // ── 入站：经过中间件链后的普通聊天消息 → Unified Agent I/O 入站通道（去重）→ 可信会话入口 → 共享交接 → dsh agent ──
     const inbound = conversation.openInbound(standard => deliverInbound(standard, conversation, config, logger));
     ctx.effect(() => inbound.close);
     bot.on('message', async (mCtx) => {
         const msg = mCtx.message;
         // 记录最近 msgId，供无上下文的出站发送（文件发送显式 target、主动推送等）获取被动回复目标
-        cacheMsgId(mCtx.replyTarget.scope, mCtx.replyTarget.targetId, mCtx.replyTarget.msgId);
+        replyIds.cacheMsgId(mCtx.replyTarget.scope, mCtx.replyTarget.targetId, mCtx.replyTarget.msgId);
         if (config.debug) {
-            logger.debug(`← message (post-middleware): ${JSON.stringify(msg, null, 2).slice(0, 500)}`);
+            logger.debug('Inbound QQ message accepted by middleware');
         }
         await handleInbound(mCtx, logger, inbound);
     });
@@ -377,7 +397,7 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
     const diagnostics=typeof deliveryRecorder==='undefined'?null:deliveryRecorder;
     const sender = {
         sendMarkdown: async (target, content, opts) => {
-            const resolved=resolveReplyTarget(target, replyLimiter, true),meta=opts?.delivery??{},fields={...meta,input:diagnostics?.hash(resolved.msgId??resolved.eventId),length:content.length,textHash:diagnostics?.hash(content),passive:!!(resolved.msgId||resolved.eventId)};
+            const resolved=resolveReplyTarget(target, replyLimiter, true, replyIds),meta=opts?.delivery??{},fields={...meta,input:diagnostics?.hash(resolved.msgId??resolved.eventId),length:content.length,textHash:diagnostics?.hash(content),passive:!!(resolved.msgId||resolved.eventId)};
             diagnostics?.trace('static-request',fields);
             try{const result=await sendResolvedMarkdown(bot,resolved,content,opts);diagnostics?.trace('static-receipt',{...fields,receipt:diagnostics?.hash(result?.id),missingReceipt:!result?.id});return result;}
             catch(error){diagnostics?.trace('static-failure',{...fields,httpStatus:error?.httpStatus,bizCode:error?.bizCode});throw error;}
@@ -394,7 +414,7 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
         split: text => chunkMarkdownText(text, config.textChunkLimit ?? 4500),
         replyTarget: (_record, messageId) => outboundHandler.delivery(messageId)?.target,
         send: (target, text, info) => sender.sendMarkdown(target, text, { delivery: { ...outboundHandler.delivery(info.messageId)?.delivery, session: diagnostics?.hash(info.sessionId), index: info.index }, ...(info.keyboard ? { keyboard: info.keyboard } : {}) }),
-        sendMedia: (target, attachment) => sendMedia(bot, replyLimiter, config, target, attachment),
+        sendMedia: (target, attachment) => sendMedia(bot, replyLimiter, config, target, attachment, replyIds),
     }));
     ctx.effect(() => releaseTextAdapter);
     ctx
@@ -409,7 +429,13 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
     const notifications = config.notifications?.enabled === false ? undefined : conversation.openNotifications();
     if (notifications) ctx.effect(() => () => notifications.close());
     // Remote Ops is an optional extension. Core messaging and approval own no ops dependency.
-    const releaseRemoteOps = ctx.get('qqRemoteOps')?.attach({ bot, manager, sender, config, ...(notifications ? { notifications } : {}) });
+    const runtime = { platform: QQ_OFFICIAL, adapter: 'qq-official-gateway', accountId: config.appId, diagnostics: conversation.diagnostics, bot, manager, sender, config, ...(notifications ? { notifications } : {}) };
+    // Optional Host lifecycle hook; ordinary QQ has no Character/Remote Ops prerequisite.
+    const integration = options?.qqGatewayLifecycle;
+    if (integration && (integration.contractVersion !== 1 || typeof integration.attach !== 'function')) throw Error('Unsupported QQ Gateway lifecycle contract');
+    const attached = integration?.attach(runtime);
+    if (attached?.close) ctx.effect(() => attached.close);
+    const releaseRemoteOps = ctx.get('qqRemoteOps')?.attach({ ...runtime, ...(attached?.notifyEvent ? { notifyEvent: attached.notifyEvent } : {}) });
     if (typeof releaseRemoteOps === 'function') ctx.effect(() => releaseRemoteOps);
     // ── 按钮点击回调（interaction）：HITL 按钮交给 Bridge 校验与结算 ──
     bot.on('interaction', async (_iCtx, event) => {
@@ -417,20 +443,20 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
         const scope = event.scene === 'group' ? 'group' : 'c2c';
         const targetId = scope === 'group' ? (event.group_openid ?? event.user_openid) : event.user_openid;
         // 记录互动事件 id，作为后续被动回复候选（event_id）
-        cacheEventId(scope, targetId, event.id);
+        replyIds.cacheEventId(scope, targetId, event.id);
         const response = hitlResponse(event);
         const matched = !!response && manager.hitl?.respond(response).status === 'accepted';
         await bot.acknowledgeInteraction(event.id, matched ? 0 : 3).catch(() => { });
     });
     bot.on('error', (err) => {
-        logger.error(`bot error: ${err instanceof Error ? err.message : String(err)}`);
+        logger.error('QQ SDK error; private exception details omitted');
     });
     // 掉线可观测：willReconnect=false 表示不会再重连（随后 bot.start() 的 Promise 会失败）。
     // disconnected 事件为 SDK 1.0.5+ 新增：旧版 handlers 表缺该键，bot.on 会抛
     // TypeError（profiles 增量安装可能残留旧版 SDK）——降级为跳过监听而非崩溃
     try {
         bot.on('disconnected', (event) => {
-            const detail = `code=${event.code}${event.reason ? ` reason=${event.reason}` : ''}`;
+            const detail = `code=${Number.isFinite(event.code) ? event.code : 'unknown'}`;
             if (event.willReconnect) {
                 logger.warn(`Bot disconnected (${detail}), reconnecting...`);
             }
@@ -440,10 +466,10 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
         });
     }
     catch (err) {
-        logger.warn(`qqbot-nodejs SDK 不支持 disconnected 事件（请升级 @tencent-connect/qqbot-nodejs 至 1.0.5+）: ${err instanceof Error ? err.message : String(err)}`);
+        logger.warn('qqbot-nodejs SDK disconnected events unavailable; version 1.0.5+ is required');
     }
     bot.on('ready', () => {
-        console.log(`[im-qqbot] Bot ready! appId=${config.appId}`);
+        logger.info('Bot ready');
     });
     // ── 富媒体过期清理 ──
     if (config.media.enabled) {
@@ -459,9 +485,9 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
     // ── 生命周期 ──
     ctx
         .effect(() => {
-        logger.info(`Starting bot (appId=${config.appId})`);
+        logger.info('Starting QQ bot');
         bot.start().catch((err) => {
-            logger.error(`Bot start failed: ${err instanceof Error ? err.message : String(err)}`);
+            logger.error('QQ Bot start failed; private exception details omitted');
         });
         let stopping;
         shutdown = () => stopping ??= (async () => {

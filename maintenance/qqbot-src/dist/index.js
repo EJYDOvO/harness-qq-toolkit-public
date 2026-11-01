@@ -4,11 +4,12 @@ import { getProfileDir, resolveEnv } from "./shared/index.js";
 import { ensureCredentials, persistCredentialsToProfile, registerBoundCredentialRoutes } from "./setup/index.js";
 // ── Cordis 插件元数据 ──
 export const name = 'im-qqbot';
+export const gatewayLifecycleContractVersion = 1;
 // Harness 0.2 uses a service-name map/array, not upstream Cordis required/optional metadata.
 export const inject = ['agents', 'conversationManager', 'agentIO'];
 export const Config = ConfigSchema;
 // ── 插件主体 ──
-export async function apply(ctx, config) {
+export async function apply(ctx, config, integration) {
     const agents = ctx.agents;
     const logger = ctx.logger ?? console;
     let appId = resolveEnv(config.appId, 'QQBOT_APPID');
@@ -43,13 +44,13 @@ export async function apply(ctx, config) {
                 ...config,
                 appId: credentials.appId,
                 appSecret: credentials.appSecret,
-            }, logger).catch((err) => {
-                logger.error(`网关启动失败: ${err instanceof Error ? err.message : String(err)}`);
+            }, logger, integration).catch((err) => {
+                logger.error('QQ Gateway startup failed; private exception details omitted');
             });
         })
             .catch((err) => {
             // 全兜：unhandled rejection 会被宿主 fail-loud 判致命
-            logger.error(`扫码绑定流程异常: ${err instanceof Error ? err.message : String(err)}`);
+            logger.error('QQ credential setup failed; private exception details omitted');
         });
         // apply 立即完成，插件 fiber 进入 ACTIVE，Host ready 不再被阻塞
         return;
@@ -57,6 +58,6 @@ export async function apply(ctx, config) {
     // 已绑定：注册常驻路由（状态回显 + 手动编辑/更换凭据 + 配置编辑）
     registerBoundCredentialRoutes(ctx, logger, appId, { ...config });
     const resolvedConfig = { ...config, appId, appSecret };
-    await bootstrapGateway(ctx, agents, resolvedConfig, logger);
+    await bootstrapGateway(ctx, agents, resolvedConfig, logger, integration);
 }
 //# sourceMappingURL=index.js.map

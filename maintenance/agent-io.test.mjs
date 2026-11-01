@@ -36,7 +36,7 @@ test('a text message reaches the adapter once and multi-part sends stay one logi
 test('the core is platform-neutral: no SDK, Character or Interaction import',()=>{
  // Only the Host message constructor joins the plugin entry; the core and the
  // Conversation wiring import nothing beyond node:crypto.
- for(const [file,allowed] of [['io.mjs',['node:crypto']],['conversation.mjs',['./commands.mjs','./hitl.mjs']],['commands.mjs',[]],['hitl.mjs',['node:crypto']],['index.mjs',['@deepseek-ai/dsh-llm','./io.mjs','./conversation.mjs','./commands.mjs','./hitl.mjs']]]){
+ for(const [file,allowed] of [['io.mjs',['node:crypto','./diagnostics.mjs']],['conversation.mjs',['./commands.mjs','./hitl.mjs','node:crypto']],['commands.mjs',[]],['hitl.mjs',['node:crypto']],['index.mjs',['@deepseek-ai/dsh-llm','./io.mjs','./conversation.mjs','./commands.mjs','./hitl.mjs']]]){
   const imports=[...fs.readFileSync(new URL('../plugin-sources/dsh-agent-io/'+file,import.meta.url),'utf8').matchAll(/^import .* from '([^']+)'/gm)].map(m=>m[1]);
   assert(imports.every(i=>allowed.includes(i)),file+': '+imports);
  }
@@ -196,7 +196,7 @@ test('send events carry only enums and counts, never text, ids or targets',async
 });
 test('the Host plugin provides one frozen agentIO service and closes it with the context',async()=>{
  let service,cleanup;plugin.apply({provide:(name,value)=>{assert.equal(name,'agentIO');service=value;},effect:f=>{cleanup=f();},logger:{debug(){}}},{maxConcurrent:1});
- assert(Object.isFrozen(service));assert.deepEqual(Object.keys(service).sort(),['openConversation','openInbound','registerAdapter','sendMessage']);
+ assert(Object.isFrozen(service));assert.deepEqual(Object.keys(service).sort(),['diagnostics','openConversation','openInbound','registerAdapter','sendMessage']);
  const f=fakeAdapter();f.routes.set('peer','s1');service.registerAdapter(f.adapter);assert.equal((await service.sendMessage(msg())).status,'sent');
  await cleanup();assert.equal((await service.sendMessage(msg())).reason,'closed');
  assert.deepEqual(plugin.inject,[]);assert.equal(plugin.name,'agent-io');
@@ -232,7 +232,7 @@ test('inbound dedup is scoped by platform, account and Conversation',async()=>{
  assert.equal((await a.receive({...inboundMsg('same'),conversation:{type:'direct',id:'peer-2'},sender:{id:'peer-2'}})).status,'accepted');
  assert.equal((await a.receive({...inboundMsg('same'),conversation:{type:'group',id:'peer'}})).status,'accepted','a group with the same id is another Conversation');
  assert.equal(seen.length,5);
- assert.throws(()=>io.openInbound({platform:'fake',adapter:'g2',accountId:'app-a',deliver}),/already open/,'one channel per platform account');
+ assert.throws(()=>io.openInbound({platform:'fake',adapter:'g',accountId:'app-a',deliver}),/already open/,'one channel per full platform/adapter/account');
 });
 test('entry outcomes: rejection and unknown failures are final, a proven non-handoff may be re-delivered',async()=>{
  const outcomes=[];const {channel}=inboundSetup({},async()=>{const o=outcomes.shift();if(o instanceof Error)throw o;return o;});

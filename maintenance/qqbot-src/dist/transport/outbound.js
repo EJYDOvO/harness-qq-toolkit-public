@@ -91,7 +91,7 @@ class OutboundRouter {
         if (failure !== undefined && !SILENT_TURN_ERROR_CODES.has(failure.code)) {
             void this.send(record, `⚠️ 本轮异常结束\n\`${failure.code}\`: ${failure.message}`, 'sendTurnEndError', { ...origin, kind: 'turn-error' });
         }
-        this.logger.debug(`im-qqbot: turn/end sessionId=${sessionId}`);
+        this.logger.debug('im-qqbot: turn/end');
     }
     /** 统一发送：整条逻辑消息连同原生事件身份（seq/turn/kind）交给 gateway 注入的 deliverText（Unified Agent I/O）；分片、限额与错误分类在 QQ 文本 Adapter */
     send(record, text, tag, origin) {

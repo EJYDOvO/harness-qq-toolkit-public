@@ -12,6 +12,7 @@
 // existing (scope, peer) keys, so stored Session keys do not change.
 import {createCommandRouter} from './commands.mjs';
 import {createHITLBridge} from './hitl.mjs';
+import {createHash} from 'node:crypto';
 
 const TYPES=['direct','group'];
 const text=value=>typeof value==='string'&&value.length>0&&value.length<=256;
@@ -20,6 +21,7 @@ const CODE=/^[a-z][a-z-]{0,39}$/;
 // host: {createInput(spec) → native UserMessage, interactionPolicy(agent) → policy|undefined,
 //        hitl?: {register(bridge) → unregister}: the one install of the native HITL listeners}
 export function createConversations(io,host){
+ const clock=host.now??(()=>performance.now());
  return function openConversation(options){
   const {platform,adapter,accountId,manager,admits}=options??{};
   if(!text(platform)||!text(adapter)||!text(accountId))throw Error('Conversation requires platform, adapter and accountId');
@@ -39,6 +41,9 @@ export function createConversations(io,host){
   // Notification grants issued by this wiring's notifiers (openNotifications);
   // an origin carrying anything else is not a notification.
   const grants=new WeakSet();
+  const inputReplies=new WeakMap();
+  const diagnostics=io.diagnostics?.scope({platform,adapter,accountId});
+  const rememberInput=input=>{inputReplies.set(input,{at:clock(),conversation:Object.freeze({...input.conversation}),messageId:input.message?.id});return input;};
 
   const allowed=(scope,peer)=>{try{return admits(scope,peer)===true;}catch{return false;}};
   // undefined: no Interaction for this Agent. null: the lookup failed; callers
@@ -53,14 +58,14 @@ export function createConversations(io,host){
   function target(record){
    const type=types.get(record?.scope);
    if(!type||!text(record.peerId))return undefined;
-   return Object.freeze({platform,accountId,conversation:Object.freeze({type,id:record.peerId})});
+   return Object.freeze({platform,adapter,accountId,conversation:Object.freeze({type,id:record.peerId})});
   }
 
   // Native input for a current record. Interaction, when enabled for the Agent,
   // receives input during a run (and explicit revisions); otherwise followup.
   // Ownership and admission are read here, after every await of the caller, so
   // access revoked while a Session was obtained creates no input.
-  function submit(record,content,{revise=false}={}){
+  function submit(record,content,{revise=false,input}={}){
    if(!current(record))return {status:'not-delivered',reason:'session-changed'};
    if(!types.has(record.scope)||!allowed(record.scope,record.peerId))return {status:'rejected',reason:'unauthorized'};
    if(typeof content!=='string'||!content)return {status:'rejected',reason:'empty-message'};
@@ -70,7 +75,8 @@ export function createConversations(io,host){
    if(p===null)return {status:'not-delivered',reason:'interaction-unavailable'};
    if(revise&&typeof p?.revise!=='function')return {status:'not-delivered',reason:'no-interaction'};
    const message=host.createInput({content:[{type:'text',text:content}],source:{kind:'user'}});
-   onInput?.(record,message,p||undefined);
+   onInput?.(record,message,p||undefined,input);
+   diagnostics?.emit('conversation','input',{sessionId:record.sessionId,conversation:target(record)?.conversation,inputId:input?.message?.id,status:'accepted'});
    if(p)p.admitInput?.(message);
    let mode;
    if(revise){p.revise(message);mode='revise';}
@@ -88,7 +94,7 @@ export function createConversations(io,host){
    */
   async function handoff(standard,{replyTarget,content}={}){
    if(closed)return {status:'rejected',reason:'closed'};
-   if(standard?.platform!==platform||standard.accountId!==accountId)return {status:'rejected',reason:'invalid-target'};
+   if(standard?.platform!==platform||standard.adapter!==adapter||standard.accountId!==accountId)return {status:'rejected',reason:'invalid-target'};
    const scope=scopes.get(standard.conversation?.type),peer=standard.conversation?.id;
    if(!scope||!text(peer))return {status:'rejected',reason:'invalid-target'};
    if(!text(standard.sender?.id))return {status:'rejected',reason:'unauthorized'};
@@ -105,7 +111,8 @@ export function createConversations(io,host){
    // a Session that is no longer current, nor to a record of another Conversation;
    // submit() re-reads admission.
    if(record?.scope!==scope||record.peerId!==peer)return {status:'not-delivered',reason:'session-changed'};
-   return submit(record,body);
+   diagnostics?.emit('conversation','route',{sessionId:record.sessionId,conversation:standard.conversation,inputId:standard.message?.id,status:'active'});
+   return submit(record,body,{input:standard});
   }
 
   /**
@@ -115,7 +122,7 @@ export function createConversations(io,host){
    * compared; nothing trusts model ids or platformData.
    */
   function route(to,origin){
-   if(to?.platform!==platform||to.accountId!==accountId)return {ok:false,reason:'invalid-target'};
+   if(to?.platform!==platform||to.adapter!==adapter||to.accountId!==accountId)return {ok:false,reason:'invalid-target'};
    const scope=scopes.get(to.conversation?.type),peer=to.conversation?.id;
    if(!scope||!text(peer))return {ok:false,reason:'invalid-target'};
    if(!text(origin?.sessionId))return {ok:false,reason:'unauthorized'};
@@ -134,14 +141,14 @@ export function createConversations(io,host){
    * Chat and HITL replies never take this path.
    */
   function notificationRoute(to,grant){
-   if(to?.platform!==platform||to.accountId!==accountId)return {ok:false,reason:'invalid-target'};
+   if(to?.platform!==platform||to.adapter!==adapter||to.accountId!==accountId)return {ok:false,reason:'invalid-target'};
    const scope=scopes.get(to.conversation?.type),peer=to.conversation?.id;
    if(!scope||!text(peer))return {ok:false,reason:'invalid-target'};
    if(closed||grant.closed())return {ok:false,reason:'closed'};
    if(!allowed(scope,peer))return {ok:false,reason:'unauthorized'};
    let granted=false;try{granted=grant.authorize(Object.freeze({type:to.conversation.type,id:peer}))===true;}catch{granted=false;}
    if(!granted)return {ok:false,reason:'unauthorized'};
-   return {ok:true,route:Object.freeze({notification:true,target:Object.freeze({type:to.conversation.type,id:peer,scope})})};
+   return {ok:true,route:Object.freeze({...(grant.reply?{inputReply:true,inputId:grant.messageId}:{notification:true}),target:Object.freeze({type:to.conversation.type,id:peer,scope})})};
   }
 
   /**
@@ -160,7 +167,7 @@ export function createConversations(io,host){
    function send({id,conversation,text:body,authorize,signal}={}){
     if(typeof id!=='string'||!id||typeof authorize!=='function')return Promise.resolve(Object.freeze({id,status:'not-sent',reason:'invalid-message',stage:'before-platform',parts:Object.freeze([])}));
     const grant=Object.freeze({authorize,closed:()=>stopped});grants.add(grant);
-    return io.sendMessage({id,target:{platform,accountId,conversation:{type:conversation?.type,id:conversation?.id}},origin:{notification:grant},message:{text:body},...(signal?{signal}:{})});
+    return io.sendMessage({id,target:{platform,adapter,accountId,conversation:{type:conversation?.type,id:conversation?.id}},origin:{notification:grant},message:{text:body},...(signal?{signal}:{})});
    }
    return Object.freeze({send,close(){stopped=true;}});
   }
@@ -169,7 +176,7 @@ export function createConversations(io,host){
   function openInbound(deliver){
    if(closed)throw Error('Conversation closed');
    if(inbound)throw Error('Inbound already open for this Conversation wiring');
-   const channel=io.openInbound({platform,adapter,accountId,deliver});
+   const channel=io.openInbound({platform,adapter,accountId,deliver:standard=>deliver(rememberInput(standard))});
    inbound=channel;
    return Object.freeze({receive:channel.receive,claim:channel.claim,close:()=>{channel.close();if(inbound===channel)inbound=undefined;}});
   }
@@ -185,10 +192,26 @@ export function createConversations(io,host){
   function openCommands(options={}){
    if(closed)throw Error('Conversation closed');
    if(commands)throw Error('Commands already open for this Conversation wiring');
-   commands=createCommandRouter({...options,
+   const router=createCommandRouter({...options,
     admits:(type,id)=>{const scope=scopes.get(type);return !closed&&!!scope&&allowed(scope,id);},
-    claim:input=>closed||!inbound?'unavailable':inbound.claim(input)});
+    claim:input=>{if(closed||!inbound)return 'unavailable';const result=inbound.claim(input);if(result==='claimed')rememberInput(input);return result;}});
+   commands=Object.freeze({...router,dispatch:(input,args={})=>router.dispatch(input,{...args,reply:async body=>{const result=await reply(input,body);if(result.status!=='sent')throw Error('Input reply not accepted');return result;}})});
    return commands;
+  }
+
+  // A short-lived response to a verified/claimed platform input, not a stable
+  // notification grant and not a Session capability. Commands (/new included)
+  // and Session-creation errors can answer without creating another Session.
+  function reply(input,body){
+   const evidence=inputReplies.get(input);
+   if(!evidence||closed)return Promise.resolve({status:'not-sent',reason:'unauthorized',stage:'before-platform',parts:[]});
+   const grant=Object.freeze({reply:true,messageId:evidence.messageId,closed:()=>closed,
+    authorize:to=>clock()-evidence.at>=0&&clock()-evidence.at<300_000&&to.type===evidence.conversation.type&&to.id===evidence.conversation.id});grants.add(grant);
+   const id=evidence.messageId?'input-reply:'+createHash('sha256').update(JSON.stringify([evidence.conversation.type,evidence.conversation.id,evidence.messageId])).digest('hex'):undefined;
+   diagnostics?.emit('conversation','queued',{inputId:evidence.messageId,logicalId:id,conversation:evidence.conversation,status:'pending'});
+   return io.sendMessage({...(id?{id}:{}),target:{platform,adapter,accountId,conversation:evidence.conversation},origin:{notification:grant},message:{text:body}}).then(result=>{
+    if(result.status!=='sent')throw Object.assign(Error('Input reply not accepted'),{status:result.status});return result;
+   });
   }
 
   /**
@@ -205,7 +228,7 @@ export function createConversations(io,host){
    if(hitl)throw Error('HITL already open for this Conversation wiring');
    if(typeof host.hitl?.register!=='function')throw Error('HITL is unavailable in this Agent I/O host');
    if(typeof manager.findBySessionId!=='function')throw Error('HITL requires the Manager Session lookup');
-   const bridge=createHITLBridge({...options,io,manager,wiring:{target,current,
+   const bridge=createHITLBridge({...options,io,manager,diagnostics,wiring:{target,current,
     allowed:record=>types.has(record?.scope)&&allowed(record.scope,record.peerId),
     claim:input=>closed||!inbound?'unavailable':inbound.claim(input)}});
    const unregister=host.hitl.register(bridge);
@@ -227,7 +250,7 @@ export function createConversations(io,host){
    if(release)throw Error('An adapter is already registered for this Conversation wiring');
    const check=typeof parts?.check==='function'?parts.check:undefined;
    const unregister=io.registerAdapter({
-    platform,accountId,split:parts?.split,send:parts?.send,classify:parts?.classify,
+    platform,adapter,accountId,split:parts?.split,send:parts?.send,classify:parts?.classify,
     // HITL actions: optional; without acceptsActions the I/O refuses them.
     ...(typeof parts?.acceptsActions==='function'?{acceptsActions:parts.acceptsActions}:{}),
     // Basic media: optional; without sendAttachment the I/O refuses attachments.
@@ -247,9 +270,10 @@ export function createConversations(io,host){
   }
 
   function close(){
+   diagnostics?.emit('conversation','close',{status:'closed'});
    closed=true;if(hitl){hitl.bridge.close();hitl.unregister();hitl=undefined;}inbound?.close();inbound=undefined;release?.();release=undefined;commands=undefined;
   }
 
-  return Object.freeze({platform,adapter,accountId,target,policy,handoff,submit,route,openInbound,openCommands,openHITL,openNotifications,registerAdapter,close});
+  return Object.freeze({platform,adapter,accountId,target,policy,handoff,submit,route,reply,openInbound,openCommands,openHITL,openNotifications,registerAdapter,diagnostics,close});
  };
 }

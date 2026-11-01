@@ -19,6 +19,7 @@
     "dist/config.js": "a52f0010155d57fda33c84c5345c6de49eeb3a6db7961b212555aff896a804c0",
     "dist/session/idle-evictor.js": "a20dda7f1e2f06b7d1797f752fcb0774606021862da1757d0c11189b351b8385",
     "dist/transport/outbound.js": "b7be7e7d127a6c92abcf28e8bd5a70b4e69e28f819617cd5c333fe6c687d7963",
+    "dist/transport/msgid-cache.js": "b5d58910a6fe8b273e5b348690bc14971f1c0a9ad6b90c44f0a9ba752d06f742",
     "dist/transport/outbound-buffer.js": "e2fc87dd048df2d82f945341f3d59d1ac86238e88d6f0365abb365026dcc8d5a"
   },
   "added": [

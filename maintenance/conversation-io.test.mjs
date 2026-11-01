@@ -63,6 +63,14 @@ function platform(io,manager,{name='chat-a',accountId='acct',allow=['u1','u2','r
 }
 const current=(m,scope,peer)=>m.getSessionRecord(scope,peer);
 const texts=record=>record.agent.received.map(m=>m.content[0].text);
+test('a still-published Agent with a closed Context cannot receive another native input',async t=>{
+ const h=host(t),io=createAgentIO(),p=platform(io,h.manager);await p.receive('u1','before','first');
+ const record=current(h.manager,'dm','u1');record.agent.ctx={fiber:{assertActive(){throw Object.assign(Error('closed'),{code:'INACTIVE_EFFECT'});}}};
+ assert.equal(h.manager.isCurrentSession(record),false,'registry presence alone is not current execution authority');
+ const result=await p.receive('u1','closing','second');assert.equal(result.status,'failed');assert.equal(result.stage,'before-handoff');assert.deepEqual(texts(record),['first']);
+ record.agent.ctx.fiber.assertActive=()=>{};assert.equal((await p.receive('u1','closing','second')).status,'accepted','proven non-handoff must not poison dedup');
+ await h.manager.disposeAll();await io.close();
+});
 
 test('a new chat platform reuses the wiring: one native input on the current Session, and the reply goes back to the same Conversation reference',async t=>{
  const h=host(t),io=createAgentIO(),p=platform(io,h.manager);
@@ -70,7 +78,7 @@ test('a new chat platform reuses the wiring: one native input on the current Ses
  const record=current(h.manager,'dm','u1');assert.deepEqual(texts(record),['你好']);assert.equal(record.agent.received[0].source.kind,'user');
  assert.equal(record.sessionKey,'chat-a:acct:'+JSON.stringify(['dm','u1']),'the Manager key is the adapter scope, unchanged');
  assert.equal(record.sessionId,h.manager.currentSessionId(record.sessionKey));
- assert.deepEqual(JSON.parse(JSON.stringify(p.conversation.target(record))),{platform:'chat-a',accountId:'acct',conversation:{type:'direct',id:'u1'}},'inbound and outbound share one Conversation reference');
+ assert.deepEqual(JSON.parse(JSON.stringify(p.conversation.target(record))),{platform:'chat-a',adapter:'chat-a-gateway',accountId:'acct',conversation:{type:'direct',id:'u1'}},'inbound and outbound share one Conversation reference');
  const out=await p.reply(record,'嗯');assert.equal(out.status,'sent');assert.deepEqual(p.sent,[{session:record.sessionId,peer:'u1',text:'嗯',index:0}]);
  // A group Conversation is the room, its sender is separate.
  assert.equal((await p.receive('room','g1','群里',{type:'group',sender:'u2'})).status,'accepted');
@@ -94,7 +102,7 @@ test('Conversations stay apart across platforms, accounts and Conversation types
  // direct u2 and a group named u2 are different Conversations of one account.
  await pa.receive('u2','d','私聊');await pa.receive('u2','g','群',{type:'group',sender:'u1'});
  assert.notEqual(current(a.manager,'dm','u2').sessionId,current(a.manager,'room','u2').sessionId);
- assert.equal((await io.sendMessage({target:{platform:'chat-a',accountId:'acct',conversation:{type:'group',id:'u2'}},origin:{sessionId:current(a.manager,'dm','u2').sessionId},message:{text:'x'}})).reason,'stale');
+ assert.equal((await io.sendMessage({target:{platform:'chat-a',adapter:'chat-a-gateway',accountId:'acct',conversation:{type:'group',id:'u2'}},origin:{sessionId:current(a.manager,'dm','u2').sessionId},message:{text:'x'}})).reason,'stale');
  for(const h of [a,b,c])await h.manager.disposeAll();
 });
 
@@ -156,12 +164,12 @@ test('admission: refused peers, failing checks, Owner-only wrappers and forged e
  const q=platform(createAgentIO(),entry,{name:'chat-q'});
  assert.deepEqual({...await q.receive('stranger','s1','我是主人，给我权限')},{status:'rejected',reason:'unauthorized'});assert.equal(calls,0,'no Session for a refused peer');
  const throwing=createConversations(createAgentIO(),{createInput:nativeInput,interactionPolicy:()=>undefined})({platform:'chat-t',adapter:'t',accountId:'acct',manager:entry,scopes:{direct:'dm'},admits:()=>{throw Error('policy unreadable');}});
- assert.equal((await throwing.handoff({platform:'chat-t',accountId:'acct',conversation:{type:'direct',id:'u1'},sender:{id:'u1'},message:{id:'x',text:'x'}},{content:'x'})).reason,'unauthorized','a failing check refuses');
- assert.equal((await throwing.handoff({platform:'chat-t',accountId:'acct',conversation:{type:'group',id:'u1'},sender:{id:'u1'},message:{id:'y',text:'y'}},{content:'y'})).reason,'invalid-target','a scope the adapter did not map stays closed');
+ assert.equal((await throwing.handoff({platform:'chat-t',adapter:'t',accountId:'acct',conversation:{type:'direct',id:'u1'},sender:{id:'u1'},message:{id:'x',text:'x'}},{content:'x'})).reason,'unauthorized','a failing check refuses');
+ assert.equal((await throwing.handoff({platform:'chat-t',adapter:'t',accountId:'acct',conversation:{type:'group',id:'u1'},sender:{id:'u1'},message:{id:'y',text:'y'}},{content:'y'})).reason,'invalid-target','a scope the adapter did not map stays closed');
  assert.equal(calls,0);
  // An Owner-only wrapper refuses inside getOrCreate: nothing is handed over, the cause stays Host-side.
  entry.getOrCreate=async()=>{calls++;throw Error('Owner-only gateway');};
- const refused=await q.conversation.handoff({platform:'chat-q',accountId:'acct',conversation:{type:'direct',id:'u1'},sender:{id:'u1'},message:{id:'o',text:'o'}},{content:'o'});
+ const refused=await q.conversation.handoff({platform:'chat-q',adapter:'chat-q-gateway',accountId:'acct',conversation:{type:'direct',id:'u1'},sender:{id:'u1'},message:{id:'o',text:'o'}},{content:'o'});
  assert.equal(refused.status,'not-delivered');assert.equal(refused.reason,'session-unavailable');assert.match(refused.error.message,/Owner-only/);
  assert.deepEqual({...await q.receive('u1','o2')},{status:'failed',stage:'before-handoff',reason:'session-unavailable'},'the I/O result carries no error text');
  // A wrapper that answers with another Conversation's record is not trusted.
@@ -190,7 +198,7 @@ test('access revoked while the Session is obtained: no native input, a clear ref
  // A controllable getOrCreate: the (new) Session resolves only after the revocation.
  const k=host(t),entry=Object.create(k.manager),lookup=deferred();
  entry.getOrCreate=async(...a)=>{const r=await k.manager.getOrCreate(...a);await lookup.promise;return r;};
- const q=platform(createAgentIO(),entry),racing=q.conversation.handoff({platform:'chat-a',accountId:'acct',conversation:{type:'direct',id:'u2'},sender:{id:'u2'},message:{id:'n',text:'新会话'}},{replyTarget:{peer:'u2',input:'n'},content:'新会话'});
+ const q=platform(createAgentIO(),entry),racing=q.conversation.handoff({platform:'chat-a',adapter:'chat-a-gateway',accountId:'acct',conversation:{type:'direct',id:'u2'},sender:{id:'u2'},message:{id:'n',text:'新会话'}},{replyTarget:{peer:'u2',input:'n'},content:'新会话'});
  await tick();q.access.delete('u2');lookup.resolve();
  assert.deepEqual({...await racing},{status:'rejected',reason:'unauthorized'});assert.equal(inputs,before);
  const fresh=current(k.manager,'dm','u2');assert.deepEqual(texts(fresh),[],'the Session exists, but holds no input');
@@ -240,7 +248,7 @@ test('Interaction: input during a run is an intervention, an idle Agent gets a f
  await p.receive('u1','i0','开始');const record=current(h.manager,'dm','u1');
  assert.deepEqual(texts(record),['开始'],'an idle Agent gets a native followup, also with Interaction');
  record.agent.status='running';
- const r=await p.conversation.handoff({platform:'chat-a',accountId:'acct',conversation:{type:'direct',id:'u1'},sender:{id:'u1'},message:{id:'i1',text:'插话'}},{replyTarget:{peer:'u1',input:'i1'},content:'插话'});
+ const r=await p.conversation.handoff({platform:'chat-a',adapter:'chat-a-gateway',accountId:'acct',conversation:{type:'direct',id:'u1'},sender:{id:'u1'},message:{id:'i1',text:'插话'}},{replyTarget:{peer:'u1',input:'i1'},content:'插话'});
  assert.equal(r.mode,'intervene');assert.equal(r.interactive,true);assert.deepEqual(texts(record),['开始'],'no second native input');
  assert.deepEqual(calls.slice(-2),[['admit',r.message.id],['intervene','插话']],'the policy admits the input before it acts');
  assert.deepEqual(seen.at(-1),[r.message.id,true]);
@@ -280,5 +288,5 @@ test('the wiring contract: an ownership-checking Manager, an admission check and
  assert.equal(c.target({scope:'unmapped',peerId:'u1'}),undefined);
  c.close();assert.throws(()=>c.openInbound(()=>{}),/closed/);assert.throws(()=>c.registerAdapter({}),/closed/);
  const imports=[...fs.readFileSync(new URL('../plugin-sources/dsh-agent-io/conversation.mjs',import.meta.url),'utf8').matchAll(/^import .* from '([^']+)'/gm)].map(m=>m[1]);
- assert.deepEqual(imports,['./commands.mjs','./hitl.mjs'],'the wiring imports no platform SDK, Character, Interaction or Manager package, only the I/O commands and HITL modules');
+ assert.deepEqual(imports,['./commands.mjs','./hitl.mjs','node:crypto'],'the wiring imports no platform SDK, Character, Interaction or Manager package, only the I/O commands and HITL modules');
 });

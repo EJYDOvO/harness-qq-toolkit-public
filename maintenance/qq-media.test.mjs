@@ -12,7 +12,7 @@ import vm from 'node:vm';
 import {createHash,randomUUID} from 'node:crypto';
 import {stat,realpath} from 'node:fs/promises';
 import {createAgentIO} from '../plugin-sources/dsh-agent-io/io.mjs';
-import {qqAdapter,qqConversation,createTurnControls} from './qq-conversation-fixture.mjs';
+import {qqAdapter,qqConversation,createTurnControls,createReplyIdCache} from './qq-conversation-fixture.mjs';
 
 const dist=new URL('./qqbot-src/dist/',import.meta.url);
 const read=file=>fs.readFileSync(new URL(file,dist),'utf8').replaceAll('\r\n','\n');
@@ -45,6 +45,7 @@ function mediaBot(){
  };
 }
 function gateway({access={c2cMode:'allowlist',c2cAllow:['owner'],groupMode:'disabled',groupAllow:[]}}={}){
+ const replyIds=createReplyIdCache();
  const io=createAgentIO(),requests=[],spy={...io,sendMessage:r=>{requests.push(r);return io.sendMessage(r);}};
  const agent={id:'agent-1'},record={sessionKey:'qqbot:app-a:c2c:owner',sessionId:'s1',agent,replyTarget:{scope:'c2c',targetId:'owner',msgId:'m1'},scope:'c2c',peerId:'owner'};
  const sessions=new Map([['c2c:owner',record]]),agents=new Map([['s1',agent]]);
@@ -55,11 +56,11 @@ function gateway({access={c2cMode:'allowlist',c2cAllow:['owner'],groupMode:'disa
  const bot=mediaBot(),cleanups=[],defs=[],ctx={get:n=>n==='tools'?{register:d=>defs.push(d)}:undefined,effect:f=>cleanups.push(f())};
  const conversation=qqConversation({io:spy,manager,config});
  // The gateway's own sender, bridge (submit, Turn controls) and adapter registration, as reviewed.
- const {sender,replyLimiter}=vm.runInNewContext('(function(){'+slice(bootstrap,'    const replyLimiter = new ReplyLimiter({ limit: 4 });','    // Optional Agent policy. No Character')+';return {sender,replyLimiter};})()',{ReplyLimiter,deliveryRecorder:null,bot,resolveReplyTarget,sendResolvedMarkdown});
+ const {sender,replyLimiter}=vm.runInNewContext('(function(){'+slice(bootstrap,'    const replyLimiter = new ReplyLimiter({ limit: 4 });','    // Optional Agent policy. No Character')+';return {sender,replyLimiter};})()',{ReplyLimiter,deliveryRecorder:null,bot,resolveReplyTarget,sendResolvedMarkdown,replyIds});
  const handler=vm.runInNewContext('(function(){'+slice(bootstrap,'    const policyFor =','    return outboundHandler;')+';return outboundHandler;})()',
   {ctx,manager,sender,config,logger,toolsRegistry:undefined,diagnostics:null,io:spy,conversation,createOutboundHandler:()=>()=>{},createTurnControls,AbortController,AbortSignal,randomUUID});
  vm.runInNewContext('(function(){'+slice(bootstrap,'    // Unified Agent I/O text adapter',"    ctx\n        .on('session/event'")+'})()',
-  {conversation,createQQTextAdapter:qqAdapter.createQQTextAdapter,config,chunkMarkdownText:t=>[t],sender,diagnostics:null,outboundHandler:handler,ctx,sendMedia,bot,replyLimiter});
+  {conversation,createQQTextAdapter:qqAdapter.createQQTextAdapter,config,chunkMarkdownText:t=>[t],sender,diagnostics:null,outboundHandler:handler,ctx,sendMedia,bot,replyLimiter,replyIds});
  fileTool.registerSendFileTool(ctx,null,manager,config,logger);
  const tool=defs.find(d=>d.name==='qqbot_send_file');
  const turn=n=>handler({header:{id:'s1'}},{type:'turn/start',data:{turn:n}});
@@ -73,7 +74,7 @@ test('qqbot_send_file sends one attachment message to the current conversation t
  const out=await g.send({file_path:png});
  assert.deepEqual({...out},{fileName:'chart.png',fileSize:1,target:'c2c:owner',fileUuid:'uuid-1',messageId:'media-2'});
  const [req]=g.requests;
- assert.match(req.id,/^qq:s1:1:file:[0-9a-f]{16}$/);assert.deepEqual({...req.origin},{sessionId:'s1'});assert.equal(req.target.conversation.id,'owner');
+ assert.match(req.id,/^qq:s1:1:file:[0-9a-f]{16}$/);assert.deepEqual({...req.origin},{sessionId:'s1',turn:1});assert.equal(req.target.conversation.id,'owner');
  assert.deepEqual(JSON.parse(JSON.stringify(req.message)),{attachments:[{kind:'image',name:'chart.png',size:1,resource:{type:'local',path:real(png)}}]});
  assert.deepEqual(g.bot.calls.map(c=>c.stage),['upload','message']);
  assert.equal(g.bot.calls[0].srvSendMsg,false,'upload never sends by itself');assert.equal(g.bot.calls[1].msgId,'m1','passive reply to the current input');

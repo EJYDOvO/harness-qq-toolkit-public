@@ -11,7 +11,8 @@ export class SessionManager {
    waitingForUser:record=>manager.hitl?.waiting(record)===true,
    cancelPending(record){manager.hitl?.cancel(record);},
    prompt:record=>record.scope==='group'?config.groupPrompt:config.directPrompt,
-   release(record){if(record.typingKeepAlive){clearInterval(record.typingKeepAlive);record.typingKeepAlive=undefined;}manager.releaseOutput?.(record);},
+   diagnostics(event,record){ctx.get('agentIO')?.diagnostics?.scope({platform:'qq-official',adapter:'qq-official-gateway',accountId:config.appId,conversation:record.peerId?{type:record.scope==='c2c'?'direct':'group',id:record.peerId}:undefined}).emit('conversation',event,{sessionId:record.sessionId,status:record.status});},
+   release(record){if(record.typingKeepAlive){clearInterval(record.typingKeepAlive);record.typingKeepAlive=undefined;}manager.releaseOutput?.(record);try{ctx.get('agentIO')?.diagnostics?.scope({platform:'qq-official',adapter:'qq-official-gateway',accountId:config.appId,conversation:{type:record.scope==='c2c'?'direct':'group',id:record.peerId}}).emit('conversation','close',{sessionId:record.sessionId,status:'closed'});}catch{}},
   }});
   return manager;
  }

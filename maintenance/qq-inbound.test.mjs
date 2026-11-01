@@ -52,6 +52,7 @@ function gateway({io=createAgentIO(),appId='app-a',access=owner,commands=[]}={})
  // Commands: the Agent I/O router of this wiring behind the reviewed QQ gate.
  const router=conversation.openCommands({prefixes:['/']});for(const c of commands)router.register(qqCommand(c));const gate=commandGate(router);
  const replies=[],typing=[];
+ conversation.registerAdapter({split:t=>[t],async send(route,text){if(!route.inputReply)throw Error('unexpected output');replies.push(text);}});
  const final=ctx=>inbound.handleInbound(ctx,logger,channel);
  const chain=sdk?[sdk.messageFilter({skipSelfEcho:false}),sdk.accessPolicy({c2c:{mode:access.c2cMode,allow:access.c2cAllow},group:{mode:access.groupMode,allow:access.groupAllow}}),sdk.mentionGate({requireMentionInGroup:true}),gate,sdk.concurrencyGuard({strategy:'merge',maxQueue:10})]:[];
  const event=({kind='c2c',sender='owner',group,id='msg-1',content='你好',attachments=[],mention=false}={})=>{
@@ -91,7 +92,7 @@ test('platform message ids are isolated per QQ application and per Conversation'
  await a.direct({kind:'group',sender:'owner',group:'grp',id:'same',content:'群里'});
  assert.equal(all(a).length,2);assert.equal(all(b).length,1);
  assert.deepEqual([...a.mgr.records.keys()],['c2c:owner','group:grp'],'group Conversation id is the group, separate from its sender');
- assert.throws(()=>io.openInbound({platform:'qq-official',adapter:'second-gateway',accountId:'app-a',deliver(){}}),/already open/,'no second Gateway intake for one application');
+ assert.throws(()=>io.openInbound({platform:'qq-official',adapter:'qq-official-gateway',accountId:'app-a',deliver(){}}),/already open/,'no second Gateway intake for one application');
 });
 test('the SDK access policy keeps strangers, forged Owner claims and a disabled group scope out',needsSdk,async()=>{
  const g=gateway();
@@ -177,7 +178,7 @@ test('the replaced path: no SDK slashCommand, the command gate sits before the m
 test('closing the channel on Gateway disposal leaves no live intake; a reloaded Gateway takes over',async()=>{
  const io=createAgentIO(),g=gateway({io});g.channel.close();await g.direct({id:'late'});
  assert.equal(all(g).length,0);assert(g.logs.some(([,m])=>m==='im-qqbot: inbound rejected (closed)'));
- const reloaded=gateway({io});await reloaded.direct({id:'late'});assert.equal(all(reloaded).length,1);
+ g.conversation.close();const reloaded=gateway({io});await reloaded.direct({id:'late'});assert.equal(all(reloaded).length,1);
  const bootstrap=read('gateway/bootstrap.js');
  assert.match(bootstrap,/const conversation = io\.openConversation\(\{ platform: QQ_OFFICIAL, adapter: 'qq-official-gateway', accountId: config\.appId, manager, scopes: QQ_SCOPES,/);
  assert.match(bootstrap,/const inbound = conversation\.openInbound\(standard => deliverInbound\(standard, conversation, config, logger\)\);/);
@@ -193,7 +194,7 @@ test('the replaced path: the message handler never creates Agent input itself, a
  assert(source.includes('conversation.handoff(standard, { replyTarget, content: agentBody })'));
  assert(!/body="|peerId=\$\{|key=\$\{scope\}:\$\{peerId\}/.test(source),'no chat text or raw peer id in the Processing/followup logs');
  const core=fs.readFileSync(new URL('../plugin-sources/dsh-agent-io/io.mjs',import.meta.url),'utf8');
- assert.deepEqual(core.match(/^import .*$/gm),["import {createHash} from 'node:crypto';"]);
+ assert.deepEqual(core.match(/^import .*$/gm),["import {createHash} from 'node:crypto';","import {createDiagnostics} from './diagnostics.mjs';"]);
 });
 
 // ── Serialization and lifecycle races (deterministic: controlled promises) ──

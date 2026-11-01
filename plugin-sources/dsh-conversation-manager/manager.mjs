@@ -28,9 +28,11 @@ export class ConversationManager {
     releasedRecords = new WeakSet();
     closingHandles = new Map();
     cleanupErrors = [];
+    diagnostic(event,record,status){try{this.adapter.diagnostics?.(event,{scope:record?.scope,peerId:record?.peerId,sessionId:record?.sessionId,status});}catch{}}
     releaseRecord(record){
         if(this.releasedRecords.has(record))return;
         this.releasedRecords.add(record);
+        this.diagnostic('close',record,'closed');
         try{this.adapter.release?.(record);}catch(error){this.cleanupErrors.push(error);}
     }
     disposeHandle(handle){
@@ -52,7 +54,7 @@ export class ConversationManager {
         this.modelResolver = new ModelResolver(ctx, config, logger);
         this.evictor = new IdleEvictor(this.sessions, config.sessionIdleTimeout, (key, record) => {
             if(this.protectedSession(record))return;
-            this.logger.info(`evicting idle session: key=${key}`);
+            this.logger.info(`Evicting idle Conversation Agent`);
             this.releaseRecord(record);
             this.sessions.delete(key);
             void this.disposeHandle(record.handle).catch(() => { });
@@ -142,7 +144,7 @@ export class ConversationManager {
             return list.map((p) => ({ id: p.id, name: p.name, description: p.description }));
         }
         catch (err) {
-            this.logger.warn(`list presets failed: ${err instanceof Error ? err.message : String(err)}`);
+            this.logger.warn(`Preset listing failed`);
             return [];
         }
     }
@@ -157,12 +159,12 @@ export class ConversationManager {
         const record = this.sessions.get(key);
         if (!record) {
             this.modelResolver.prefs.commitSession(key,this.currentSessionId(key),route);
-            this.logger.info(`model pref saved (no active session): key=${key} → ${route.provider}/${route.model}`);
+            this.logger.info(`Model preference saved (no active Session)`);
             return;
         }
         if(this.protectedSession(record))throw Error('Conversation has unfinished interaction; model switch refused');
         await this.rebuildSession(record, { route });
-        this.logger.info(`model switched via fork: key=${key} → ${route.provider}/${route.model}`);
+        this.logger.info(`Model switched via native fork`);
     }
     /**
      * 切换指定 peer 的 agent preset（per-peer 覆盖）
@@ -192,7 +194,7 @@ export class ConversationManager {
         // 2. 持久化 per-peer 覆盖（新会话生效）
         this.modelResolver.setPreset(key, presetId);
         const hasActive = this.sessions.has(key);
-        this.logger.info(`preset pref saved: key=${key} → ${presetId}${hasActive ? ' (active session locked, next session applies)' : ''}`);
+        this.logger.info(`Preset preference saved; applies to the next Session`);
         return { ok: true, presetId };
     }
     /**
@@ -204,7 +206,7 @@ export class ConversationManager {
     async clearPresetPreference(scope, peerId) {
         const key = this.sessionKey(scope, peerId);
         this.modelResolver.clearPreset(key);
-        this.logger.info(`preset pref cleared: key=${key} (next session applies)`);
+        this.logger.info(`Preset preference cleared; applies to the next Session`);
         return { ok: true };
     }
     /**
@@ -256,7 +258,7 @@ export class ConversationManager {
         record.lastActivity = Date.now();
         this.releasedRecords.delete(record); // the reused record now owns a new Agent lifetime
         void this.disposeHandle(oldHandle).catch(() => { });
-        this.logger.info(`session rebuilt via fork: key=${key} preset=${composed.agentPreset ?? 'none'} sessionId=${childId}`);
+        this.logger.info(`Session rebuilt via native fork`);
     }
     async clearModelOverride(scope, peerId) {
         const key = this.sessionKey(scope, peerId);
@@ -422,9 +424,11 @@ export class ConversationManager {
     }
     /** Host admission check, not a model-provided identity. Recheck after await. */
     isCurrentSession(record) {
-        return !this.closed && this.sessions.get(record?.sessionKey) === record
-            && record.sessionId === this.currentSessionId(record.sessionKey)
-            && this.agents.get(record.sessionId) === record.agent;
+        if(!record||this.closed||this.sessions.get(record.sessionKey)!==record
+            ||record.sessionId!==this.currentSessionId(record.sessionKey)
+            ||this.agents.get(record.sessionId)!==record.agent)return false;
+        try{record.agent.ctx?.fiber?.assertActive?.();}catch{return false;}
+        return true;
     }
     async composePreset(presetId) {
         const presets = this.getPresetsService();
@@ -436,7 +440,7 @@ export class ConversationManager {
     }
     /** 获取或恢复或创建会话（get → resume → create） */
     async getOrCreate(scope, peerId, senderId, replyTarget) {
-        return this.inConversation(this.sessionKey(scope,peerId),async()=>{
+        const record=await this.inConversation(this.sessionKey(scope,peerId),async()=>{
             await this.drainSessionClosures(this.currentSessionId(this.sessionKey(scope,peerId)));
             // Remote Ops restores the owner route at Gateway startup without a
             // message id. Restoration must neither count as user activity nor
@@ -449,6 +453,7 @@ export class ConversationManager {
             }
             return this.getOrRestore(scope,peerId,senderId,replyTarget);
         });
+        this.diagnostic('route',record,'active');return record;
     }
     async getOrRestore(scope, peerId, senderId, replyTarget) {
         const key = this.sessionKey(scope, peerId);
@@ -460,7 +465,7 @@ export class ConversationManager {
         }
         const route = this.modelResolver.getEffectiveRoute(key);
         const sessionId = SessionId(this.currentSessionId(key));
-        this.logger.info(`getOrCreate: key=${key} route=${route ? `${route.provider}/${route.model}` : 'host-default'} sessionId=${sessionId}`);
+        this.logger.info(`Acquiring Conversation Session`);
         let agent;
         let handle;
         let agentPreset;
@@ -468,7 +473,7 @@ export class ConversationManager {
         if (live) {
             agent = live;
             agentPreset = this.getPresetsService()?.composedPreset?.(live.ctx);
-            this.logger.info(`reusing live agent: key=${key}`);
+            this.logger.info(`Reusing current Conversation Agent`);
         }
         else {
             // preset 只解析一次：resume/create 共用同一组合，避免重复 resolve/mount 目录。
@@ -486,7 +491,7 @@ export class ConversationManager {
                 });
                 agent = resumed.agent;
                 handle = resumed;
-                this.logger.info(`resumed session: key=${key} preset=${agentPreset ?? 'none'} route=${resumeRoute ? `${resumeRoute.provider}/${resumeRoute.model}` : 'session-own'}`);
+                this.logger.info(`Resumed native Conversation Session`);
             }
             else {
                 const created = await this.agents.create({
@@ -502,7 +507,7 @@ export class ConversationManager {
                 handle = created;
                 try{if(!await this.ctx.get('sessions')?.flush(agent.session))throw Error('Created Conversation Session was not durably stored');}
                 catch(error){await this.disposeHandle(handle).catch(()=>{});throw error;}
-                this.logger.info(`created new session: key=${key} preset=${agentPreset ?? 'none'}`);
+                this.logger.info(`Created native Conversation Session`);
             }
         }
         const record = {
@@ -548,7 +553,7 @@ export class ConversationManager {
         this.sessions.delete(key);
         record.agent.cancel({ kind: 'user' });
         await this.disposeHandle(record.handle).catch(() => { });
-        this.logger.info(`session removed: key=${key}`);
+        this.logger.info(`Conversation Session removed`);
     }
     /**
      * 原地压缩当前会话历史（保留 sessionId，用摘要替换旧历史）。
@@ -596,11 +601,11 @@ export class ConversationManager {
             }
             // 其他 ManualCompactionError 预期失败，给友好文案（debug 记录，不 warn 刷屏）
             if (code !== undefined && code in COMPACTION_ERROR_HINTS) {
-                this.logger.debug(`compact declined: key=${key} code=${code}`);
+                this.logger.debug(`Compaction declined`);
                 return { ok: false, reason: 'failed', message: COMPACTION_ERROR_HINTS[code] };
             }
             const message = err instanceof Error ? err.message : String(err);
-            this.logger.warn(`compact failed: key=${key} err=${message}`);
+            this.logger.warn(`Compaction failed; private exception details omitted`);
             return { ok: false, reason: 'failed', message };
         }
     }

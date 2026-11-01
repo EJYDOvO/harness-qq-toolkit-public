@@ -6,6 +6,7 @@
 // handoff from an adapter's channel to its trusted Conversation entry, with
 // scoped duplicate suppression. Nothing here is durable.
 import {createHash} from 'node:crypto';
+import {createDiagnostics} from './diagnostics.mjs';
 
 const CODE=/^[a-z][a-z-]{0,39}$/;
 const code=(value,fallback)=>typeof value==='string'&&CODE.test(value)?value:fallback;
@@ -57,10 +58,12 @@ export function createAgentIO(options={}){
  const maxPerConversation=options.maxPendingPerConversation??32,maxPending=options.maxPending??512,maxConcurrent=options.maxConcurrent??8,maxText=options.maxTextLength??100_000,remember=options.rememberResults??1024;
  const maxAttachments=options.maxAttachments??10,maxInboundAttachments=options.maxInboundAttachments??20;
  const now=options.now??Date.now,onEvent=typeof options.onEvent==='function'?options.onEvent:undefined;
+ const diagnostics=createDiagnostics({...options.diagnostics,now});
+ const trace=(request,event,fields={})=>diagnostics.scope(request?.target).emit('io',event,{logicalId:request?.id,sessionId:request?.origin?.sessionId,turn:request?.origin?.turn,...fields});
  const adapters=new Map(),conversations=new Map(),results=new Map(),ready=[];
  let pending=0,active=0,closed=false;const running=new Set();
  const channels=new Map(),received=new Map(),inboundWindow=options.inboundWindowMs??86_400_000,rememberInbound=options.rememberInbound??4096;
- const adapterKey=(platform,accountId)=>JSON.stringify([platform,accountId]);
+ const adapterKey=(platform,accountId,adapter='legacy')=>JSON.stringify([platform,adapter,accountId]);
  const issued=new WeakSet();
 
  /** {ref, options:[{value, label, doneLabel?, style?}]} → frozen actions the I/O accepts on a message. */
@@ -82,17 +85,19 @@ export function createAgentIO(options={}){
   if(closed)throw Error('Agent I/O closed');
   if(!adapter||!text(adapter.platform)||!text(adapter.accountId))throw Error('Adapter requires platform and accountId');
   for(const m of ['resolve','split','send'])if(typeof adapter[m]!=='function')throw Error('Adapter requires '+m+'()');
-  const key=adapterKey(adapter.platform,adapter.accountId);
+  if(adapter.adapter!==undefined&&!text(adapter.adapter))throw Error('Invalid adapter identity');
+  const key=adapterKey(adapter.platform,adapter.accountId,adapter.adapter);
   if(adapters.has(key))throw Error('An adapter is already registered for this platform account');
   const entry={adapter};adapters.set(key,entry);
-  return ()=>{if(adapters.get(key)===entry)adapters.delete(key);};
+  diagnostics.scope(adapter).emit('io','attach');
+  return ()=>{if(adapters.get(key)===entry){adapters.delete(key);diagnostics.scope(adapter).emit('io','detach');}};
  }
 
  // Only the shape is checked here; whether the origin may reach the target is
  // the adapter's decision against its trusted routing records, at send time.
  function validate(request){
   const target=request?.target,conversation=target?.conversation,message=request?.message;
-  if(!target||!text(target.platform)||!text(target.accountId)||!conversation||!['direct','group'].includes(conversation.type)||!text(conversation.id))return 'invalid-target';
+  if(!target||!text(target.platform)||!text(target.accountId)||(target.adapter!==undefined&&!text(target.adapter))||!conversation||!['direct','group'].includes(conversation.type)||!text(conversation.id))return 'invalid-target';
   if(!request.origin||typeof request.origin!=='object')return 'unauthorized';
   if(!message||typeof message!=='object')return 'invalid-message';
   if(Object.keys(message).some(k=>!['text','attachments','actions'].includes(k)))return 'unsupported';
@@ -123,12 +128,12 @@ export function createAgentIO(options={}){
   if(invalid)return Promise.resolve(report(request,notSent(id,invalid),now()));
   if(closed)return Promise.resolve(report(request,notSent(id,'closed'),now()));
   const {platform,accountId,conversation}=request.target;
-  const key=JSON.stringify([platform,accountId,conversation.type,conversation.id]);
+  const scope=adapterKey(platform,accountId,request.target.adapter),key=JSON.stringify([scope,conversation.type,conversation.id]);
   // Ids are scoped to the platform account. Within it a logical message is handed
   // over at most once per process: the same id with the same Conversation and
   // text (repeated event, settlement, a second internal caller) gets the first
   // result; the same id with another target or text is refused as a conflict.
-  const idKey=id===undefined?undefined:JSON.stringify([platform,accountId,id]),print=id===undefined?undefined:fingerprint(request);
+  const idKey=id===undefined?undefined:JSON.stringify([scope,id]),print=id===undefined?undefined:fingerprint(request);
   const known=idKey===undefined?undefined:results.get(idKey);
   if(known){
    if(known.fingerprint!==print)return Promise.resolve(report(request,notSent(id,'id-conflict'),now()));
@@ -137,7 +142,7 @@ export function createAgentIO(options={}){
   let conv=conversations.get(key);
   if(pending>=maxPending||(conv?(conv.jobs.length+(conv.running?1:0)):0)>=maxPerConversation)return Promise.resolve(report(request,notSent(id,'queue-full'),now()));
   if(!conv)conversations.set(key,conv={key,jobs:[],running:false,waiting:false});
-  const job={id,request,adapterKey:adapterKey(platform,accountId),started:now()};
+  const job={id,request,adapterKey:scope,entry:adapters.get(scope),started:now()};
   const promise=new Promise(resolve=>{job.resolve=resolve;});
   if(idKey!==undefined){
    // Bounded: the oldest settled ids are forgotten first. An id still queued or
@@ -145,7 +150,9 @@ export function createAgentIO(options={}){
    const entry={fingerprint:print,promise,settled:false};results.set(idKey,entry);promise.then(()=>{entry.settled=true;});
    for(const [k,e] of results){if(results.size<=remember)break;if(e.settled)results.delete(k);}
   }
-  pending++;conv.jobs.push(job);schedule(conv);
+  pending++;conv.jobs.push(job);
+  trace(request,'queued',{status:'pending'});
+  schedule(conv);
   return promise;
  }
 
@@ -164,7 +171,7 @@ export function createAgentIO(options={}){
   if(closed)return notSent(id,'closed');
   if(cancelled())return notSent(id,'cancelled');
   const check=()=>{
-   const entry=adapters.get(job.adapterKey);if(!entry)return {reason:'adapter-unavailable'};
+   const entry=adapters.get(job.adapterKey);if(!entry||entry!==job.entry)return {reason:'adapter-unavailable'};
    let resolved;try{resolved=entry.adapter.resolve(request.target,request.origin);}catch{return {reason:'adapter-error'};}
    return resolved?.ok===true?{adapter:entry.adapter,route:resolved.route}:{reason:code(resolved?.reason,'unauthorized')};
   };
@@ -197,12 +204,15 @@ export function createAgentIO(options={}){
    const part=parts[index],media=part.attachment?{attachment:part.n}:part.actions?{actions:true}:{};
    try{
     const info={messageId:id,index,count:parts.length,...(part.actions?{actions:part.actions}:{})};
+    trace(request,'part',{status:'sending',index,count:parts.length});
     const receipt=part.attachment?await current.adapter.sendAttachment(current.route,part.attachment,info):await current.adapter.send(current.route,part.text,info);
+    trace(request,'part',{status:'sent',index,count:parts.length,receiptId:receipt?.receipt});
     done.push({index,status:'sent',...media,...(text(receipt?.receipt)?{receipt:receipt.receipt}:{}),...(text(receipt?.uploaded)?{uploaded:receipt.uploaded}:{})});
    }catch(error){
     let c;try{c=current.adapter.classify?.(error);}catch{}
     const outcome=c?.outcome==='not-sent'?'not-sent':'unknown';
     failure={status:outcome,reason:code(c?.reason,outcome==='unknown'?'unknown-outcome':'platform-rejected'),stage:c?.stage==='before-platform'?'before-platform':'platform'};
+    trace(request,'part',{status:outcome,reason:failure.reason,stage:failure.stage,index,count:parts.length});
     done.push({index,status:outcome,...media,reason:failure.reason});
     break;
    }
@@ -226,7 +236,7 @@ export function createAgentIO(options={}){
   if(closed)throw Error('Agent I/O closed');
   if(!channel||!text(channel.platform)||!text(channel.adapter)||!text(channel.accountId))throw Error('Inbound channel requires platform, adapter and accountId');
   if(typeof channel.deliver!=='function')throw Error('Inbound channel requires deliver()');
-  const key=adapterKey(channel.platform,channel.accountId);
+  const key=adapterKey(channel.platform,channel.accountId,channel.adapter);
   if(channels.has(key))throw Error('An inbound channel is already open for this platform account');
   const entry={channel,open:true};channels.set(key,entry);
   const close=()=>{entry.open=false;if(channels.get(key)===entry)channels.delete(key);};
@@ -240,17 +250,18 @@ export function createAgentIO(options={}){
  //   duplicate    in flight or already settled within the window
  //   unavailable  channel closed or invalid shape
  function claim(entry,message){
-  if(closed||!entry.open)return 'unavailable';
   const conversation=message?.conversation,id=message?.message?.id;
-  if(!conversation||!['direct','group'].includes(conversation.type)||!text(conversation.id))return 'unavailable';
-  if(id===undefined)return 'claimed';
-  if(!text(id))return 'unavailable';
-  const {platform,accountId}=entry.channel,at=now(),key=JSON.stringify([platform,accountId,conversation.type,conversation.id,id]);
+  const done=status=>{diagnostics.scope({...entry.channel,conversation}).emit('io','claim',{inputId:id,status});return status;};
+  if(closed||!entry.open)return done('unavailable');
+  if(!conversation||!['direct','group'].includes(conversation.type)||!text(conversation.id))return done('unavailable');
+  if(id===undefined)return done('claimed');
+  if(!text(id))return done('unavailable');
+  const {platform,adapter,accountId}=entry.channel,at=now(),key=JSON.stringify([platform,adapter,accountId,conversation.type,conversation.id,id]);
   const known=received.get(key);
-  if(known&&(!known.settled||at-known.at<inboundWindow))return 'duplicate';
+  if(known&&(!known.settled||at-known.at<inboundWindow))return done('duplicate');
   received.delete(key);received.set(key,{settled:true,at});
   for(const [k,e] of received){if(received.size<=rememberInbound)break;if(e.settled)received.delete(k);}
-  return 'claimed';
+  return done('claimed');
  }
 
  function validateInbound(message){
@@ -299,11 +310,11 @@ export function createAgentIO(options={}){
  //              was created (a platform re-delivery may be processed), stage
  //              'unknown' may follow an input and is never replayed.
  async function receive(entry,message){
-  const started=now(),done=result=>reportInbound(entry.channel,result,started);
+  const started=now(),done=result=>reportInbound(entry.channel,result,started,message);
   if(closed||!entry.open)return done({status:'rejected',reason:'closed'});
   const invalid=validateInbound(message);if(invalid)return done({status:'rejected',reason:invalid});
-  const {platform,accountId}=entry.channel,id=message.message.id;
-  const key=id===undefined?undefined:JSON.stringify([platform,accountId,message.conversation.type,message.conversation.id,id]);
+  const {platform,adapter,accountId}=entry.channel,id=message.message.id;
+  const key=id===undefined?undefined:JSON.stringify([platform,adapter,accountId,message.conversation.type,message.conversation.id,id]);
   if(key!==undefined){
    const known=received.get(key);
    if(known&&(!known.settled||started-known.at<inboundWindow))return done({status:'duplicate'});
@@ -327,12 +338,14 @@ export function createAgentIO(options={}){
   return done(result);
  }
 
- function reportInbound(channel,result,started){
+ function reportInbound(channel,result,started,message){
+  diagnostics.scope({...channel,conversation:message?.conversation}).emit('io','receive',{inputId:message?.message?.id,status:result.status,reason:result.reason,stage:result.stage,elapsedMs:Math.max(0,now()-started)});
   try{onEvent?.({event:'receive',platform:code(channel?.platform,'unknown'),status:result.status,reason:result.reason,stage:result.stage,elapsedMs:Math.max(0,now()-started)});}catch{}
   return Object.freeze(result);
  }
 
  function report(request,result,started){
+  trace(request,'send',{status:result.status,reason:result.reason,stage:result.stage,elapsedMs:Math.max(0,now()-started)});
   try{onEvent?.({event:'send',platform:code(request?.target?.platform,'unknown'),status:result.status,reason:result.reason,parts:result.parts.length,elapsedMs:Math.max(0,now()-started)});}catch{}
   return result;
  }
@@ -347,5 +360,5 @@ export function createAgentIO(options={}){
   channels.clear();received.clear();
  }
 
- return Object.freeze({sendMessage,registerAdapter,openInbound,issueActions,close});
+ return Object.freeze({sendMessage,registerAdapter,openInbound,issueActions,diagnostics,close});
 }

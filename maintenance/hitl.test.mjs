@@ -241,7 +241,7 @@ test('actions are Host-issued only: a self-made button set or one with attachmen
  assert.throws(()=>f.io.issueActions({ref:'issued-reference',options:[{value:'a b',label:'A'}]}),/Invalid action option/);
  assert.equal(f.sent.length,0);
  const entry=fs.readFileSync(new URL('../plugin-sources/dsh-agent-io/index.mjs',import.meta.url),'utf8');
- assert(entry.includes("ctx.provide('agentIO',Object.freeze({sendMessage:io.sendMessage,registerAdapter:io.registerAdapter,openInbound:io.openInbound,openConversation}))"),'the provided service cannot issue actions');
+ assert(entry.includes("ctx.provide('agentIO',Object.freeze({sendMessage:io.sendMessage,registerAdapter:io.registerAdapter,openInbound:io.openInbound,openConversation,diagnostics:io.diagnostics}))"),'the provided service cannot issue actions');
 });
 
 test('Interaction sees the wait; the QQ text gate answers before the merge guard; hitl.enabled:false leaves QQ requests native',async()=>{
@@ -250,7 +250,7 @@ test('Interaction sees the wait; the QQ text gate answers before the merge guard
  // The reviewed QQ text gate (hitlAnswers) on the real Bridge.
  const source=fs.readFileSync(new URL('./qqbot-src/dist/gateway/middleware-setup.js',import.meta.url),'utf8').replaceAll('\r\n','\n');
  const start=source.indexOf('export function hitlAnswers'),end=source.indexOf('export function setupMiddlewares',start);
- const cached=[],gate=vm.runInNewContext(source.slice(start,end).replace('export function','function')+';hitlAnswers',{cacheMsgId:(...a)=>cached.push(a)})({hitl:f.hitl});
+ const cached=[],gate=vm.runInNewContext(source.slice(start,end).replace('export function','function')+';hitlAnswers')({hitl:f.hitl},{cacheMsgId:(...a)=>cached.push(a)});
  const run=async(content,senderId='owner')=>{const c={message:{kind:'c2c',senderId,messageId:'mx-'+content,content},replyTarget:{scope:'c2c',targetId:senderId,msgId:'mx'},stop(reason){this.stopped=reason;}};let passed=false;await gate(c,async()=>{passed=true;});return {passed,stopped:c.stopped};};
  assert.deepEqual(await run('你好','stranger'),{passed:true,stopped:undefined});
  assert.deepEqual(await run('<@bot> 2'),{passed:false,stopped:'hitl:answered'});
@@ -268,6 +268,10 @@ test('the replaced path: no QQ HITL channel, button decoding or direct send outs
  const bootstrap=read('gateway/bootstrap.js'),setup=read('gateway/middleware-setup.js'),manager=read('session/session-manager.js');
  for(const old of ['question-channel.js','approval-channel.js','question-answer.js','button-utils.js'])for(const [name,s] of [['bootstrap',bootstrap],['middleware',setup]])assert(!s.includes(old),name+' imports '+old);
  assert(!/approvalChannel|questionChannel/.test(bootstrap+setup+manager),'no old channel reference remains');
+ for(const [file,name]of [['approval-channel.js','ApprovalChannel'],['question-channel.js','QuestionChannel']]){
+  const retired=vm.runInNewContext(read('features/'+file).replace('export class','class')+';'+name);
+  assert.throws(()=>new retired(),/retired; use conversation.openHITL/,'accidental legacy imports cannot resurrect direct senders');
+ }
  assert(/conversation\.openHITL\(/.test(bootstrap));assert(/manager\.hitl\?\.waiting\(record\)/.test(manager));assert(/manager\.hitl\?\.cancel\(record\)/.test(manager));
  const hitl=fs.readFileSync(new URL('../plugin-sources/dsh-agent-io/hitl.mjs',import.meta.url),'utf8');
  assert(!/sendMarkdown|\.ask\s*=|__qqQuestionPatched/.test(hitl),'the Bridge neither sends directly nor patches userQuestions.ask');

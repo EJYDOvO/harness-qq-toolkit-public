@@ -1,7 +1,6 @@
-import { errorHandler, messageFilter, accessPolicy, mentionGate, contentSanitizer, rateLimiter, concurrencyGuard, typingIndicator, quoteRef, historyBuffer, envelopeFormatter, } from '@tencent-connect/qqbot-nodejs';
+import { messageFilter, accessPolicy, mentionGate, contentSanitizer, rateLimiter, concurrencyGuard, typingIndicator, quoteRef, historyBuffer, envelopeFormatter, } from '@tencent-connect/qqbot-nodejs';
 import { buildCommandList } from "../commands/index.js";
 import { downloadMediaAttachments } from "../transport/attachment.js";
-import { cacheMsgId } from "../transport/msgid-cache.js";
 import { getHistoryStore, historyGroupKey } from "../features/history-store.js";
 /**
  * A QQ command spec (SDK SlashCommand shape: name, scope, authorized, handler)
@@ -42,7 +41,7 @@ export function commandGate(router) {
             sender: { id: msg.senderId },
             message: { ...(typeof msg.messageId === 'string' && msg.messageId ? { id: msg.messageId } : {}), text: cleaned },
         };
-        const result = await router.dispatch(input, { context: ctx, reply: text => ctx.bot.sendText(ctx.replyTarget, text) });
+        const result = await router.dispatch(input, { context: ctx });
         if (result.status === 'pass') return next();
         if (result.status === 'failed') ctx.log?.error?.(`[command] /${result.command} failed`);
         ctx.stop(`command:${result.status}${result.command ? ':' + result.command : ''}`);
@@ -65,7 +64,7 @@ export function attachmentDownloads(config, logger) {
                 const [file] = await downloadMediaAttachments([raw], config.media, logger);
                 if (file) out.push({ ...file, attachment });
             }
-            catch (err) { logger.warn(`im-qqbot: attachment download failed: ${err instanceof Error ? err.message : String(err)}`); }
+            catch (err) { logger.warn('im-qqbot: attachment download failed'); }
         }
         return out;
     };
@@ -84,7 +83,7 @@ export function attachmentDownloads(config, logger) {
  * question of this Conversation only for the expected person and claims the
  * platform message once. Anything else continues as ordinary chat input.
  */
-export function hitlAnswers(manager) {
+export function hitlAnswers(manager, replyIds) {
     return async (ctx, next) => {
         const hitl = manager.hitl, msg = ctx.message;
         if (!hitl) return next();
@@ -96,13 +95,16 @@ export function hitlAnswers(manager) {
         });
         if (result.status === 'pass') return next();
         // The answer never reaches bot.on('message'): keep its msgId as a passive-reply candidate.
-        if (result.status === 'answered') cacheMsgId(ctx.replyTarget.scope, ctx.replyTarget.targetId, ctx.replyTarget.msgId);
+        if (result.status === 'answered') replyIds.cacheMsgId(ctx.replyTarget.scope, ctx.replyTarget.targetId, ctx.replyTarget.msgId);
         ctx.stop(`hitl:${result.status}`);
     };
 }
-export function setupMiddlewares(bot, config, manager, logger, conversation) {
+export function setupMiddlewares(bot, config, manager, logger, conversation, replyIds) {
     // 1. 错误兜底（最外层洋葱皮）
-    bot.use(errorHandler());
+    // The SDK errorHandler directly sends raw exception text. Before an input
+    // has entered I/O there is no scoped reply grant: fail closed, never revive
+    // that sender. Admitted Session acquisition errors use conversation.reply.
+    bot.use(async (_ctx, next) => { try { await next(); } catch (error) { try { logger.error?.('QQ inbound pipeline failed; no direct fallback'); } catch {} throw error; } });
     // 2. 消息过滤：bot 回声 + 消息去重
     bot.use(messageFilter({ skipSelfEcho: false }));
     // 3. 访问控制（白名单/开放/禁用）
@@ -117,7 +119,7 @@ export function setupMiddlewares(bot, config, manager, logger, conversation) {
         },
         onBlock: (_mCtx, reason) => {
             if (config.debug) {
-                logger.debug(`Access blocked: ${reason}`);
+                logger.debug('Access blocked by configured policy');
             }
         },
     }));
@@ -175,7 +177,7 @@ export function setupMiddlewares(bot, config, manager, logger, conversation) {
     for (const cmd of commands) router.register(qqCommand(cmd));
     bot.use(commandGate(router));
     // 8.5. 待答问题文本作答（HITL Bridge；在 concurrencyGuard 之前，答案消息不排队直接作答）
-    bot.use(hitlAnswers(manager));
+    bot.use(hitlAnswers(manager, replyIds));
     // Explicit correction only, after access/question admission but before merge.
     // Ordinary messages and /stop retain their existing native paths.
     bot.use(async (mCtx, next) => {
@@ -191,7 +193,10 @@ export function setupMiddlewares(bot, config, manager, logger, conversation) {
         }
         record.replyTarget = { scope: 'c2c', targetId: msg.senderId, msgId: msg.messageId };
         // The shared handoff re-checks the current Session and creates the native input.
-        const handed = conversation.submit(record, msg.content, { revise: true });
+        const handed = conversation.submit(record, msg.content, { revise: true, input: {
+            platform: conversation.platform, adapter: conversation.adapter, accountId: conversation.accountId,
+            conversation: { type: 'direct', id: msg.senderId }, sender: { id: msg.senderId }, message: { id: msg.messageId, text: msg.content },
+        } });
         if (handed.status !== 'accepted') throw new Error('Interaction Session changed during admission');
     });
     // 9. 并发串行 + 消息合并（同 peer 排队，避免 session 冲突）

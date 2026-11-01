@@ -38,7 +38,7 @@ test('a notification reaches its stable Conversation without a current Session; 
 });
 test('only an issued grant opens the notification route; authority, admission, account and closing are checked before every part',async()=>{
  const g=gateway({split:t=>t.split('|')});
- const forged=await g.io.sendMessage({target:{platform:'qq-official',accountId:'app',conversation:owner},origin:{notification:{authorize:()=>true,closed:()=>false}},message:{text:'伪造'}});
+ const forged=await g.io.sendMessage({target:{platform:'qq-official',adapter:'qq-official-gateway',accountId:'app',conversation:owner},origin:{notification:{authorize:()=>true,closed:()=>false}},message:{text:'伪造'}});
  assert.deepEqual([forged.status,forged.reason],['not-sent','unauthorized'],'a self-made grant is not a notification');
  assert.equal((await g.notifier.send({id:'a1',conversation:owner,text:'x',authorize:()=>false})).reason,'unauthorized');
  assert.equal((await g.notifier.send({id:'a2',conversation:owner,text:'x',authorize:()=>{throw Error('boom');}})).reason,'unauthorized');
@@ -76,7 +76,7 @@ test('the Gateway opens one notifier for its notification authorities only; noti
  const read=f=>fs.readFileSync(new URL('./qqbot-src/dist/'+f,import.meta.url),'utf8');
  const bootstrap=read('gateway/bootstrap.js');
  assert.match(bootstrap,/const notifications = config\.notifications\?\.enabled === false \? undefined : conversation\.openNotifications\(\);/);
- assert.match(bootstrap,/qqRemoteOps'\)\?\.attach\(\{ bot, manager, sender, config, \.\.\.\(notifications \? \{ notifications \} : \{\}\) \}\)/);
+ assert.match(bootstrap,/qqRemoteOps'\)\?\.attach\(\{ \.\.\.runtime,/);
  assert.match(bootstrap,/ctx\.provide\('qqGateway', Object\.freeze\(\{ bot, manager, sender \}\)\)/,'the general Gateway service does not hand out the notifier');
  const ops=fs.readFileSync(new URL('../plugin-sources/dsh-remote-ops/index.js',import.meta.url),'utf8');
  assert(!/sender\.sendMarkdown/.test(ops),'Remote Ops has no direct Gateway send');
