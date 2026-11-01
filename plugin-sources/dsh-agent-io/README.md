@@ -1,6 +1,6 @@
 # DSH Agent I/O（Unified Agent I/O）
 
-独立、平台无关的 Host 插件，提供 sendMessage、openInbound、openConversation、内部 Commands/Media、HITL 与通知通道。当前源码 `0.1.0-test.8`（Iteration 08 候选，未部署）；最近部署记录为 Iteration 07 的 test.7，真实 QQ/按钮/手机验收另计。验证基线为 DSH `0.2.1-rc.3`、Node 24。
+独立、平台无关的 Host 插件，提供 sendMessage、openInbound、openConversation、内部 Commands/Media、HITL 与通知通道。当前源码 `0.1.0-test.8`（Iteration 08，2026-11-02 已授权部署）；Iteration 07 的 test.7 为历史版本，真实 QQ/按钮/手机验收另计。验证基线为 DSH `0.2.1-rc.3`、Node 24。
 
 它只做逻辑消息的交接语义：出站的校验、同 Conversation 串行、取消与分片间复核、同一逻辑消息去重、诚实的结果；入站的标准消息交接、按平台消息范围去重与交接结果；以及平台无关的 Session 接线（Manager 取得/校验当前 Session、原生 `UserMessage`、Interaction 交接、出站可信路由）。平台协议（回复目标、限额、分片、API 错误、事件解析与标准化）由各平台 Adapter 负责；准入与权限仍属 Host；Session 与路由仍由原生 DSH 和 [Conversation Manager](../dsh-conversation-manager/README.md) 负责。不依赖 QQ SDK、Character、Interaction 或 Conversation Manager 包（只使用平台传入的 Manager 句柄），原生消息构造取自 Host 提供的 `@deepseek-ai/dsh-llm`；不注册模型工具、RPC 或路由；不持久化任何状态。
 
@@ -259,7 +259,7 @@ npm test
 ## 本轮未覆盖
 
 被 SDK 合并的非首条消息 ID 不进入 I/O 去重；显式更正由 SDK 去重后通过 I/O submit 交接，Identity 只接收该可信输入钩子（更正不经普通 Inbound 去重；命令自 Iteration 05、HITL 文本作答自 Iteration 06 起经 I/O 认领）；出站引用关联（`replyTo`）与远程 URL 附件；视觉理解等高级媒体工具仍为原实现；Remote Ops 启动时的 Owner 路由恢复与 Character Identity 的准入仍直接调用 Manager `getOrCreate`（不是 Agent 输入）；Interaction 气泡的持久发送状态与崩溃后恢复（重启后同一气泡不会被识别为重复）；HITL 请求的持久状态与重启恢复（重启即取消）、同一 Session 并发的第二个审批（返回 `unavailable`）、真实 QQ 按钮与手机端验收；通知的跨服务优先级与公平性（只有同 Conversation 的先后顺序）、真实 QQ 主动推送额度与手机收件；QQ Personal 及其他平台；持久发送状态与崩溃恢复；真实 QQ 手机收件验收。
-## Iteration 08 增量（test.8，未部署）
+## Iteration 08 增量（test.8，已部署；手机验收另计）
 
 目标/通道使用完整 `platform / adapter / accountId / conversation{type,id}`。`openConversation()` 生成的目标包含 adapter，handoff 必须匹配。低层旧调用省略 adapter 时只进入独立 legacy 范围，不能进入 QQ 具名通道；不改任何持久 Session/身份 ID。
 

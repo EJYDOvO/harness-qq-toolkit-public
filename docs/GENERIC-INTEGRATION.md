@@ -1,6 +1,6 @@
 # QQTK 通用安装与依赖
 
-Iteration 08 候选为 Manager test.3 / Agent I/O test.8（未部署），保留恢复错误分类、唯一当前路由和关闭生命周期，并移除普通日志中的原始路由值。普通 QQ 无 Character/Remote Ops 的合成平台与原生 Host 验证见 Character STATUS；NapCat 与手机验收仍未完成。路由接口见 [独立插件说明](../plugin-sources/dsh-conversation-manager/README.md)。
+Iteration 08 为 Manager test.3 / Agent I/O test.8（2026-11-02 已授权部署），保留恢复错误分类、唯一当前路由和关闭生命周期，并移除普通日志中的原始路由值。普通 QQ 无 Character/Remote Ops 的合成平台与原生 Host 验证见 Character STATUS；NapCat 与手机验收仍未完成。路由接口见 [独立插件说明](../plugin-sources/dsh-conversation-manager/README.md)。
 
 当前 QQ 补丁要求 I/O test.8 的 `conversation.reply`。所有具名通道的输入和目标都带 platform/adapter/account；不得把省略 adapter 的旧低层请求混入具名通道。模型、platformData、昵称和相同消息 ID 不能授予身份。去重仅进程内、有界；不同真实账号及不同 Adapter 默认隔离，不改变旧 QQ Session Key。
 
