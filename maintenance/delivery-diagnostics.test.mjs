@@ -7,6 +7,16 @@ import {resolve} from 'node:path';
 import {homedir} from 'node:os';
 import vm from 'node:vm';
 const source=readFileSync(new URL('./qqbot-src/dist/gateway/bootstrap.js',import.meta.url),'utf8');
+test('attachment downloader logs never disclose filenames, local paths or raw failures',async()=>{
+ const source=readFileSync(new URL('./qqbot-src/dist/gateway/middleware-setup.js',import.meta.url),'utf8'),begin=source.indexOf('export function attachmentDownloads'),end=source.indexOf('/**',begin);
+ const lines=[],logger=Object.fromEntries(['debug','warn','error'].map(k=>[k,t=>lines.push(t)]));
+ const make=vm.runInNewContext(source.slice(begin,end).replace('export function','function')+';attachmentDownloads;',{
+  downloadMediaAttachments:async(_a,_c,log)=>{for(const k of ['debug','warn','error'])log[k]('PRIVATE_FILENAME_PATH_ERROR');return [{path:'synthetic-resource'}];},
+ });
+ const ctx={state:{},message:{attachments:[{filename:'PRIVATE_FILENAME_PATH_ERROR'}]}};
+ let called=false;await make({media:{}},logger)(ctx,async()=>{called=true;});
+ assert(called);assert.equal(ctx.state.downloadedFiles[0].path,'synthetic-resource');assert.equal(ctx.state.downloadedFiles[0].attachment,0);assert.equal(lines.length,3);assert(!JSON.stringify(lines).includes('PRIVATE_'));
+});
 test('SDK dynamic log text never reaches the Host logger',()=>{
  const begin=source.indexOf('export function privateSDKLogger'),end=source.indexOf('// Opt-in bounded',begin);
  const make=vm.runInNewContext(source.slice(begin,end).replace('export function','function')+';privateSDKLogger;');

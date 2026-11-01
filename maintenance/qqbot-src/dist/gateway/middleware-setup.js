@@ -57,11 +57,17 @@ export function commandGate(router) {
  * is lost.
  */
 export function attachmentDownloads(config, logger) {
+    // Upstream download logs contain filenames, local paths and raw errors.
+    const downloadLog = {
+        debug: () => logger.debug?.('QQ attachment download state changed'),
+        warn: () => logger.warn?.('QQ attachment download unavailable'),
+        error: () => logger.error?.('QQ attachment download failed'),
+    };
     const each = async list => {
         const out = [];
         for (const [attachment, raw] of (list ?? []).entries()) {
             try {
-                const [file] = await downloadMediaAttachments([raw], config.media, logger);
+                const [file] = await downloadMediaAttachments([raw], config.media, downloadLog);
                 if (file) out.push({ ...file, attachment });
             }
             catch (err) { logger.warn('im-qqbot: attachment download failed'); }

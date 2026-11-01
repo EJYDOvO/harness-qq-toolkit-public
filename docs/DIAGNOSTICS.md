@@ -31,3 +31,5 @@ HMAC 使用随机进程内密钥，并按 platform/adapter/account 分域。同�
 `sent` 表示平台 API 已接受，不代表手机到达。`not-sent` 区分 before-platform 与 platform；`unknown` 可能已发生，`partial` 已接受部分分片，二者不能自动重发。Remote Ops 的 JSON status 是交接时摘要；Character 组合的最终持久权威仍是 SQLite Outbox。
 
 默认日志不再输出 Manager 路由/Session 原值、QQ 入站 JSON 或 SDK 动态异常。QQ 协议 ACK/Typing 与 Token/WebSocket 是控制操作，不是审批结果或聊天送达。I/O 前的中间件异常没有输入回复授权时仅产生固定 Host 告警，不恢复 SDK 直发。
+
+附件下载器只收到分类日志适配器，原始文件名、本地路径及异常内容不传给 Host logger；这不改变资源校验、下载结果或失败语义。
