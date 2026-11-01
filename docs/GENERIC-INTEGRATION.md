@@ -1,6 +1,14 @@
 # QQTK 通用安装与依赖
 
-当前源码为 Manager test.2，修复恢复错误分类和关闭生命周期；抽离基线 test.1 已随 Character test.21 授权部署，新版部署见仓库根 README。普通 QQ 新装、NapCat 与手机验收仍待独立完成；历史版本记录不证明这些组合。路由接口、安装与恢复前置见 [独立插件说明](../plugin-sources/dsh-conversation-manager/README.md)。
+Iteration 08 候选为 Manager test.3 / Agent I/O test.8（未部署），保留恢复错误分类、唯一当前路由和关闭生命周期，并移除普通日志中的原始路由值。普通 QQ 无 Character/Remote Ops 的合成平台与原生 Host 验证见 Character STATUS；NapCat 与手机验收仍未完成。路由接口见 [独立插件说明](../plugin-sources/dsh-conversation-manager/README.md)。
+
+当前 QQ 补丁要求 I/O test.8 的 `conversation.reply`。所有具名通道的输入和目标都带 platform/adapter/account；不得把省略 adapter 的旧低层请求混入具名通道。模型、platformData、昵称和相同消息 ID 不能授予身份。去重仅进程内、有界；不同真实账号及不同 Adapter 默认隔离，不改变旧 QQ Session Key。
+
+每个 Gateway 独立拥有被动回复 ID 缓存并在卸载时清空；文本、媒体、互动回答使用同一实例，不读取其他账号的候选。已被 HITL Bridge 替代的内部 ApprovalChannel/QuestionChannel 保留明确拒绝入口，不能重新挂载旧的直发通道。
+
+Character 专用集成通过 QQ 插件自有 `apply(ctx, config, integration)` 的 Host-only `qqGatewayLifecycle@1` 参数，在 SDK 启动前附加准入/通知回调；不是配置表单、工具或 RPC。普通 QQ 不传该参数，Remote Ops 仍可选。兼容补丁导出 `gatewayLifecycleContractVersion:1`，旧原版包不能冒充支持该接口。
+
+命令回复与已进入 I/O 的 Session 获取错误改用短期输入回复授权；SDK 默认错误中间件不再直发异常。在 I/O 前失败时保留固定 Host 告警并传播原异常，没有未经授权的备用 Sender。Typing/ACK 仍为协议控制，审批权威仍属于原生 Approval。详细诊断是可选观察，见 [字段规范](DIAGNOSTICS.md)。
 
 QQTK 继续是独立插件与维护组件集合，不迁入 Character 仓库、不合并单体。Character 通过固定版本的 QQTK 接口和补丁使用它。
 

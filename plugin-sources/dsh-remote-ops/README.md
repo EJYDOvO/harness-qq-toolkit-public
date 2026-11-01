@@ -52,4 +52,7 @@ stateDirectory/jobs 下的 result.json 可接入现有维护通知（action/ok/r
 更新前备份配置、状态和旧安装包，固定依赖及补丁哈希，独立 Profile 验证后单活切换。基础 QQ 审批/问答不经过本插件。启动仅恢复 Owner Session，不自动执行模型请求；/new 不迁移旧提醒，应先管理原提醒。
 ## Interaction 兼容
 
-当前源码版本 `1.1.1-test.2`（Iteration 07：通知只经 Agent I/O 通知器或 Character Outbox），2026-11-01 已配套 Character test.26 / Agent I/O test.7 授权部署，启动与既有账本保留检查通过；真实 QQ 通知仍待验收。`1.1.1-test.1` 曾配套 Character test.10 部署。目标 Agent 存在可选 Interaction 服务时让出普通等待提示，保留维护、超时、故障与任务完成通知；原生流式帧更新活动时间。旧 `1.1.0` 恢复包未被覆盖。详见 [适配说明](../../docs/INTERACTION.md)。
+Iteration 07 部署版本 `1.1.1-test.2`（Iteration 07：通知只经 Agent I/O 通知器或 Character Outbox），2026-11-01 已配套 Character test.26 / Agent I/O test.7 授权部署，启动与既有账本保留检查通过；真实 QQ 通知仍待验收。`1.1.1-test.1` 曾配套 Character test.10 部署。目标 Agent 存在可选 Interaction 服务时让出普通等待提示，保留维护、超时、故障与任务完成通知；原生流式帧更新活动时间。旧 `1.1.0` 恢复包未被覆盖。详见 [适配说明](../../docs/INTERACTION.md)。
+## Iteration 08 候选（1.1.1-test.3，未部署）
+
+通知与持久写入规则不变。Gateway 可选传入 `diagnostics`，Remote Ops 只记录脱敏事件关系与交接状态；观察异常不能改变 Ledger 或发送。与 Character 组合时不再拦截 `attach`，Gateway 使用显式 Host 集成参数取得 Character 的 `notifyEvent`；SQLite Outbox 仍是唯一发送者。下文 test.2 是最近部署记录。
