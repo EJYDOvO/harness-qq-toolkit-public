@@ -12,6 +12,14 @@ Character 专用集成通过 QQ 插件自有 `apply(ctx, config, integration)` �
 
 QQTK 继续是独立插件与维护组件集合，不迁入 Character 仓库、不合并单体。Character 通过固定版本的 QQTK 接口和补丁使用它。
 
+### Iteration 08 复审边界
+
+Remote Ops 命令和通知器在 Gateway 启动时挂接，不支持单独热插拔后自动重装。卸载 Remote Ops 后旧命令必须拒绝、旧 Bot 监听器释放；重新加载 Remote Ops 后须显式重载 QQ Gateway，才能注册一次新命令并附着新通知器。已进入后端的在途操作不能撤回；卸载不授权自动重试。
+
+`openConversation.onInput` 是同步准入/证据钩子，不得自行调用 followup/intervene/revise。钩子抛错返回 `not-delivered/entry-error`，I/O 分类为 `failed/before-handoff` 并释放该入站去重项。原生交接调用抛错仍为 unknown，不自动重放。上游 SDK 自身的预去重不由此回滚，不能据此宣称 QQ 会自动重投；必要时用户重新发送新消息。
+
+输入回复授权从 I/O 认领/收到输入起仅有效 300 秒（单调时钟，每片检查），独立于 QQ msgId 的协议窗口。长命令仍可执行完成，但到期或排队跨过期限时回复被拒绝，命令返回 `handled,replied:false`；相同消息不会重新执行。应先返回任务 ID，再通过现有任务/结果查询和独立授权通知通道报告完成，不能延长输入授权或自动改用主动推送。
+
 ## 依赖变化
 
 | 功能 | 旧前提 | 当前前提 |

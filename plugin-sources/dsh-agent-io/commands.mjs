@@ -71,8 +71,8 @@ export function createCommandRouter({prefixes=['/'],claim,admits,messages={}}={}
   *   duplicate  this platform message was already claimed: nothing runs, no Agent input
   *   rejected   not admitted / invalid / no inbound channel: nothing runs, no reply
   *   denied     scope or authorization refused (reply sent)
-  *   handled    executed (result replied)
-  *   failed     execute threw (error replied)
+  *   handled    executed; inspect replied for whether a response was accepted
+  *   failed     execute threw; inspect replied for the error response
   * Every status except pass means the message must not reach the Agent.
   */
  async function dispatch(input,{reply,context}={}){

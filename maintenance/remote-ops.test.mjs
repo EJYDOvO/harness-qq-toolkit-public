@@ -1,6 +1,21 @@
 import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import path from 'node:path';
 import {apply} from '../plugin-sources/dsh-remote-ops/index.js';
 import {PrefsStore} from '../plugin-sources/dsh-conversation-manager/preferences.mjs';
+test('retired Remote Ops commands cannot reach a released backend and detach removes Bot listeners',async t=>{
+ const state=fs.mkdtempSync(path.resolve('tmp/ops-retirement-')),cleanup=[],handlers=new Map();let service,calls=0;
+ const backend={features(){calls++;return {remoteOps:{enabled:true}};},setFeature(){calls++;},tasks(){calls++;return {};},stop(){calls++;},jobs(){calls++;return [];},queue(){calls++;return 'queued';}};
+ const ctx={agents:{},get:n=>n==='qqMaintenance'?backend:undefined,on(){},provide:(_,v)=>service=v,effect:f=>cleanup.push(f())};
+ apply(ctx,{stateDirectory:state,ownerId:'owner',backend:'service'});t.after(()=>cleanup.forEach(f=>f()));
+ const bot={on(n,f){handlers.set(n,f);},off(n,f){if(handlers.get(n)===f)handlers.delete(n);}},manager={sessions:new Map(),getOrCreate:async()=>{}};
+ service.attach({config:{access:{c2cMode:'allowlist',c2cAllow:['owner']}},bot,manager});
+ const command=service.commands(manager)[0],call={message:{kind:'c2c',senderId:'owner'},command:{args:['backup']}};
+ assert.equal(await command.handler(call),'queued');const before=calls;cleanup.forEach(f=>f());
+ assert.notEqual(command.authorized(call),true);await assert.rejects(()=>command.handler(call),/retired/);
+ assert.equal(calls,before);assert.equal(handlers.size,0);assert.throws(()=>service.attach({}),/retired/);
+ apply(ctx,{stateDirectory:state,ownerId:'owner',backend:'service'});
+ assert.notEqual(command.authorized(call),true,'new instance never revives old command');
+ const fresh=service.commands(manager)[0];assert.equal(await fresh.handler(call),'queued');assert.equal(handlers.size,0,'Gateway reload is required to attach a new notifier');
+});
 
 // Stand-in for the Gateway's Agent I/O notifier: the target must pass the sender's
 // own authorization, and the result is an Agent I/O SendResult.

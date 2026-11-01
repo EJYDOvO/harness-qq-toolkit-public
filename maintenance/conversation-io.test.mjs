@@ -48,6 +48,22 @@ function host(t,{home,durable=new Map(),clock={now:Date.now()},namespace='chat-a
 
 let inputs=0;
 const nativeInput=m=>({id:'native-'+(++inputs),role:'user',...m});
+test('an admission hook failure is before-handoff and permits one safe redelivery',async t=>{
+ const h=host(t),io=createAgentIO();let fail=true;
+ const p=platform(io,h.manager,{onInput(){if(fail)throw Error('synthetic admission failure');}});
+ const result=await p.receive('u1','admission');
+ assert.equal(result.stage,'before-handoff');assert.deepEqual(texts(current(h.manager,'dm','u1')),[]);
+ fail=false;assert.equal((await p.receive('u1','admission')).status,'accepted');
+ assert.equal((await p.receive('u1','admission')).status,'duplicate');assert.deepEqual(texts(current(h.manager,'dm','u1')),['你好']);
+ await io.close();
+});
+test('a native handoff that throws after accepting remains unknown and never automatically replays',async t=>{
+ const h=host(t),io=createAgentIO(),p=platform(io,h.manager);await p.receive('u1','setup');
+ const r=current(h.manager,'dm','u1'),original=r.agent.followup;
+ r.agent.followup=function(m){original.call(this,m);throw Error('after native acceptance');};
+ assert.equal((await p.receive('u1','uncertain')).stage,'unknown');
+ assert.equal((await p.receive('u1','uncertain')).status,'duplicate');assert.equal(texts(r).length,2);await io.close();
+});
 // A synthetic platform: only protocol code (its scope names, access list, opaque
 // reply target, transport). Session lookup, current-Session checks, native input
 // and Interaction come from the shared wiring.

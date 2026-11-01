@@ -75,7 +75,10 @@ export function createConversations(io,host){
    if(p===null)return {status:'not-delivered',reason:'interaction-unavailable'};
    if(revise&&typeof p?.revise!=='function')return {status:'not-delivered',reason:'no-interaction'};
    const message=host.createInput({content:[{type:'text',text:content}],source:{kind:'user'}});
-   onInput?.(record,message,p||undefined,input);
+   // This synchronous admission hook must not hand input to the Agent itself.
+   // Failure here is provably before the native/Interaction handoff below.
+   try{onInput?.(record,message,p||undefined,input);}
+   catch(error){return {status:'not-delivered',reason:'entry-error',error};}
    diagnostics?.emit('conversation','input',{sessionId:record.sessionId,conversation:target(record)?.conversation,inputId:input?.message?.id,status:'accepted'});
    if(p)p.admitInput?.(message);
    let mode;

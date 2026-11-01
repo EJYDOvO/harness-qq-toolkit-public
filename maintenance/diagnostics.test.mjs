@@ -4,6 +4,15 @@ import {createDiagnostics} from '../plugin-sources/dsh-agent-io/diagnostics.mjs'
 import {createAgentIO} from '../plugin-sources/dsh-agent-io/io.mjs';
 import {createConversations} from '../plugin-sources/dsh-agent-io/conversation.mjs';
 const context={platform:'synthetic',adapter:'synthetic-adapter',accountId:'private-account',conversation:{type:'direct',id:'private-user'}};
+test('commands finishing beyond 300 seconds execute once but cannot use an expired input reply',async()=>{
+ let at=0,runs=0,sends=0;
+ const io=createAgentIO(),c=createConversations(io,{now:()=>at,createInput:x=>x,interactionPolicy:()=>undefined})({...context,scopes:{direct:'dm'},admits:()=>true,manager:{getOrCreate(){throw Error('no session grant');},getSessionRecord(){},isCurrentSession:()=>false}});
+ c.openInbound(()=>({status:'accepted'}));c.registerAdapter({split:t=>[t],async send(){sends++;}});
+ const commands=c.openCommands();commands.register({name:'slow',execute(){runs++;at+=300_000;return 'done';}});
+ const input={conversation:context.conversation,sender:{id:'private-user'},message:{id:'slow',text:'/slow'}};
+ const result=await commands.dispatch(input);assert.equal(result.status,'handled');assert.equal(result.replied,false);
+ assert.equal((await commands.dispatch(input)).status,'duplicate');assert.equal(runs,1);assert.equal(sends,0);c.close();await io.close();
+});
 test('diagnostics are optional, bounded, closed-shape and observer failures cannot change a result',async()=>{
  const off=createDiagnostics();off.scope(context).emit('io','send',{status:'sent'});assert.deepEqual(off.snapshot(),[]);
  const d=createDiagnostics({enabled:true,capacity:3,onEvent:()=>{throw Error('diagnostic failure');}}),s=d.scope(context),rows=[];
