@@ -984,10 +984,10 @@ index c4998d0..a47bcfd 100644
 \ No newline at end of file
 +//# sourceMappingURL=index.js.map
 diff --git a/dist/gateway/bootstrap.js b/dist/gateway/bootstrap.js
-index 070f21e..02492ee 100644
+index 070f21e..bf66f85 100644
 --- a/dist/gateway/bootstrap.js
 +++ b/dist/gateway/bootstrap.js
-@@ -1,37 +1,359 @@
+@@ -1,37 +1,365 @@
 -import { QQBot } from '@tencent-connect/qqbot-nodejs';
 +import { QQBot, MediaFileType } from '@tencent-connect/qqbot-nodejs';
 +import { createHmac, randomBytes, randomUUID } from 'node:crypto';
@@ -1038,7 +1038,13 @@ index 070f21e..02492ee 100644
 +        chain=chain.then(async()=>{
 +            await diagnosticFs.mkdir(dir,{recursive:true,mode:0o700});
 +            const size=await diagnosticFs.stat(file).then(s=>s.size,e=>{if(e.code==='ENOENT')return 0;throw e;});
-+            if(size>=1024*1024){await diagnosticFs.rm(file+'.1',{force:true});await diagnosticFs.rename(file,file+'.1');}
++            if(size>=1024*1024){
++                // Seven previous windows plus the active file. Old .1 files
++                // remain compatible; never rotate or retain message contents.
++                await diagnosticFs.rm(file+'.7',{force:true});
++                for(let i=6;i>=1;i--)await diagnosticFs.rename(file+'.'+i,file+'.'+(i+1)).catch(error=>{if(error.code!=='ENOENT')throw error;});
++                await diagnosticFs.rename(file,file+'.1');
++            }
 +            await diagnosticFs.appendFile(file,batch.join(''),{mode:0o600});
 +        }).catch(()=>{if(!warned){warned=true;logger?.warn?.('QQ delivery diagnostics unavailable; messaging continues without file diagnostics');}}).finally(()=>{writing=false;});
 +        return chain;
@@ -1087,7 +1093,10 @@ index 070f21e..02492ee 100644
 +        logger,
 +    });
 +}
-+/**
+ /**
+- * interaction 统一分发器：按 button_data 的顶层 `t` 判别字段，路由到对应
+- * channel（question / approval）。QQ 只有一个 interaction 入口，集中路由
+- * 避免多通道各自 try 导致误判。
 + * Cancellation controllers of native Turns, per Session. A controller leased by
 + * a submission still in the Unified Agent I/O is never evicted, so /stop always
 + * reaches queued output; idle ones are bounded per Session and overall (leased
@@ -1095,7 +1104,19 @@ index 070f21e..02492ee 100644
 + * is dropped at turn/end; an aborted one stays as a tombstone (within the
 + * bounds) so late output of that Turn remains cancelled. Output without a Turn
 + * shares one Session controller that /stop replaces after aborting it.
-+ */
+  */
+-function dispatchInteraction(event, manager) {
+-    const raw = event.data?.resolved?.button_data;
+-    if (!raw)
+-        return false;
+-    const button = decodeButtonData(raw);
+-    if (!button)
+-        return false;
+-    if (button.t === 'question')
+-        return manager.questionChannel?.handleInteraction(event) ?? false;
+-    if (button.t === 'approval')
+-        return manager.approvalChannel?.handleInteraction(event) ?? false;
+-    return false;
 +export function createTurnControls({ maxTurns = 8, maxSessions = 256 } = {}) {
 +    const sessions = new Map();
 +    const ANY = '*';
@@ -1176,7 +1197,8 @@ index 070f21e..02492ee 100644
 +        close() { closed = true; for (const session of sessions.values()) abortAll(session); sessions.clear(); },
 +        size() { let n = 0; for (const s of sessions.values()) n += s.size; return { sessions: sessions.size, controllers: n }; },
 +    };
-+}
+ }
+-export async function bootstrapGateway(ctx, agents, config, logger) {
 +// Reusable transport wiring, separately testable without creating a QQ gateway.
 +// Every QQ chat message (Interaction bubbles and hang-on lines, plain replies,
 +// tool results, turn errors) is one logical message for the Unified Agent I/O,
@@ -1300,28 +1322,13 @@ index 070f21e..02492ee 100644
 +    return outboundHandler;
 +}
 +const MEDIA_TYPES = { image: 'IMAGE', video: 'VIDEO', voice: 'VOICE', file: 'FILE' };
- /**
-- * interaction 统一分发器：按 button_data 的顶层 `t` 判别字段，路由到对应
-- * channel（question / approval）。QQ 只有一个 interaction 入口，集中路由
-- * 避免多通道各自 try 导致误判。
++/**
 + * One trusted local attachment → QQ media message, in two stages so a failure
 + * is classified honestly: the resource is re-checked first (still its own real
 + * path, inside the allowed roots, a regular file), then uploaded without sending
 + * (the SDK retries uploads; an upload alone is invisible to the user), then the
 + * media message is sent. Passive-reply quota as for files before (no event_id).
-  */
--function dispatchInteraction(event, manager) {
--    const raw = event.data?.resolved?.button_data;
--    if (!raw)
--        return false;
--    const button = decodeButtonData(raw);
--    if (!button)
--        return false;
--    if (button.t === 'question')
--        return manager.questionChannel?.handleInteraction(event) ?? false;
--    if (button.t === 'approval')
--        return manager.approvalChannel?.handleInteraction(event) ?? false;
--    return false;
++ */
 +export async function sendMedia(bot, replyLimiter, config, target, attachment, replyIds) {
 +    let file;
 +    try { file = await verifyLocalFile(attachment?.resource?.path, config.sendFile, config.cwd || process.cwd(), { expectReal: true }); }
@@ -1341,8 +1348,7 @@ index 070f21e..02492ee 100644
 +        return { id: message?.id, uploaded: upload.file_uuid };
 +    }
 +    catch (error) { throw Object.assign(new Error('QQ media message failed'), { qqStage: 'message', cause: error }); }
- }
--export async function bootstrapGateway(ctx, agents, config, logger) {
++}
 +export async function bootstrapGateway(ctx, agents, config, logger, options) {
 +    if (gatewayLeases.has(config.appId)) throw new Error('Duplicate QQ Gateway for this application');
 +    const lease = {};
@@ -1370,7 +1376,7 @@ index 070f21e..02492ee 100644
      // ── 初始化 QQ Bot SDK ──
      const userAgent = buildUserAgent();
      const bot = new QQBot({
-@@ -41,20 +363,24 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+@@ -41,20 +369,24 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
          baseUrl: process.env.QQBOT_BASE_URL?.replace(/\/+$/, '') || 'https://api.bot.qq.com',
          tokenBaseUrl: process.env.QQBOT_TOKEN_BASE_URL?.replace(/\/+$/, '') || 'https://api.bot.qq.com',
          userAgent,
@@ -1401,7 +1407,7 @@ index 070f21e..02492ee 100644
      });
      // ── 出站：dsh session/event → QQ 消息 ──
      // 获取 tools 服务（工具结果结构化展示），可选
-@@ -65,49 +391,72 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+@@ -65,49 +397,72 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
      catch {
          toolsRegistry = undefined;
      }
@@ -1497,7 +1503,7 @@ index 070f21e..02492ee 100644
              if (event.willReconnect) {
                  logger.warn(`Bot disconnected (${detail}), reconnecting...`);
              }
-@@ -117,10 +466,10 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+@@ -117,10 +472,10 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
          });
      }
      catch (err) {
@@ -1510,7 +1516,7 @@ index 070f21e..02492ee 100644
      });
      // ── 富媒体过期清理 ──
      if (config.media.enabled) {
-@@ -130,27 +479,22 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
+@@ -130,27 +485,22 @@ export async function bootstrapGateway(ctx, agents, config, logger) {
      ensureVisionInputModal(config.vision, logger);
      registerDescribeImageTool(ctx, config.vision, logger);
      // ── 附件发送工具注册（qqbot_send_file） ──

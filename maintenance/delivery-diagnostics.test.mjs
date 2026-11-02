@@ -28,6 +28,18 @@ const start=source.indexOf('export function createDeliveryRecorder'),end=source.
 const create=vm.runInNewContext(source.slice(start,end).replace('export function','function')+';createDeliveryRecorder;',{
  diagnosticFs:fs,diagnosticPath:resolve,diagnosticHome:homedir,createHmac,randomBytes,randomUUID,setTimeout,clearTimeout,process,
 });
+test('bounded rotation retains several windows instead of losing the complete earlier lifecycle',async t=>{
+ await fs.mkdir('tmp',{recursive:true});const dir=await fs.mkdtemp(resolve('tmp','qq-delivery-history-'));t.after(()=>fs.rm(dir,{recursive:true,force:true}));
+ const recorder=create(true,{},dir),file=resolve(dir,'delivery.jsonl');
+ for(let i=0;i<10;i++){
+  await fs.writeFile(file,JSON.stringify({event:'lifecycle',seq:i})+'\n'+' '.repeat(1024*1024));
+  recorder.trace('stream-open',{seq:i});await recorder.flush();
+ }
+ await recorder.close();
+ assert.deepEqual((await fs.readdir(dir)).sort(),['delivery.jsonl',...Array.from({length:7},(_,i)=>'delivery.jsonl.'+(i+1))]);
+ assert.equal(JSON.parse((await fs.readFile(file+'.7','utf8')).split('\n')[0]).seq,3);
+ assert.equal(JSON.parse((await fs.readFile(file+'.1','utf8')).split('\n')[0]).seq,9);
+});
 test('delivery diagnostics are opt-in, bounded, redacted and stable only within a boot',async t=>{
  await fs.mkdir('tmp',{recursive:true});const dir=await fs.mkdtemp(resolve('tmp','qq-delivery-'));t.after(()=>fs.rm(dir,{recursive:true,force:true}));
  assert.equal(create(false,{},dir),null);assert.deepEqual(await fs.readdir(dir),[]);

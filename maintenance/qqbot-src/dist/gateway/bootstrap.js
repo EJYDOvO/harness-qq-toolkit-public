@@ -41,7 +41,13 @@ export function createDeliveryRecorder(enabled, logger, directory, hub, context)
         chain=chain.then(async()=>{
             await diagnosticFs.mkdir(dir,{recursive:true,mode:0o700});
             const size=await diagnosticFs.stat(file).then(s=>s.size,e=>{if(e.code==='ENOENT')return 0;throw e;});
-            if(size>=1024*1024){await diagnosticFs.rm(file+'.1',{force:true});await diagnosticFs.rename(file,file+'.1');}
+            if(size>=1024*1024){
+                // Seven previous windows plus the active file. Old .1 files
+                // remain compatible; never rotate or retain message contents.
+                await diagnosticFs.rm(file+'.7',{force:true});
+                for(let i=6;i>=1;i--)await diagnosticFs.rename(file+'.'+i,file+'.'+(i+1)).catch(error=>{if(error.code!=='ENOENT')throw error;});
+                await diagnosticFs.rename(file,file+'.1');
+            }
             await diagnosticFs.appendFile(file,batch.join(''),{mode:0o600});
         }).catch(()=>{if(!warned){warned=true;logger?.warn?.('QQ delivery diagnostics unavailable; messaging continues without file diagnostics');}}).finally(()=>{writing=false;});
         return chain;

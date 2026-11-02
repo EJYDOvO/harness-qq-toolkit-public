@@ -2,6 +2,8 @@
 
 为 DeepSeek Harness 提供 **QQ 接入兼容补丁、可选 Remote Ops 插件和维护工具**。普通 DSH Agent 可以独立使用 QQ 接入，不需要 Character Agent、角色 Preset 或记忆插件。
 
+**QQ 验收修复候选，未部署：** 可选投递诊断从一份前档扩为七份前档及当前文件，降低早期证据被短时高频事件覆盖的概率；队列、脱敏和失败隔离契约不变。配套 Character test.28 对成功授权观察限频，不缓存授权结果，拒绝仍完整记录。QQ/SDK 版本不变，部署须采用重新生成并校验的补丁；不会恢复已轮转丢失的旧日志。
+
 **Iteration 08（2026-11-02 已合并、授权部署）：** Agent I/O test.8、Conversation Manager test.3、Remote Ops `1.1.1-test.3`。完整平台/Adapter/账号范围、旧发送实例围栏、命令/错误提示统一出站、Host 生命周期接入与可选脱敏关联；不新增服务或数据库。接口及限制见 [Diagnostics](docs/DIAGNOSTICS.md)、[通用接入](docs/GENERIC-INTEGRATION.md)。下文 Iteration 07 为历史部署；最新部署与实机限制以 Character STATUS 为准。
 
 **Iteration 07（2026-11-01 已授权部署）：** Agent I/O `0.1.0-test.7`、Remote Ops `1.1.1-test.2` 与配套补丁已随 Character test.26 冷切换上线，冻结锁文件、代码哈希、单一 Gateway 和 QQ connected 检查通过；角色、Memory、Session、Schedule 与通知账本保留。独立通用安装、真实 QQ 通知、审批按钮与手机显示仍未验收。
