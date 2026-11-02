@@ -71,6 +71,8 @@ Character 在上述命令追加 --qqtk。备份独立保存 sessions、storages�
 
 在另一个新 Home/候选 Profile 中构建安装，核验接口、包哈希和锁文件，离线数据副本先跑恢复测试。正式切换须另获授权并停净原实例；旧版代码若不理解新增终态或 Schema，应阻断回滚。
 
+已有旧 Windows 布局实例升级维护后端时，保留该实例自己的 `maintenance/features.json`、`plugin-policy.json` 与 `maintenance/browser/` 运行包，只更新代码文件。仓库中的 features.json 是新安装模板（Task Memory/Browser 默认关闭）；用它覆盖已启用 Browser 或 Memory 的实例会在下次 apply 时关闭这些功能。切换前对比新旧开关，确认一致后再重新 Stage。
+
 回滚保留**最新** Memory、Session、Schedule、路由和去重账本，只切回兼容的旧代码/包/补丁/私有配置。不用旧数据快照覆盖新增记录。官方 DSH 自身的安装/降级由官方渠道管理，本仓库不修改 ASAR 或内置 Bundle。
 
 SDK/Interaction 跨仓库审计需要 Character 源码：在非默认相邻目录时设置 DSH_CHARACTER_PROJECT 为其绝对路径。仅为测试依赖，不是 QQTK 运行依赖；CI 固定检出兼容 Character 提交，更新接口时同步审查该固定点。
