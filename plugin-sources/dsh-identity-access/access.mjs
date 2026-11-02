@@ -39,7 +39,7 @@ export function createIdentityAccess({stateFile,owner,now=Date.now,persist}={}){
   if(action==='grant'){row.role='contact';row.expires=durationMs===null?null:now()+durationMs;}
   if(action==='revoke'){delete row.role;row.expires=null;}
   if(action==='block')row.blocked=true;if(action==='unblock')row.blocked=false;
-  next.accounts[who.principalId]=row;next.epoch++;next.audit.push({id:randomUUID(),at:now(),actor:ownerId,target:who.principalId,action,expires:row.expires,epoch:next.epoch});
+  row.provider=who.provider;row.subject=who.subject;next.accounts[who.principalId]=row;next.epoch++;next.audit.push({id:randomUUID(),at:now(),actor:ownerId,target:who.principalId,action,expires:row.expires,epoch:next.epoch});
   try{save(next);}catch(error){faulted=true;for(const lease of [...leases.values()])revoke(lease);throw error;}state=next;for(const lease of [...leases.values()])revoke(lease);
   return Object.freeze({policyEpoch:state.epoch,...policy(who.principalId)});
  }
@@ -52,7 +52,7 @@ export function createIdentityAccess({stateFile,owner,now=Date.now,persist}={}){
   show(auth,{sessionId,target}={}){admin(auth,sessionId);return Object.freeze(policy(identity(target).principalId));},
   list(auth,{sessionId}={}){admin(auth,sessionId);return Object.keys(state.accounts).map(id=>Object.freeze(policy(id)));},
   audit(auth,{sessionId}={}){admin(auth,sessionId);return structuredClone(state.audit);},
-  reference(auth,{sessionId,principalId}={}){admin(auth,sessionId);const handle=known.get(principalId);identity(handle);return handle;},
+  reference(auth,{sessionId,principalId}={}){admin(auth,sessionId);let handle=known.get(principalId);if(!handle){const row=state.accounts[principalId],registration=providers.get(row?.provider);if(!registration||!field(row.subject)||principal(row.provider,row.subject)!==principalId)throw Error('No verified account reference');handle=Object.freeze({});identities.set(handle,Object.freeze({provider:row.provider,subject:row.subject,principalId,registration}));known.set(principalId,handle);}identity(handle);return handle;},
   get policyEpoch(){active();return state.epoch;},
   close(){if(closed)return;closed=true;for(const lease of [...leases.values()])revoke(lease);providers.clear();known.clear();writers.delete(key);}
  });
