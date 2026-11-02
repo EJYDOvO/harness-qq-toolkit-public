@@ -92,6 +92,8 @@ export function createIdentityAccess({stateFile,owner,ownerFile,presets:names,le
    if(!handle){const row=state.accounts[principalId],registration=providers.get(row?.provider);if(!registration||!field(row.subject)||principal(row.provider,row.subject)!==principalId)throw Error('No verified account reference');handle=Object.freeze({});identities.set(handle,Object.freeze({provider:row.provider,subject:row.subject,principalId,registration}));known.set(principalId,handle);}
    identity(handle);return handle;
   },
+  // The management API bound to one verified Owner actor (each call re-checks it).
+  manager(actor){admin(actor);return Object.freeze({list:()=>service.list(actor),show:target=>service.show(actor,{target}),change:options=>service.change(actor,options),reference:principalId=>service.reference(actor,{principalId}),get policyEpoch(){return service.policyEpoch;}});},
   conversation(spec){active();const id=JSON.stringify([spec?.platform,spec?.adapter,spec?.accountId]);let value=conversations.get(id);if(!value||value.closed){value=createConversation(spec);conversations.set(id,value);}return value.access;},
   get policyEpoch(){active();return state.epoch;},
   get roles(){return roles;},
@@ -122,7 +124,9 @@ export function createIdentityAccess({stateFile,owner,ownerFile,presets:names,le
    proofs.add(input);let verified;try{verified=await provider.resolve(input);}finally{proofs.delete(input);}
    const p=service.resolve(verified);if(p.blocked)return undefined;
    if(p.role!=='owner')service.note(verified);
-   return Object.freeze({principalId:p.principalId,role:p.role,presets:accepted[p.role],identity:verified});
+   // The Owner's admission carries the management API bound to that verified actor,
+   // so a command registered once keeps using the current service after a reload.
+   return Object.freeze({principalId:p.principalId,role:p.role,presets:accepted[p.role],identity:verified,...(p.role==='owner'?{manage:service.manager(verified)}:{})});
   }
   function bind(admission,record){
    if(!live())throw Error('Identity service unavailable');
@@ -140,7 +144,7 @@ export function createIdentityAccess({stateFile,owner,ownerFile,presets:names,le
    // Input replies may answer any non-blocked direct account; notifications reach the Owner only.
    outbound(target,{kind}={}){if(!live()||target?.type!=='direct')return false;let p;try{p=service.targetPolicy(providerId,target.id);}catch{return false;}return !p.blocked&&(kind==='reply'||p.role==='owner');},
    onRevoke(fn){listeners.add(fn);return()=>listeners.delete(fn);},
-   commands:()=>[roleCommandSpec(service)],
+   commands:()=>[ROLE_COMMAND],
   });
   value.close=()=>{if(value.closed)return;value.closed=true;listeners.clear();bindings.clear();provider.close();};
   return value;
@@ -151,21 +155,23 @@ export function createIdentityAccess({stateFile,owner,ownerFile,presets:names,le
 const DURATION=/^(\d{1,6})(m|h|d)$/,UNIT={m:60000,h:3600000,d:86400000},MAX_DURATION=366*86400000;
 function line(row){return [row.principalId,row.role,...(row.blocked?['blocked']:[]),...(row.expires!==null?['until '+new Date(row.expires).toISOString()]:[]),...(row.account?[row.account]:[])].join(' ');}
 // Owner-only /role for the Agent I/O command router: the router's gate supplies
-// call.access (the verified admission); the return value is the reply text.
-export function roleCommandSpec(service){
+// call.access (the verified admission and, for the Owner, its management API);
+// the return value is the reply text. Stateless, so it survives a service reload.
+export const ROLE_COMMAND=roleCommandSpec();
+export function roleCommandSpec(){
  return Object.freeze({name:'role',scopes:['direct'],hidden:true,category:'identity',description:'Owner 管理角色授权',usage:'/role list | show <principal> | grant contact <principal> [30m|12h|7d] | revoke|block|unblock <principal>',
   async execute(call){
-   const actor=call.access?.identity;if(!actor||call.access.role!=='owner')throw Error('Owner operation required');
+   const manage=call.access?.manage;if(!manage||call.access.role!=='owner')throw Error('Owner operation required');
    const args=call.args??[],operation=args[0];
-   if(operation==='list'&&args.length===1){const rows=service.list(actor);return rows.length?rows.map(line).join('\n'):'(no recorded accounts)';}
+   if(operation==='list'&&args.length===1){const rows=manage.list();return rows.length?rows.map(line).join('\n'):'(no recorded accounts)';}
    const grant=operation==='grant';
    if(!['show','grant','revoke','block','unblock'].includes(operation))throw Error('Unknown role operation');
    if(grant&&args[1]!=='contact')throw Error('Only contact can be granted');
    let durationMs=null;
    if(grant&&args[3]!==undefined){const match=DURATION.exec(args[3]);if(!match)throw Error('Duration uses m/h/d');durationMs=Number(match[1])*UNIT[match[2]];if(durationMs>MAX_DURATION)throw Error('Duration too long');}
    if(args.length!==(grant?(args[3]===undefined?3:4):2))throw Error('Invalid role arguments');
-   const target=service.reference(actor,{principalId:args[grant?2:1]});
-   if(operation==='show')return line(service.show(actor,{target}));
-   return line(service.change(actor,{target,action:operation,expectedEpoch:service.policyEpoch,durationMs}));
+   const target=manage.reference(args[grant?2:1]);
+   if(operation==='show')return line(manage.show(target));
+   return line(manage.change({target,action:operation,expectedEpoch:manage.policyEpoch,durationMs}));
   }});
 }

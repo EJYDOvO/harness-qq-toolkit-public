@@ -71,20 +71,21 @@ test('persistence failure fails closed; HMR cannot open a second writer; restart
 });
 
 test('/role returns its reply text, references verified accounts only and works after restart and Provider re-registration',async t=>{
- const f=await service(t),s=f.s,spec=roleCommandSpec(s);s.note(f.user);
- const run=(args,access={role:'owner',identity:f.owner})=>spec.execute(Object.freeze({name:'role',args,access}));
+ const f=await service(t),s=f.s,spec=roleCommandSpec();s.note(f.user);
+ const run=(args,access={role:'owner',manage:s.manager(f.owner)})=>spec.execute(Object.freeze({name:'role',args,access}));
  await assert.rejects(run(['list'],{role:'guest',identity:f.user}),/Owner operation/);
  await assert.rejects(run(['list'],{role:'owner',identity:f.user}),/Owner operation/,'a forged role field without the Owner identity');
+ assert.throws(()=>s.manager(f.user),/Owner operation/,'no management API for another verified account');
  await assert.rejects(run(['grant','contact','nickname']),/verified account/);
  const id=s.resolve(f.user).principalId;assert.match(await run(['list']),new RegExp(id+' guest'));
  assert.match(await run(['grant','contact',id,'1h']),/ contact until /);await assert.rejects(run(['grant','contact',id,'9999d']),/too long/);
  assert.match(await run(['show',id]),/ contact /);
  f.provider.close();s.close();
  const next=createIdentityAccess(f.options);t.after(()=>next.close());const proof={},provider=next.registerProvider('verified-test-account',v=>v===proof?{subject:v.subject??'owner'}:null);
- const actor=await provider.resolve(proof),again=roleCommandSpec(next);
- assert.match(await again.execute({args:['revoke',id],access:{role:'owner',identity:actor}}),new RegExp(id+' guest'));
+ const actor=await provider.resolve(proof),again=roleCommandSpec();
+ assert.match(await again.execute({args:['revoke',id],access:{role:'owner',manage:next.manager(actor)}}),new RegExp(id+' guest'));
  provider.close();const proof2={},p2=next.registerProvider('verified-test-account',v=>v===proof2?{subject:'owner'}:null),actor2=await p2.resolve(proof2);
- assert.match(await again.execute({args:['block',id],access:{role:'owner',identity:actor2}}),/blocked/,'a stale reference handle is rebuilt for the new Provider');
+ assert.match(await again.execute({args:['block',id],access:{role:'owner',manage:next.manager(actor2)}}),/blocked/,'a stale reference handle is rebuilt for the new Provider');
 });
 
 test('the global tool guard needs a current Owner lease and always denies contact/guest Presets',async t=>{
