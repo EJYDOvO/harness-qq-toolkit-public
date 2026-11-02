@@ -20,10 +20,10 @@ test('backup integrity detects corruption and incomplete backups before restore'
   fs.unlinkSync(path.join(dir,'profile/cordis.patch.yml'));assert.throws(()=>backup.verify(dir),/Missing/);
 });
 
-test('re-applying feature configuration is idempotent and keeps one browser entry',()=>{
+test('re-applying feature configuration is idempotent and does not fabricate an absent browser runtime',()=>{
  const dir=fs.mkdtempSync(path.join(root,'tmp/config-feature-test-')),file=path.join(dir,'cordis.patch.yml');
  fs.writeFileSync(file,yaml.dump([{id:'custom',config:{keep:'unchanged'}}]));
  configureFeatures(dir);const first=fs.readFileSync(file,'utf8');configureFeatures(dir);assert.equal(fs.readFileSync(file,'utf8'),first);
- const rows=yaml.load(first);assert.equal(rows[0].config.keep,'unchanged');assert.equal(rows.flatMap(r=>r.insert||[]).filter(r=>r.id==='mcp-browser').length,1);
+ const rows=yaml.load(first);assert.equal(rows[0].config.keep,'unchanged');assert.equal(rows.flatMap(r=>r.insert||[]).filter(r=>r.id==='mcp-browser').length,0,'Disabled external browser must not inject a missing runtime');
  assert.equal(rows.find(r=>r.id==='task-memory'),undefined,'Absent legacy bundle must not gain a dangling override');
 });

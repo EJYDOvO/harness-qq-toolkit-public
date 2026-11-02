@@ -15,10 +15,10 @@
     "maxStartsPerHour": 3
   },
   "memory": {
-    "enabled": true
+    "enabled": false
   },
   "browser": {
-    "enabled": true
+    "enabled": false
   },
   "retention": {
     "keepNewest": 5,

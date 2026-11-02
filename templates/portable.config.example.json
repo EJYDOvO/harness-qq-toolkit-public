@@ -1,0 +1,19 @@
+{
+  "runtimeRoot": "<OFFICIAL_DSH_RUNTIME_DIRECTORY>",
+  "profileName": "portable",
+  "model": {
+    "provider": "configured-provider",
+    "id": "configured-model",
+    "api": "openai-completions",
+    "baseURL": "https://provider.example.invalid/v1",
+    "apiKeyEnv": "MODEL_API_KEY",
+    "input": ["text"]
+  },
+  "qq": {
+    "enabled": true,
+    "appId": "<QQ_APP_ID>",
+    "ownerId": "<OWNER_OPENID>",
+    "appSecretEnv": "QQ_APP_SECRET"
+  },
+  "remoteOps": {"enabled": false}
+}
