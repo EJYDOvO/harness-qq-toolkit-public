@@ -22,10 +22,11 @@ const tick=async(n=8)=>{for(let i=0;i<n;i++)await new Promise(r=>setImmediate(r)
 class ApiError extends Error{name='ApiError';constructor(status){super('API Error');this.httpStatus=status;}}
 
 // Real files: media root, agent cwd, and a directory outside both.
-const root=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'qq-media-'))),media=path.join(root,'media'),cwd=path.join(root,'cwd'),outside=path.join(root,'outside');
+// Use the same OS-native canonicalization as fs/promises.realpath, including Windows 8.3 temp aliases.
+const root=fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(),'qq-media-'))),media=path.join(root,'media'),cwd=path.join(root,'cwd'),outside=path.join(root,'outside');
 for(const d of [media,cwd,outside])fs.mkdirSync(d);
 const file=(dir,name,body='x')=>{const p=path.join(dir,name);fs.writeFileSync(p,body);return p;};
-const real=p=>fs.realpathSync(p);
+const real=p=>fs.realpathSync.native(p);
 let junctions=true;try{fs.symlinkSync(outside,path.join(cwd,'escape'),'junction');}catch{junctions=false;}
 test.after(()=>fs.rmSync(root,{recursive:true,force:true}));
 
@@ -71,6 +72,7 @@ const uploads=g=>g.bot.calls.filter(c=>c.stage==='upload').length;
 
 test('qqbot_send_file sends one attachment message to the current conversation through the Unified I/O',async()=>{
  const g=gateway();g.turn(1);const png=file(media,'chart.png');
+ assert.equal(real(png),await realpath(png),'Fixture must use the same canonical path as send-time validation');
  const out=await g.send({file_path:png});
  assert.deepEqual({...out},{fileName:'chart.png',fileSize:1,target:'c2c:owner',fileUuid:'uuid-1',messageId:'media-2'});
  const [req]=g.requests;
@@ -117,6 +119,7 @@ test('upload failures and refusals are provably not sent and may be retried; a r
  g.bot.uploadFailures.push(new ApiError(500));
  await assert.rejects(g.send({file_path:png}),/未发送（upload-failed）/);
  assert.equal(g.bot.calls.filter(c=>c.stage==='message').length,0);
+ assert.equal(real(png),await realpath(png),'Fixture must use the same canonical path as send-time validation');
  const out=await g.send({file_path:png});assert.equal(out.messageId,'media-3','a provable failure may be retried');
  g.bot.messageFailures.push(new ApiError(400));
  await assert.rejects(g.send({file_path:file(media,'bad.png')}),/未发送（platform-rejected）/);
