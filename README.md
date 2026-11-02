@@ -36,3 +36,5 @@ Windows rc.3 是原生验证基线；Mac/Linux 没有同等原生验收。构建
 所有正文、命令、HITL、媒体和通知经唯一 Agent I/O 出口。Typing/ACK 是协议控制，不是对话或审批结算。通知目标是可靠的 at-most-once handoff；unknown/partial 不自动重发，API 接受不等于手机收件。
 
 Character 集成见独立 [Character Agent](https://github.com/EJYDOvO/character-agent-v1)。第三方授权文件保留在 `licenses/` 和对应源码目录；公开可见不等于改变原许可。
+
+实验性独立 [Identity & Access](plugin-sources/dsh-identity-access/README.md) 提供 Principal、角色策略与可撤销授权；当前未接入 QQ 或默认装配，不代表多用户已可安全启用。

@@ -11,14 +11,14 @@ export function createIdentityAccess({stateFile,owner,now=Date.now,persist}={}){
  if(!path.isAbsolute(stateFile??'')||!field(owner?.provider)||!field(owner?.subject))throw Error('Explicit trusted state and Owner binding required');
  const key=path.resolve(stateFile);if(writers.has(key))throw Error('Identity state already owned');
  const ownerId=principal(owner.provider,owner.subject),fingerprint=createHash('sha256').update(ownerId).digest('hex');
- let state={schemaVersion:1,owner:fingerprint,epoch:0,accounts:{},audit:[]},closed=false;
+ let state={schemaVersion:1,owner:fingerprint,epoch:0,accounts:{},audit:[]},closed=false,faulted=false;
  if(fs.existsSync(key))state=JSON.parse(fs.readFileSync(key,'utf8'));
  if(state.schemaVersion!==1||state.owner!==fingerprint||!Number.isSafeInteger(state.epoch)||state.epoch<0||!state.accounts||Array.isArray(state.accounts)||!Array.isArray(state.audit))throw Error('Identity state incompatible or damaged');
  for(const [id,row]of Object.entries(state.accounts))if(id===ownerId||!/^principal-[a-f0-9]{64}$/.test(id)||!row||!['contact',undefined].includes(row.role)||typeof row.blocked!=='boolean'||row.expires!==null&&!Number.isFinite(row.expires))throw Error('Invalid persisted role state');
  const providers=new Map(),identities=new WeakMap(),known=new Map(),leases=new Map();
  const save=persist??(next=>{fs.mkdirSync(path.dirname(key),{recursive:true});const tmp=key+'.'+randomUUID()+'.tmp';let fd;try{fd=fs.openSync(tmp,'wx',0o600);fs.writeFileSync(fd,JSON.stringify(next));fs.fsyncSync(fd);fs.closeSync(fd);fd=undefined;fs.renameSync(tmp,key);}finally{if(fd!==undefined)fs.closeSync(fd);if(fs.existsSync(tmp))fs.unlinkSync(tmp);}});
  writers.add(key);
- function active(){if(closed)throw Error('Identity service closed');}
+ function active(){if(closed||faulted)throw Error('Identity service unavailable');}
  function identity(handle){active();const row=identities.get(handle);if(!row||providers.get(row.provider)!==row.registration)throw Error('Untrusted or revoked platform identity');return row;}
  function policy(id){const row=state.accounts[id];return {principalId:id,role:id===ownerId?'owner':row?.role==='contact'&&(row.expires===null||now()<row.expires)?'contact':'guest',blocked:row?.blocked===true,expires:row?.expires??null};}
  function revoke(lease){lease.controller.abort();leases.delete(lease.handle);}
@@ -40,7 +40,7 @@ export function createIdentityAccess({stateFile,owner,now=Date.now,persist}={}){
   if(action==='revoke'){delete row.role;row.expires=null;}
   if(action==='block')row.blocked=true;if(action==='unblock')row.blocked=false;
   next.accounts[who.principalId]=row;next.epoch++;next.audit.push({id:randomUUID(),at:now(),actor:ownerId,target:who.principalId,action,expires:row.expires,epoch:next.epoch});
-  save(next);state=next;for(const lease of [...leases.values()])revoke(lease);
+  try{save(next);}catch(error){faulted=true;for(const lease of [...leases.values()])revoke(lease);throw error;}state=next;for(const lease of [...leases.values()])revoke(lease);
   return Object.freeze({policyEpoch:state.epoch,...policy(who.principalId)});
  }
  return Object.freeze({contractVersion:1,

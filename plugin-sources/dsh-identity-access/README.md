@@ -9,3 +9,6 @@ Independent of QQ SDK, Memory and Persona. `createIdentityAccess({stateFile,owne
 `role-command.mjs` produces an existing I/O command spec using a Host actor resolver. References are verified Principal IDs, not nicknames. Commands are not auto-registered.
 
 **Not enabled or wired into the production Gateway.** This initial service alone is not a multi-user safety boundary. Existing Character Identity still admits only its fixed Owner. Do not open platform admission until commands, HITL, Manager recovery/preset switching and all outbound routes use the same authorization lifecycle. No deployment or data migration is included.
+
+Any persistence exception revokes all leases and makes the current instance fail closed. Recovery requires reviewing durable state and restarting the isolated service; no old grant is allowed to continue on assumed in-memory success.
+
