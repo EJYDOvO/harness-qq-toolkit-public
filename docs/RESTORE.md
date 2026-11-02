@@ -20,7 +20,7 @@ npm test
 npm run test:audit
 ```
 
-根 package-lock.json 固定构建依赖及 QQ/SDK 下载完整性。pnpm 11.7.0 来自本地锁定依赖，不依赖开发机全局 pnpm 或旧 Profile。SDK 3.18.5 指 schemastery；运行时 DSH 服务仍由官方宿主提供，不另装第二套 Core。
+根 package-lock.json 固定构建依赖及 QQ/SDK 下载完整性。pnpm 11.7.0 来自本地锁定依赖，不依赖开发机全局 pnpm 或旧 Profile。schemastery 3.18.5 仅用于测试依赖；DSH SDK 由 rc.3 发行包提供，不另装第二套 Core。
 
 ## 2. 创建私有配置
 
