@@ -2,7 +2,9 @@
 // Assertions describe release requirements and intentionally remain red on test.10.
 // Iteration 04: all chat output goes through the Unified Agent I/O; no SDK stream path.
 import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import vm from 'node:vm';import path from 'node:path';import {pathToFileURL} from 'node:url';import os from 'node:os';
-import {Interaction} from '../../../character-agent-v1/packages/interaction-policy/policy.mjs';
+const character=process.env.DSH_CHARACTER_PROJECT||path.resolve(import.meta.dirname,'../../../character-agent-v1');
+assert(path.isAbsolute(character),'DSH_CHARACTER_PROJECT must be an absolute code-only clone path');
+const {Interaction}=await import(pathToFileURL(path.join(character,'packages/interaction-policy/policy.mjs')));
 import {createConversations} from '../../plugin-sources/dsh-agent-io/conversation.mjs';
 import {createAgentIO} from '../../plugin-sources/dsh-agent-io/io.mjs';
 import {createTurnControls} from '../qq-conversation-fixture.mjs';

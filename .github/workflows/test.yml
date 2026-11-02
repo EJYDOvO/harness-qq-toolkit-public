@@ -16,5 +16,12 @@ jobs:
           node-version: '24'
       - run: npm ci
       - run: npm test
+      - uses: actions/checkout@v4
+        with:
+          repository: EJYDOvO/character-agent-v1
+          ref: 82d7bbfe19ade822416837c6aa3c28da98da1937
+          path: reference/character
       - run: npm run test:audit
+        env:
+          DSH_CHARACTER_PROJECT: ${{ github.workspace }}/reference/character
       - run: npm run test:patch
