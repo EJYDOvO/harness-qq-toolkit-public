@@ -99,7 +99,7 @@ overrides:
 
 ## 更新维护
 
-维护源码包含 QQ Bot 15 文件和 SDK 3 文件的审查快照（含未改动的 IdleEvictor 供回归验证）；原文件哈希分别在 qqbot-upstream-0.5.2/manifest.json 和 sdk-upstream-1.0.5/manifest.json。修改后分别构建并检查两份补丁（SDK 使用 `--sdk`），安装示例见 [审计修复说明](INTERACTION-AUDIT-FIXES.md)。升级上游版本时重新比对，不能跨版本盲目应用。
+维护源码包含 QQ Bot 15 文件和 SDK 3 文件的审查快照（含未改动的 IdleEvictor 供回归验证）；原文件哈希分别在 qqbot-upstream-0.5.2/manifest.json 和 sdk-upstream-1.0.5/manifest.json。修改后分别构建并检查两份补丁（SDK 使用 `--sdk`），安装示例见 STATUS。升级上游版本时重新比对，不能跨版本盲目应用。
 
 原 templates/profile 是旧安装快照；新项目优先使用本文件的最小装配，不直接复制旧绝对路径/可选插件清单。更新配置与状态目录时先备份；不要删除通知账本来“重试”不确定投递。
 # Interaction 可选接入

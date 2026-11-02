@@ -3,11 +3,21 @@
   "version": "1.0.0",
   "private": true,
   "engines": {
-    "node": ">=22"
+    "node": ">=24"
   },
   "scripts": {
     "pretest": "node -e \"require('node:fs').mkdirSync('tmp',{recursive:true})\"",
-    "test": "node --test maintenance/agent-io.test.mjs maintenance/conversation-io.test.mjs maintenance/qq-agent-io.test.mjs maintenance/qq-inbound.test.mjs maintenance/commands.test.mjs maintenance/turn-controls.test.mjs maintenance/qq-media.test.mjs maintenance/hitl.test.mjs maintenance/notifications.test.mjs maintenance/remote-ops.test.mjs maintenance/interaction.test.mjs maintenance/delivery-diagnostics.test.mjs maintenance/integration-hardening.test.mjs maintenance/diagnostics.test.mjs maintenance/session-lifecycle.test.mjs maintenance/conversation-manager.test.mjs plugin-sources/dsh-task-memory/tests/render.test.mjs maintenance/runtime.test.mjs",
-    "test:audit": "node --test maintenance/audit/*.test.mjs"
+    "test": "node scripts/test.cjs",
+    "test:audit": "node scripts/test.cjs --audit",
+    "portable": "node scripts/portable.cjs",
+    "test:patch": "node maintenance/build-qqbot-patch.cjs --check && node maintenance/build-qqbot-patch.cjs --sdk --check && node maintenance/audit/verify-patches.cjs"
+  },
+  "packageManager": "pnpm@11.7.0",
+  "devDependencies": {
+    "js-yaml": "4.1.1",
+    "pnpm": "11.7.0",
+    "@tencent-connect/dsh-qqbot": "0.5.2",
+    "@tencent-connect/qqbot-nodejs": "1.0.5",
+    "@deepseek-ai/schemastery": "3.18.5"
   }
 }

@@ -3,7 +3,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const assert = require('node:assert/strict');
 const { root, profile, policy, atomic, configure, configureFeatures } = require('./ops.cjs');
-const yaml = require(require.resolve('js-yaml',{paths:[profile]}));
+const yaml = require('js-yaml');
 const stage = path.join(root,'data/profiles/qqbot-validation');
 const state = path.join(root,'data/maintenance/candidate.json');
 const selectedRuntime=()=>require('./runtime.cjs').resolveRuntime(root);
@@ -22,7 +22,7 @@ if (cmd === 'seal') {
   record.features=hash(path.join(__dirname,'features.json'));
   record.policy=hash(path.join(__dirname,'plugin-policy.json'));
   record.helpers=helperHashes();
-  record.browser=Object.fromEntries(['package.json','pnpm-lock.yaml','config.json'].map(f=>[f,hash(path.join(__dirname,'browser/0.0.83',f))]));
+  record.browser=!JSON.parse(fs.readFileSync(path.join(__dirname,'features.json'))).browser.enabled?null:Object.fromEntries(['package.json','pnpm-lock.yaml','config.json'].map(f=>[f,hash(path.join(__dirname,'browser/0.0.83',f))]));
   record.sealedAt=new Date().toISOString();
   atomic(state,JSON.stringify(record,null,2));
   console.log('Candidate validated and sealed.');
@@ -38,7 +38,7 @@ if (cmd === 'seal') {
   assert.equal(record.features,hash(path.join(__dirname,'features.json')),'Features changed: stage again');
   assert.equal(record.policy,hash(path.join(__dirname,'plugin-policy.json')),'Policy changed: stage again');
   assert.deepEqual(record.helpers,helperHashes(),'Maintenance helpers changed: stage again');
-  assert.deepEqual(record.browser,Object.fromEntries(['package.json','pnpm-lock.yaml','config.json'].map(f=>[f,hash(path.join(__dirname,'browser/0.0.83',f))])),'Browser runtime changed: stage again');
+  assert.deepEqual(record.browser,!JSON.parse(fs.readFileSync(path.join(__dirname,'features.json'))).browser.enabled?null:Object.fromEntries(['package.json','pnpm-lock.yaml','config.json'].map(f=>[f,hash(path.join(__dirname,'browser/0.0.83',f))])),'Browser runtime changed: stage again');
   console.log('Candidate and live baseline verified.');
 } else {
   const archive=require('./read-asar.cjs').openArchive();

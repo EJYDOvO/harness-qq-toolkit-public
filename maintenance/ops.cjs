@@ -4,8 +4,7 @@ const assert = require('node:assert/strict');
 const { createRequire } = require('node:module');
 const root = path.resolve(__dirname, '..');
 const profile = path.join(root, 'data/profiles/desktop');
-const requireProfile = createRequire(path.join(profile, 'package.json'));
-const yaml = requireProfile('js-yaml');
+const yaml = require('js-yaml');
 const policy = JSON.parse(fs.readFileSync(path.join(__dirname, 'plugin-policy.json'), 'utf8'));
 const readYaml = file => yaml.load(fs.readFileSync(file, 'utf8'));
 function atomic(file, content) {
@@ -28,7 +27,8 @@ function row(rows, id) {
 function configure(dir = profile) {
   const rows = patchRows(dir);
   const qq = row(rows, 'im-qqbot');
-  const prefs = JSON.parse(fs.readFileSync(path.join(root, 'data/qqbot/model-prefs.json'), 'utf8'));
+  const prefsFile=path.join(root,'data/qqbot/model-prefs.json');
+  const prefs=fs.existsSync(prefsFile)?JSON.parse(fs.readFileSync(prefsFile,'utf8')):{};
   const existing = [...new Set(Object.keys(prefs.sessionIds || {}).filter(k => k.startsWith(`qqbot:${qq.config.appId}:c2c:`)).map(k => k.split(':').at(-1)))];
   const current = qq.config.access?.c2cAllow;
   assert(current ? current.length > 0 : existing.length === 1, 'Cannot choose an owner: specify a non-empty private QQ whitelist explicitly.');
@@ -56,12 +56,15 @@ function configureFeatures(dir=profile) {
   const rows=patchRows(dir),features=JSON.parse(fs.readFileSync(path.join(__dirname,'features.json'),'utf8'));
   const bundles=fs.existsSync(path.join(dir,'package.json'))?JSON.parse(fs.readFileSync(path.join(dir,'package.json'),'utf8')).dsh?.profile?.bundles??[]:[];
   if(bundles.includes('dsh-task-memory-local')) Object.assign(row(rows,'task-memory'),{disabled:bundles.includes('dsh-character-core')||!features.memory.enabled,config:{storageRoot:path.join(root,'data/storages/task-memory').replaceAll('\\','/'),injectPrompt:false,injectLimit:5,injectMaxChars:1200,injectMaxEntryChars:300,maxEntries:500}});
+  if(features.browser.enabled) {
+  assert(fs.existsSync(path.join(__dirname,'browser/0.0.83/config.json'))&&fs.existsSync(path.join(__dirname,'browser/0.0.83/node_modules/@playwright/mcp/cli.js')),'Optional browser runtime must be installed and configured privately');
   Object.assign(row(rows,'mcp-browser'),{name:'@deepseek-ai/dsh-mcp-client',disabled:!features.browser.enabled,config:{serverName:'browser',transport:'stdio',command:path.join(root,'resources/runtime/primary-runtime/dependencies/node/bin/node.exe'),args:[path.join(__dirname,'browser/0.0.83/node_modules/@playwright/mcp/cli.js'),'--config',path.join(__dirname,'browser/0.0.83/config.json')],cwd:path.join(root,'default-workspace'),toolCallTimeoutMs:60000,failOnStartupError:false}});
   // A new row must use insert; overrides reference rows provided by installed bundles.
   const browser=rows.find(x=>x.id==='mcp-browser');rows.splice(rows.indexOf(browser),1);
   const previous=rows.find(x=>Array.isArray(x.insert)&&x.insert.some(y=>y.id==='mcp-browser'));
   if(previous)previous.insert=previous.insert.filter(y=>y.id!=='mcp-browser');
   rows.push({insert:[browser]});
+  }
   atomic(path.join(dir,'cordis.patch.yml'),yaml.dump(rows.filter(x=>!Array.isArray(x.insert)||x.insert.length),{lineWidth:120,noRefs:true}));
 }
 async function liveStatus(withPresets = false) {
@@ -97,7 +100,7 @@ async function liveStatus(withPresets = false) {
             const pluginsEnvelope=await pluginResponse.json();assert(pluginsEnvelope.result?.ok,'Plugin inspection failed');
             const plugins=pluginsEnvelope.result.value,manifest=JSON.parse(fs.readFileSync(path.join(profile,'package.json'),'utf8'));
             const checks=['im-qqbot'];
-            if(manifest.dependencies['dsh-remote-ops-local'])checks.push('qq-remote-ops','mcp-browser');
+            if(manifest.dependencies['dsh-remote-ops-local'])checks.push('qq-remote-ops');
             if(manifest.dsh?.profile?.bundles?.includes('dsh-task-memory-local'))checks.push('task-memory');
             value.featurePlugins=plugins.filter(p=>checks.includes(p.patchId)).map(p=>({id:p.patchId,enabled:p.enabled,phase:p.fiberPhase}));
             for(const id of checks){const p=value.featurePlugins.find(p=>p.id===id);assert(p,`Missing plugin: ${id}`);assert(!p.enabled||p.phase==='active',`Plugin failed to activate: ${id}`);}

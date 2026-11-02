@@ -19,10 +19,6 @@
 *.dll
 *.asar
 *.tgz
-!/plugin-packages/dsh-remote-ops-local-1.0.0.tgz
-!/plugin-packages/dsh-remote-ops-local-1.1.0.tgz
-!/plugin-packages/dsh-task-memory-local-0.1.0-local.2.tgz
-!/plugin-packages/dsh-plugin-bilibili-0.2.4.tgz
 **/browser-profile/
 **/browser-output/
 **/backups/
@@ -32,3 +28,12 @@
 [Aa][Gg][Ee][Nn][Tt].[Mm][Dd]
 [Aa][Gg][Ee][Nn][Tt][Ss].[Mm][Dd]
 [Pp][Uu][Bb][Ll][Ii][Cc][Aa][Tt][Ii][Oo][Nn].[Mm][Dd]
+
+# Generated private installation state and packages
+/artifacts/
+/private/
+/validation/
+*.sqlite*
+*.db
+*.zip
+*.tar
