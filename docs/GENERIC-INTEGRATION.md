@@ -70,6 +70,8 @@ overrides:
           groupAllow: []
 ```
 
+可选 Identity & Access（I1）：先装配 `dsh-identity-access`（见其 [README](../plugin-sources/dsh-identity-access/README.md)），再在 QQ 配置 `identityAccess: { enabled: true }`。白名单仍是平台准入；通过准入的私聊按 Owner/Contact/Guest 选择 Preset，Owner 用 `/role` 管理。开启时 `groupMode` 必须为 `disabled`，需要 `dsh-agent-io@0.1.0-test.9`、`dsh-conversation-manager@0.1.0-test.4`；默认关闭，行为不变。
+
 包管理器正常安装并应用补丁；不手改 DSH app.asar 或安装后的 node_modules 文件。每个项目设置独立的绝对 DSH_HOME。不要同时启用 QQ 官方 Bundle 和另一个手动 QQ 条目。
 
 需要 `/ops` 时，另行安装 已审查并固定哈希的 `dsh-remote-ops-local` 包（或审查源码后 pack）。按 [独立模式与维护后端](../plugin-sources/dsh-remote-ops/README.md) 在 QQ 前加载。没有维护后端时基本任务观察可用，部署/重启等明确拒绝；不会猜测其他安装目录。

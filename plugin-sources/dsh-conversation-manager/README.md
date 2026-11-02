@@ -2,7 +2,7 @@
 
 独立、平台无关的 Host 插件。维护 Conversation → 原生 Session 的唯一当前路由、模型/Preset 偏好、并发、恢复和可选空白轮换。QQ、Identity、Memory、Remote Ops 均不是本插件依赖。
 
-当前源码 `0.1.0-test.3`（Iteration 08，2026-11-02 已授权部署），保留恢复异常分类和关闭规则，补充 Context 活性门禁及可选脱敏观察。test.2 为历史部署。验证基线为 DSH `0.2.1-rc.3`；复用原生 Agent/Session/Persistence/Preset/Schedule，不实现第二套运行时、调度器或数据库。
+当前源码 `0.1.0-test.4`（I1：可选授权 Preset，未部署）；test.3 为 2026-11-02 授权部署的 Iteration 08 版本，保留恢复异常分类和关闭规则，补充 Context 活性门禁及可选脱敏观察。test.2 为历史部署。验证基线为 DSH `0.2.1-rc.3`；复用原生 Agent/Session/Persistence/Preset/Schedule，不实现第二套运行时、调度器或数据库。
 
 ## 安装与装配
 
@@ -48,7 +48,7 @@ ctx.effect(() => () => manager.disposeAll());
 
 | 接口 | 用途 |
 |---|---|
-| `getOrCreate(scope, peer, sender, target)` | 串行准入、恢复/创建，必要时安全轮换 |
+| `getOrCreate(scope, peer, sender, target, options?)` | 串行准入、恢复/创建，必要时安全轮换；`options.presets` 为 Host 授权的 Preset（首个用于新 Session）：当前、存活或持久 Session 的 Preset 不在其中时不交出，换到新 Session 并保留旧 Session，此时不应用 per-peer Preset 偏好 |
 | `noteUserMessage(...)` | Adapter 完成访问校验后记录活动，命令/问答也可调用 |
 | `getSessionRecord` / `records` | 当前活跃句柄；不授予身份或 Memory 权限 |
 | `ownershipState(key)` | 唯一当前 Session、上一个轮换根、代数和阻塞原因 |

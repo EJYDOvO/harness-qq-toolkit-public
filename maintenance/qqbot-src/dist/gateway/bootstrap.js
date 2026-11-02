@@ -345,6 +345,13 @@ export async function bootstrapGateway(ctx, agents, config, logger, options) {
     const io = ctx.get('agentIO');
     if (!io) throw new Error('Install and configure dsh-agent-io before QQ');
     if (typeof io.openConversation !== 'function') throw new Error('dsh-agent-io 0.1.0-test.4 or later (openConversation) is required before QQ');
+    // Optional Gate 2: roles come from the Host Identity & Access service, never
+    // from the platform admission list or message content. Read per use, so a
+    // reloaded service replaces the contract and old grants end with it.
+    const roles = config.identityAccess?.enabled === true;
+    if (roles && config.access?.groupMode !== 'disabled') throw new Error('Identity & Access supports direct Conversations only; disable group access');
+    const accessContract = () => { let service; try { service = ctx.get('identityAccess'); } catch { service = undefined; } if (!service) throw new Error('Identity & Access unavailable'); return service.conversation({ platform: QQ_OFFICIAL, adapter: 'qq-official-gateway', accountId: config.appId }); };
+    if (roles) accessContract();
     const manager = new SessionManager(ctx, agents, config, logger);
     ctx.effect(()=>()=>manager.disposeAll()); // also release the adapter if SDK setup fails
     // One Conversation wiring for this application: the same Conversation
@@ -352,11 +359,14 @@ export async function bootstrapGateway(ctx, agents, config, logger, options) {
     // and the outbound text adapter. The access configuration admits both ways.
     const conversation = io.openConversation({ platform: QQ_OFFICIAL, adapter: 'qq-official-gateway', accountId: config.appId, manager, scopes: QQ_SCOPES,
         admits: (scope, peer) => accessAllows(config.access, scope, peer),
+        ...(roles ? { access: accessContract } : {}),
         onInput: (record, message, policy, input) => { manager.admitInput?.(record, input); if (policy) manager.trackInteractionInput?.(record, message); } });
     ctx.effect(() => conversation.close);
     if (typeof conversation.openCommands !== 'function') throw new Error('dsh-agent-io 0.1.0-test.5 or later (commands and attachments) is required before QQ');
     if (typeof conversation.openHITL !== 'function') throw new Error('dsh-agent-io 0.1.0-test.6 or later (HITL Bridge) is required before QQ');
     if (typeof conversation.reply !== 'function') throw new Error('dsh-agent-io 0.1.0-test.8 or later (scoped input replies) is required before QQ');
+    // An older I/O would ignore the access option: never run roles without Gate 2.
+    if (roles && conversation.accessControlled !== true) throw new Error('dsh-agent-io 0.1.0-test.9 or later (Identity & Access gate) is required for identityAccess');
     if (config.notifications?.enabled !== false && typeof conversation.openNotifications !== 'function') throw new Error('dsh-agent-io 0.1.0-test.7 or later (notifications) is required before QQ');
     const deliveryRecorder=createDeliveryRecorder(config.deliveryDiagnostics,logger,undefined,io.diagnostics,{platform:QQ_OFFICIAL,adapter:'qq-official-gateway',accountId:config.appId});
     ctx.effect(()=>()=>deliveryRecorder?.close());
@@ -375,7 +385,7 @@ export async function bootstrapGateway(ctx, agents, config, logger, options) {
     // ── 中间件链 ──
     const replyIds = createReplyIdCache();
     ctx.effect(() => () => replyIds.clear());
-    setupMiddlewares(bot, config, manager, logger, conversation, replyIds);
+    setupMiddlewares(bot, config, manager, logger, conversation, replyIds, roles ? accessContract().commands() : []);
     // ── 入站：经过中间件链后的普通聊天消息 → Unified Agent I/O 入站通道（去重）→ 可信会话入口 → 共享交接 → dsh agent ──
     const inbound = conversation.openInbound(standard => deliverInbound(standard, conversation, config, logger));
     ctx.effect(() => inbound.close);

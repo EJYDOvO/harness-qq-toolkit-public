@@ -105,7 +105,7 @@ export function hitlAnswers(manager, replyIds) {
         ctx.stop(`hitl:${result.status}`);
     };
 }
-export function setupMiddlewares(bot, config, manager, logger, conversation, replyIds) {
+export function setupMiddlewares(bot, config, manager, logger, conversation, replyIds, accessCommands = []) {
     // 1. 错误兜底（最外层洋葱皮）
     // The SDK errorHandler directly sends raw exception text. Before an input
     // has entered I/O there is no scoped reply grant: fail closed, never revive
@@ -181,6 +181,8 @@ export function setupMiddlewares(bot, config, manager, logger, conversation, rep
     // authorizing themselves. No SDK slashCommand and no automatic /help.
     const router = conversation.openCommands({ prefixes: ['/'] });
     for (const cmd of commands) router.register(qqCommand(cmd));
+    // Identity & Access management (Owner only through the router's access gate).
+    for (const spec of accessCommands) router.register(spec);
     bot.use(commandGate(router));
     // 8.5. 待答问题文本作答（HITL Bridge；在 concurrencyGuard 之前，答案消息不排队直接作答）
     bot.use(hitlAnswers(manager, replyIds));

@@ -28,7 +28,8 @@ if(hitlStart<0||hitlEnd<hitlStart)throw Error('bootstrap openQQHITL not found');
 export const openQQHITL=vm.runInNewContext(strip(read('features/approval-renderer.js'))+'\n'+strip(read('features/question-renderer.js'))+'\n'+bootstrap.slice(hitlStart,hitlEnd).replace('export function','function')+';openQQHITL');
 // io: a real createAgentIO() core. policy(agent): the Interaction lookup.
 // hitl: the Host's one HITL install (createHITLHost), when the test opens a Bridge.
-export function qqConversation({io,manager,config,policy=()=>undefined,createInput=nativeInput,hitl}){
+// access: the Identity & Access contract getter (bootstrap's accessContract), when roles are on.
+export function qqConversation({io,manager,config,policy=()=>undefined,createInput=nativeInput,hitl,access}){
  const {QQ_OFFICIAL,QQ_SCOPES,accessAllows}=qqAdapter;
- return vm.runInNewContext('(function(){'+opening+';return conversation;})()',{io:{openConversation:createConversations(io,{createInput,interactionPolicy:policy,...(hitl?{hitl}:{})})},manager,config,QQ_OFFICIAL,QQ_SCOPES,accessAllows});
+ return vm.runInNewContext('(function(){'+opening+';return conversation;})()',{io:{openConversation:createConversations(io,{createInput,interactionPolicy:policy,...(hitl?{hitl}:{})})},manager,config,QQ_OFFICIAL,QQ_SCOPES,accessAllows,roles:access!==undefined,accessContract:access});
 }

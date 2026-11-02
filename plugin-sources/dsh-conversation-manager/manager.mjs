@@ -385,7 +385,7 @@ export class ConversationManager {
         }
         return open||Object.values(pending).some(a=>a.length>0);
     }
-    async rotateSession(scope,peerId,senderId,replyTarget,old,state){
+    async rotateSession(scope,peerId,senderId,replyTarget,old,state,presets){
         const key=this.sessionKey(scope,peerId),previous=old?.sessionId??this.currentSessionId(key);
         const protectedOld=()=>{const live=this.agents.get(previous);return this.protectedSession(old)||!!live&&(live.status==='running'||live.inbox?.hasPending);};
         if(protectedOld()){state.blocker='unfinished_interaction';this.modelResolver.prefs.commitLifecycle(key,state);return null;}
@@ -396,7 +396,7 @@ export class ConversationManager {
         const reminders=schedules?await schedules.list({sessionId:previous}):[];
         if(reminders.length&&this.preserveScheduledSession?.(previous)!==true){state.blocker='existing_schedule';this.modelResolver.prefs.commitLifecycle(key,state);return null;}
         if(protectedOld())return null;
-        const composed=await this.composePreset(old?.agentPreset??this.getEffectivePresetByKey(key)),route=this.modelResolver.getEffectiveRoute(key),id=SessionId(randomUUID());
+        const composed=await this.composePreset(presets?(presets.includes(old?.agentPreset)?old.agentPreset:presets[0]):old?.agentPreset??this.getEffectivePresetByKey(key)),route=this.modelResolver.getEffectiveRoute(key),id=SessionId(randomUUID());
         const handle=await this.agents.create({sessionId:id,meta:{cwd:this.config.cwd||process.cwd(),agentPreset:composed.agentPreset},...(route?{agentOptions:route}:{}),setup:composed.setup});
         try{
             if(this.closed)throw Error('Conversation manager closed during rotation');
@@ -438,8 +438,17 @@ export class ConversationManager {
             throw new Error('Conversation preset unavailable; refusing fallback');
         return { agentPreset: resolved.id, setup: async (agentCtx) => { await presets.mount(agentCtx, resolved.id); } };
     }
-    /** 获取或恢复或创建会话（get → resume → create） */
-    async getOrCreate(scope, peerId, senderId, replyTarget) {
+    /**
+     * 获取或恢复或创建会话（get → resume → create）。
+     * options.presets: the Presets the Host authorized for this sender (first =
+     * Preset of a new Session). A current, live or persisted Session with another
+     * Preset is never handed over: the Conversation moves to a new Session and
+     * the old one is kept, not reused (a role change never inherits history).
+     * Per-peer Preset preferences do not apply while presets is given.
+     */
+    async getOrCreate(scope, peerId, senderId, replyTarget, options) {
+        const presets=options?.presets;
+        if(presets!==undefined&&(!Array.isArray(presets)||!presets.length||presets.some(p=>typeof p!=='string'||!p)))throw Error('Authorized Presets must be a non-empty list');
         const record=await this.inConversation(this.sessionKey(scope,peerId),async()=>{
             await this.drainSessionClosures(this.currentSessionId(this.sessionKey(scope,peerId)));
             // Remote Ops restores the owner route at Gateway startup without a
@@ -449,27 +458,35 @@ export class ConversationManager {
                 const key=this.sessionKey(scope,peerId);
                 this.noteUserMessage(scope,peerId,senderId,this.adapter.inputId(replyTarget));
                 const state=this.modelResolver.prefs.getLifecycle(key),old=this.sessions.get(key);
-                if(state?.due){const rotated=await this.rotateSession(scope,peerId,senderId,replyTarget,old,state);if(rotated)return rotated;}
+                if(state?.due){const rotated=await this.rotateSession(scope,peerId,senderId,replyTarget,old,state,presets);if(rotated)return rotated;}
             }
-            return this.getOrRestore(scope,peerId,senderId,replyTarget);
+            return this.getOrRestore(scope,peerId,senderId,replyTarget,presets);
         });
         this.diagnostic('route',record,'active');return record;
     }
-    async getOrRestore(scope, peerId, senderId, replyTarget) {
+    async getOrRestore(scope, peerId, senderId, replyTarget, presets) {
         const key = this.sessionKey(scope, peerId);
-        const existing = this.sessions.get(key);
+        let existing = this.sessions.get(key);
+        if (existing && presets && !presets.includes(existing.agentPreset)) {
+            this.logger.info(`Conversation Preset no longer authorized; moving to a new Session`);
+            await this.removeSession(scope, peerId);
+            existing = undefined;
+        }
         if (existing) {
             existing.replyTarget = replyTarget;
             existing.lastActivity = Date.now();
             return existing;
         }
         const route = this.modelResolver.getEffectiveRoute(key);
-        const sessionId = SessionId(this.currentSessionId(key));
+        let sessionId = SessionId(this.currentSessionId(key));
+        const fresh = () => { this.modelResolver.setSessionId(key, randomUUID()); sessionId = SessionId(this.currentSessionId(key)); };
         this.logger.info(`Acquiring Conversation Session`);
         let agent;
         let handle;
         let agentPreset;
-        const live = this.agents.get(sessionId);
+        let live = this.agents.get(sessionId);
+        // A live native Agent of another Preset (e.g. opened elsewhere) is left alone, not routed.
+        if (live && presets && !presets.includes(this.getPresetsService()?.composedPreset?.(live.ctx))) { fresh(); live = this.agents.get(sessionId); }
         if (live) {
             agent = live;
             agentPreset = this.getPresetsService()?.composedPreset?.(live.ctx);
@@ -478,8 +495,9 @@ export class ConversationManager {
         else {
             // preset 只解析一次：resume/create 共用同一组合，避免重复 resolve/mount 目录。
             // 优先 session 当初的 preset（started 锁定语义），无则用当前 effective preset。
-            const persisted=await this.readPersistedSession(sessionId);
-            const presetId = persisted?.meta?.agentPreset ?? this.getEffectivePresetByKey(key);
+            let persisted=await this.readPersistedSession(sessionId);
+            if (persisted && presets && !presets.includes(persisted.meta?.agentPreset)) { this.logger.info(`Persisted Conversation Preset not authorized; creating a new Session`); fresh(); persisted = undefined; }
+            const presetId = presets ? (persisted?.meta?.agentPreset ?? presets[0]) : persisted?.meta?.agentPreset ?? this.getEffectivePresetByKey(key);
             const composed = await this.composePreset(presetId);
             agentPreset = composed.agentPreset;
             if(persisted) {

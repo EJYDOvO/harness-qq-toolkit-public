@@ -1,6 +1,6 @@
 # DSH Agent I/O（Unified Agent I/O）
 
-独立、平台无关的 Host 插件，提供 sendMessage、openInbound、openConversation、内部 Commands/Media、HITL 与通知通道。当前源码 `0.1.0-test.8`（Iteration 08，2026-11-02 已授权部署）；Iteration 07 的 test.7 为历史版本，真实 QQ/按钮/手机验收另计。验证基线为 DSH `0.2.1-rc.3`、Node 24。
+独立、平台无关的 Host 插件，提供 sendMessage、openInbound、openConversation、内部 Commands/Media、HITL 与通知通道。当前源码 `0.1.0-test.9`（I1：可选 Identity & Access 闸门，未部署）；test.8 为 2026-11-02 授权部署的 Iteration 08 版本，test.7 为历史版本，真实 QQ/按钮/手机验收另计。验证基线为 DSH `0.2.1-rc.3`、Node 24。
 
 它只做逻辑消息的交接语义：出站的校验、同 Conversation 串行、取消与分片间复核、同一逻辑消息去重、诚实的结果；入站的标准消息交接、按平台消息范围去重与交接结果；以及平台无关的 Session 接线（Manager 取得/校验当前 Session、原生 `UserMessage`、Interaction 交接、出站可信路由）。平台协议（回复目标、限额、分片、API 错误、事件解析与标准化）由各平台 Adapter 负责；准入与权限仍属 Host；Session 与路由仍由原生 DSH 和 [Conversation Manager](../dsh-conversation-manager/README.md) 负责。不依赖 QQ SDK、Character、Interaction 或 Conversation Manager 包（只使用平台传入的 Manager 句柄），原生消息构造取自 Host 提供的 `@deepseek-ai/dsh-llm`；不注册模型工具、RPC 或路由；不持久化任何状态。
 
@@ -110,6 +110,7 @@ const conversation = ctx.get('agentIO').openConversation({
   scopes: { direct: 'dm', group: 'room' },   // Conversation type → Manager scope（沿用既有 Session Key）
   admits: (scope, peer) => allowList.has(peer),   // 平台访问配置；入站与出站都复核，抛错视为拒绝
   onInput: (record, message, policy) => {},       // 可选：交接前的平台侧登记（如该输入的回复目标）
+  access: () => identityAccess.conversation({ platform, adapter, accountId }), // 可选：Gate 2 访问契约（见下）
 });
 ctx.effect(() => conversation.close);
 const inbound = conversation.openInbound(standard =>
@@ -136,6 +137,18 @@ await ctx.get('agentIO').sendMessage({ id, target: conversation.target(record), 
 **统一 Conversation 引用**：`{platform, accountId, conversation: {type, id}}` 在入站（由通道固定平台与账号）与出站（由同一接线校验）中含义相同，并经同一 `scopes` 映射到 Manager 的 `(scope, peer)`。因此不同平台、账号或 direct/group 互不串线；Manager 已持久化的 Session Key、偏好与生命周期状态不变。
 
 **Manager 仍是唯一路由权威**：接线不缓存记录、不写偏好、不决定轮换，每次交接与每个出站分片都向 Manager 重新确认（`getOrCreate` 后、创建输入前，以及发送每个分片前）。它只信任平台 Host 代码传入的 Manager 句柄与 Host 填写的 `origin`，不信任模型给出的 ID、Owner 声明或 `platformData`。
+
+### 可选 Identity & Access 闸门（I1，test.9）
+
+`access` 是 Host 访问契约（或返回当前契约的函数；服务重载即换新契约，旧授权随之失效）。不提供时行为与 test.8 相同。提供时，同一接线的每个入口都先由契约 `admit()` 已验证的发送者，再按角色动作：
+
+- 普通入站 `handoff`：拒绝（含封禁）不回复；`manager.getOrCreate(…, {presets})` 只取得角色授权的 Preset；取得的 Session 必须属于这些 Preset，再 `bind` 可撤销授权。
+- `submit`（含显式更正）、每个出站分片的 `route`、HITL 请求/按钮/文本回答：复核该 Session 当前授权（`chat`/`reply`/`hitl`）。无授权的 Session 只有契约 `adopt()`（本机 Owner）可重新绑定，其他角色需要新的已准入输入。
+- 命令：路由闸门 `gate(call, spec)` 在认领后、执行前运行；Owner 可执行所有命令，其他角色仅限 spec 声明的 `roles`；封禁账号静默拒绝。闸门结果以 `call.access` 交给 authorize/execute。
+- 通知/输入回复路由：契约 `outbound()` 复核目标账号（通知仅 Owner，输入回复不得发往封禁账号）。
+- 授权撤销（角色变更、封禁、过期、服务关闭）：取消该 Session 正在运行的 Turn、结束其 HITL 请求、取消待发输出；已排队分片在发送前被 route 拒绝。
+
+返回对象的 `accessControlled` 表示闸门已启用；旧版 I/O 会忽略 `access`，QQ 在开启角色时据此拒绝启动。
 
 ## Commands（Iteration 05）
 

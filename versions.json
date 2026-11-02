@@ -4,7 +4,8 @@
   "pnpm": "11.7.0",
   "dsh-qqbot": "0.5.2",
   "qqbot-nodejs": "1.0.5",
-  "agentIO": "0.1.0-test.8",
-  "conversationManager": "0.1.0-test.3",
-  "remoteOps": "1.1.1-test.3"
+  "agentIO": "0.1.0-test.9",
+  "conversationManager": "0.1.0-test.4",
+  "remoteOps": "1.1.1-test.3",
+  "identityAccess": "0.1.0-test.2"
 }
