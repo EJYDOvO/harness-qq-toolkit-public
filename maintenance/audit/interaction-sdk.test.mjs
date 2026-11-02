@@ -225,7 +225,7 @@ const {MediaApi}=await import(pathToFileURL(path.join(sdk,'protocol/api/media.js
 const {verifyLocalFile}=await import(pathToFileURL(path.join(qq,'media/send-file-tool.js')));
 const {sendMedia}=vm.runInNewContext(slice('const MEDIA_TYPES','export async function bootstrapGateway').replace(/^export (async )?function/gm,'$1function')+';({sendMedia});',{verifyLocalFile,resolveReplyTarget,MediaFileType:{IMAGE:1,VIDEO:2,VOICE:3,FILE:4},process});
 function mediaFixture(t,{fail}={}){
- const dir=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'qq-audit-media-')));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+ const dir=fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(),'qq-audit-media-')));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
  const requests=[],creds={appId:'fixture',clientSecret:'dummy'};
  const client={async request(_token,method,route,body){requests.push({method,route,body:structuredClone(body)});const f=fail?.(route,requests.length);if(f)throw f;return route.endsWith('/files')?{file_uuid:'synthetic-uuid',file_info:'synthetic-info',ttl:0}:{id:'synthetic-media-receipt'};}};
  const mediaApi=new MediaApi(client,{getAccessToken:async()=> 'synthetic-token'},{});
@@ -242,6 +242,7 @@ function mediaFixture(t,{fail}={}){
 }
 test('Q20 a file attachment is uploaded without sending, then sent as one media message replying to the input',async t=>{
  const f=mediaFixture(t),doc=f.fileAt('report.pdf','PDF');
+ assert.equal(await fs.promises.realpath(doc),doc,'SDK fixture uses the native canonical path, including Windows temp aliases');
  const r=await f.send([{kind:'file',name:'report.pdf',resource:{type:'local',path:doc}}],'qq:fixture:1:file:x');
  assert.equal(r.status,'sent');assert.deepEqual({...r.parts[0]},{index:0,status:'sent',attachment:0,receipt:'synthetic-media-receipt',uploaded:'synthetic-uuid'});
  const [upload,message]=f.requests;
@@ -257,7 +258,7 @@ test('Q21 real SDK errors: a refused upload is not-sent, a timed-out media messa
  const timeout=mediaFixture(t,{fail:route=>route.endsWith('/messages')?new ApiError('timeout',0,route):undefined});
  const u=await timeout.send([{kind:'image',resource:{type:'local',path:timeout.fileAt('b.png')}}]);
  assert.deepEqual([u.status,u.reason],['unknown','timeout-or-network']);assert.equal(timeout.requests.filter(x=>x.route.endsWith('/messages')).length,1,'the message request is never repeated');
- const outside=mediaFixture(t),elsewhere=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'qq-audit-out-')));t.after(()=>fs.rmSync(elsewhere,{recursive:true,force:true}));
+ const outside=mediaFixture(t),elsewhere=fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(),'qq-audit-out-')));t.after(()=>fs.rmSync(elsewhere,{recursive:true,force:true}));
  fs.writeFileSync(path.join(elsewhere,'x.txt'),'secret');
  const o=await outside.send([{kind:'file',resource:{type:'local',path:path.join(elsewhere,'x.txt')}}]);
  assert.deepEqual([o.status,o.reason,o.stage],['not-sent','invalid-resource','before-platform']);assert.equal(outside.requests.length,0,'nothing read or uploaded');
