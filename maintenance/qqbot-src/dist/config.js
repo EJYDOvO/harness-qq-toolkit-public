@@ -33,6 +33,9 @@ export const ConfigSchema = Schema.object({
     notifications: Schema.object({
         enabled: Schema.boolean().default(true),
     }).default({ enabled: true }).description('主动通知（提醒、长任务、运维结果）经 Agent I/O 发往稳定目标；关闭后不发送，持久 Outbox 中的通知保持待发'),
+    identityAccess: Schema.object({
+        enabled: Schema.boolean().default(false),
+    }).default({ enabled: false }).description('可选 Identity & Access（Gate 2）：已准入私聊按 Owner/Contact/Guest 角色选择 Preset 并逐项授权；需先装配 dsh-identity-access，开启时禁止群聊'),
     hitl: Schema.object({
         enabled: Schema.boolean().default(true),
     }).default({ enabled: true }).description('原生审批与 ask_user_question 经 Agent I/O HITL Bridge 在 QQ 展示和作答；关闭后由原生 Web/Desktop 处理'),

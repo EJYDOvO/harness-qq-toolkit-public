@@ -7,6 +7,11 @@
 //             Interaction intervene/revise when enabled, otherwise followup
 //   outbound  target → the Manager's current record → isCurrentSession, checked
 //             by the I/O before every part
+// With an optional Host access contract (Identity & Access, Gate 2) every
+// entry — ordinary input, commands, HITL answers, corrections — admits the
+// verified sender first, the Manager receives the role's Presets, and the
+// Session's revocable authorization is re-checked before input, each outbound
+// part, HITL and notification delivery. Revocation cancels the running Turn.
 // One Conversation reference {platform, accountId, conversation:{type, id}} names
 // a Conversation everywhere; the adapter's scopes map it to the Manager's
 // existing (scope, peer) keys, so stored Session keys do not change.
@@ -37,6 +42,12 @@ export function createConversations(io,host){
   }
   if(!scopes.size)throw Error('Conversation requires at least one scope');
   const onInput=typeof options.onInput==='function'?options.onInput:undefined;
+  // access: the Host contract object, or a function returning the current one
+  // (a reloaded identity service yields a new contract; old grants end with it).
+  const accessOption=options.access;
+  if(accessOption!==undefined&&typeof accessOption!=='function'&&typeof accessOption?.admit!=='function')throw Error('Conversation access contract invalid');
+  const guarded=accessOption!==undefined;
+  const subscriptions=new Map();
   let inbound,release,commands,hitl,closed=false;
   // Notification grants issued by this wiring's notifiers (openNotifications);
   // an origin carrying anything else is not a notification.
@@ -54,6 +65,31 @@ export function createConversations(io,host){
   }
   const current=record=>!closed&&manager.isCurrentSession(record)===true;
 
+  // The current access contract, or undefined when unavailable: callers fail closed.
+  function accessNow(){
+   let value;try{value=typeof accessOption==='function'?accessOption():accessOption;}catch{return undefined;}
+   if(value?.contractVersion!==1||!['admit','bind','authorize','command','outbound','onRevoke'].every(m=>typeof value[m]==='function'))return undefined;
+   if(!subscriptions.has(value)){for(const [old,stop]of subscriptions)if(old!==value){try{stop();}catch{}subscriptions.delete(old);}subscriptions.set(value,value.onRevoke(revoked));}
+   return value;
+  }
+  // Host-verified input only (inbound channel, claimed command, HITL answer).
+  async function admit(input){const value=accessNow();if(!value)return undefined;try{return await value.admit(input)??undefined;}catch{return undefined;}}
+  // A Session without a current grant may only be re-bound by the contract's own
+  // adopt() (the configured Owner); other roles need a fresh admitted input.
+  const authorized=(record,operation)=>{
+   if(!guarded)return true;const value=accessNow();
+   try{return value?.authorize(record.sessionId,operation)===true||value?.adopt?.(record)===true&&value.authorize(record.sessionId,operation)===true;}catch{return false;}
+  };
+  // A revoked Session stops now: its Turn is cancelled and its HITL requests end;
+  // queued parts are refused by the per-part route check.
+  function revoked(sessionId){
+   const record=manager.findBySessionId?.(sessionId);if(!record)return;
+   try{hitl?.bridge.cancel(record);}catch{}
+   try{manager.cancelOutput?.(record);}catch{}
+   try{record.agent.cancel?.({kind:'user'});}catch{}
+   diagnostics?.emit('conversation','revoked',{sessionId,status:'revoked'});
+  }
+
   /** The logical target of a Manager record; the same reference inbound uses. */
   function target(record){
    const type=types.get(record?.scope);
@@ -68,6 +104,7 @@ export function createConversations(io,host){
   function submit(record,content,{revise=false,input}={}){
    if(!current(record))return {status:'not-delivered',reason:'session-changed'};
    if(!types.has(record.scope)||!allowed(record.scope,record.peerId))return {status:'rejected',reason:'unauthorized'};
+   if(!authorized(record,'chat'))return {status:'rejected',reason:'unauthorized'};
    if(typeof content!=='string'||!content)return {status:'rejected',reason:'empty-message'};
    const p=policy(record),interactive=!!p&&typeof p.intervene==='function';
    // A failed lookup is not a plain Agent: no input is created, and the I/O lets
@@ -104,16 +141,24 @@ export function createConversations(io,host){
    // Defence in depth after the platform chain: the same configuration admits
    // the Conversation; a scope the platform disabled is never opened here.
    if(!allowed(scope,peer))return {status:'rejected',reason:'unauthorized'};
+   // Gate 2: platform admission does not choose a role; Identity & Access does.
+   let admission;
+   if(guarded){admission=await admit(standard);if(!admission||closed)return {status:'rejected',reason:'unauthorized'};}
    const body=typeof content==='function'?content():content;
    if(typeof body!=='string'||!body)return {status:'rejected',reason:'empty-message'};
    let record;
-   try{record=await manager.getOrCreate(scope,peer,standard.sender.id,replyTarget);}
+   try{record=await manager.getOrCreate(scope,peer,standard.sender.id,replyTarget,...(admission?[{presets:admission.presets}]:[]));}
    catch(error){return {status:'not-delivered',reason:'session-unavailable',error};}
    // getOrCreate re-checks after each of its awaits, but disposal, rotation or a
    // revocation can still land before this continuation runs: never hand input to
    // a Session that is no longer current, nor to a record of another Conversation;
    // submit() re-reads admission.
    if(record?.scope!==scope||record.peerId!==peer)return {status:'not-delivered',reason:'session-changed'};
+   // The Session's revocable authorization: the role's Preset and this Principal.
+   if(admission){
+    if(!admission.presets.includes(record.agentPreset))return {status:'rejected',reason:'unauthorized'};
+    const value=accessNow();try{if(!value)throw Error('unavailable');value.bind(admission,record);}catch{return {status:'rejected',reason:'unauthorized'};}
+   }
    diagnostics?.emit('conversation','route',{sessionId:record.sessionId,conversation:standard.conversation,inputId:standard.message?.id,status:'active'});
    return submit(record,body,{input:standard});
   }
@@ -133,6 +178,7 @@ export function createConversations(io,host){
    const record=manager.getSessionRecord(scope,peer);
    if(!record||record.sessionId!==origin.sessionId||!current(record))return {ok:false,reason:'stale'};
    if(record.scope!==scope||record.peerId!==peer)return {ok:false,reason:'invalid-target'};
+   if(!authorized(record,'reply'))return {ok:false,reason:'unauthorized'};
    return {ok:true,record};
   }
 
@@ -151,6 +197,7 @@ export function createConversations(io,host){
    if(!allowed(scope,peer))return {ok:false,reason:'unauthorized'};
    let granted=false;try{granted=grant.authorize(Object.freeze({type:to.conversation.type,id:peer}))===true;}catch{granted=false;}
    if(!granted)return {ok:false,reason:'unauthorized'};
+   if(guarded){let ok=false;try{ok=accessNow()?.outbound(Object.freeze({type:to.conversation.type,id:peer}),{kind:grant.reply?'reply':'notification'})===true;}catch{ok=false;}if(!ok)return {ok:false,reason:'unauthorized'};}
    return {ok:true,route:Object.freeze({...(grant.reply?{inputReply:true,inputId:grant.messageId}:{notification:true}),target:Object.freeze({type:to.conversation.type,id:peer,scope})})};
   }
 
@@ -195,7 +242,13 @@ export function createConversations(io,host){
   function openCommands(options={}){
    if(closed)throw Error('Conversation closed');
    if(commands)throw Error('Commands already open for this Conversation wiring');
-   const router=createCommandRouter({...options,
+   const gate=!guarded?undefined:async(call,spec)=>{
+    const admission=await admit({conversation:call.conversation,sender:call.sender,message:call.message});
+    if(!admission)return {ok:false,silent:true};
+    let ok=false;try{ok=accessNow()?.command(admission,spec)===true;}catch{ok=false;}
+    return ok?{ok:true,access:admission}:{ok:false};
+   };
+   const router=createCommandRouter({...options,...(gate?{gate}:{}),
     admits:(type,id)=>{const scope=scopes.get(type);return !closed&&!!scope&&allowed(scope,id);},
     claim:input=>{if(closed||!inbound)return 'unavailable';const result=inbound.claim(input);if(result==='claimed')rememberInput(input);return result;}});
    commands=Object.freeze({...router,dispatch:(input,args={})=>router.dispatch(input,{...args,reply:async body=>{const result=await reply(input,body);if(result.status!=='sent')throw Error('Input reply not accepted');return result;}})});
@@ -232,7 +285,7 @@ export function createConversations(io,host){
    if(typeof host.hitl?.register!=='function')throw Error('HITL is unavailable in this Agent I/O host');
    if(typeof manager.findBySessionId!=='function')throw Error('HITL requires the Manager Session lookup');
    const bridge=createHITLBridge({...options,io,manager,diagnostics,wiring:{target,current,
-    allowed:record=>types.has(record?.scope)&&allowed(record.scope,record.peerId),
+    allowed:record=>types.has(record?.scope)&&allowed(record.scope,record.peerId)&&authorized(record,'hitl'),
     claim:input=>closed||!inbound?'unavailable':inbound.claim(input)}});
    const unregister=host.hitl.register(bridge);
    const handle={bridge,unregister};hitl=handle;
@@ -274,9 +327,9 @@ export function createConversations(io,host){
 
   function close(){
    diagnostics?.emit('conversation','close',{status:'closed'});
-   closed=true;if(hitl){hitl.bridge.close();hitl.unregister();hitl=undefined;}inbound?.close();inbound=undefined;release?.();release=undefined;commands=undefined;
+   closed=true;for(const stop of subscriptions.values())try{stop();}catch{}subscriptions.clear();if(hitl){hitl.bridge.close();hitl.unregister();hitl=undefined;}inbound?.close();inbound=undefined;release?.();release=undefined;commands=undefined;
   }
 
-  return Object.freeze({platform,adapter,accountId,target,policy,handoff,submit,route,reply,openInbound,openCommands,openHITL,openNotifications,registerAdapter,diagnostics,close});
+  return Object.freeze({platform,adapter,accountId,accessControlled:guarded,target,policy,handoff,submit,route,reply,openInbound,openCommands,openHITL,openNotifications,registerAdapter,diagnostics,close});
  };
 }

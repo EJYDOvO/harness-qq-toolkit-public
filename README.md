@@ -6,7 +6,8 @@ DSH 的可复用 QQ 通信组件。普通 Agent 不需要 Character、Memory、P
 |---|---|
 | DSH | 0.2.1-rc.3，用户自行安装官方发行包 |
 | QQ Bot / SDK | 0.5.2 / 1.0.5，必须配套应用两份补丁 |
-| Agent I/O / Conversation Manager | 0.1.0-test.8 / 0.1.0-test.3 |
+| Agent I/O / Conversation Manager | 0.1.0-test.9 / 0.1.0-test.4（已部署：test.8 / test.3） |
+| Identity & Access（可选，默认关闭） | 0.1.0-test.2 |
 | Remote Ops（可选） | 1.1.1-test.3 |
 | 构建工具 | Node 24、锁定依赖、pnpm 11.7.0 |
 
@@ -15,6 +16,7 @@ DSH 的可复用 QQ 通信组件。普通 Agent 不需要 Character、Memory、P
 - `plugin-sources/dsh-agent-io`：可信入站、命令、HITL、通知和统一出站队列。
 - `plugin-sources/dsh-conversation-manager`：唯一当前 Session 路由、偏好与生命周期。
 - `plugin-sources/dsh-remote-ops`：可选 Owner 运维命令；维护后端需另外显式配置。
+- `plugin-sources/dsh-identity-access`：可选 Owner/Contact/Guest 授权服务（Gate 2）与 `/role`。
 - `maintenance/qqbot-src`、`sdk-src`：实际兼容代码；对应 upstream 文件/哈希和 `patches` 用于确定性重建与校验。
 - `scripts/portable.cjs`、`versions.json`、根锁文件和 `templates`：空目录安装、私有配置和离线数据迁移。
 - `maintenance/*.test.*`：权限、I/O、重启、通知与生命周期回归。
@@ -36,3 +38,5 @@ Windows rc.3 是原生验证基线；Mac/Linux 没有同等原生验收。构建
 所有正文、命令、HITL、媒体和通知经唯一 Agent I/O 出口。Typing/ACK 是协议控制，不是对话或审批结算。通知目标是可靠的 at-most-once handoff；unknown/partial 不自动重发，API 接受不等于手机收件。
 
 Character 集成见独立 [Character Agent](https://github.com/EJYDOvO/character-agent-v1)。第三方授权文件保留在 `licenses/` 和对应源码目录；公开可见不等于改变原许可。
+
+可选 [Identity & Access](plugin-sources/dsh-identity-access/README.md)（`identityAccess.enabled`，默认关闭）在 Agent I/O 的入站、命令、HITL、出站与 Conversation Manager 的 Session 选择上形成可撤销的角色授权。已有源码与隔离测试，未部署，未经真实 QQ/手机验收。

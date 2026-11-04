@@ -23,15 +23,19 @@ const DEFAULT_MESSAGES=Object.freeze({
  *                  message as consumed in the inbound duplicate scope
  * @param admits    (type, id) → boolean: the platform admission of the Conversation
  * @param messages  reply texts for refusals (defaults keep the QQ SDK wording)
+ * @param gate      optional (call, spec) → Promise<{ok:true, access?}|{ok:false, silent?}>:
+ *                  the Host access check of the sender (e.g. Identity & Access);
+ *                  access is handed to authorize/execute as call.access
  */
-export function createCommandRouter({prefixes=['/'],claim,admits,messages={}}={}){
+export function createCommandRouter({prefixes=['/'],claim,admits,messages={},gate}={}){
  if(!Array.isArray(prefixes)||!prefixes.length||prefixes.some(p=>!text(p)))throw Error('Command prefixes must be non-empty strings');
  if(typeof claim!=='function'||typeof admits!=='function')throw Error('Command router requires claim() and admits()');
+ if(gate!==undefined&&typeof gate!=='function')throw Error('Command gate must be a function');
  const words={...DEFAULT_MESSAGES,...messages};
  const registry=new Map(),specs=new Set();
 
  /**
-  * spec: {name: string|string[], execute(call), authorize?(call) → true|string|false,
+  * spec: {name: string|string[], execute(call), authorize?(call) → true|string|false, roles?: string[],
   *        scopes?: ['direct'|'group'], description?, usage?, hidden?, category?}
   * → unregister()
   */
@@ -88,7 +92,7 @@ export function createCommandRouter({prefixes=['/'],claim,admits,messages={}}={}
   let claimed;try{claimed=claim(input);}catch{claimed='unavailable';}
   if(claimed==='duplicate')return {status:'duplicate'};
   if(claimed!=='claimed')return {status:'rejected',reason:'closed'};
-  const call=Object.freeze({name:parsed.name,args:Object.freeze(parsed.args),raw:parsed.raw,
+  let call=Object.freeze({name:parsed.name,args:Object.freeze(parsed.args),raw:parsed.raw,
    conversation:Object.freeze({type:conversation.type,id:conversation.id}),sender:Object.freeze({id:sender.id}),
    message:Object.freeze({...(text(input.message.id)?{id:input.message.id}:{}),text:input.message.text}),context});
   const answer=async value=>{
@@ -99,6 +103,16 @@ export function createCommandRouter({prefixes=['/'],claim,admits,messages={}}={}
   if(spec.scopes&&!spec.scopes.includes(conversation.type)){
    const replied=await answer(spec.scopes.includes('direct')?words.direct:words.group);
    return {status:'denied',reason:'scope',command:parsed.name,replied};
+  }
+  if(gate){
+   let verdict;try{verdict=await gate(call,spec);}catch{verdict=undefined;}
+   // A silent refusal (e.g. a blocked account) sends nothing back.
+   if(verdict?.ok!==true){
+    if(verdict?.silent===true)return {status:'rejected',reason:'unauthorized'};
+    const replied=await answer(words.unauthorized);
+    return {status:'denied',reason:'unauthorized',command:parsed.name,replied};
+   }
+   if(verdict.access!==undefined)call=Object.freeze({...call,access:verdict.access});
   }
   if(spec.authorize){
    let verdict;try{verdict=spec.authorize(call);}catch{verdict=false;}

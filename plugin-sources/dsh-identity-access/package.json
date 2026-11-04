@@ -1,0 +1,1 @@
+{"name":"dsh-identity-access","version":"0.1.0-test.2","type":"module","main":"index.mjs","files":["*.mjs","README.md","LICENSE"],"engines":{"node":">=24"}}
