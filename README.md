@@ -4,7 +4,7 @@ DSH 的可复用 QQ 通信组件。普通 Agent 不需要 Character、Memory、P
 
 | 组件 | 固定源码基线 |
 |---|---|
-| DSH | 0.2.1-rc.3，用户自行安装官方发行包 |
+| DSH | 0.2.2-rc.1，用户自行安装官方发行包（Conversation Manager test.5 只支持 0.2.2 的 Schedule API） |
 | QQ Bot / SDK | 0.5.2 / 1.0.5，必须配套应用两份补丁 |
 | Agent I/O / Conversation Manager | 0.1.0-test.9 / 0.1.0-test.4（已部署：test.8 / test.3） |
 | Identity & Access（可选，默认关闭） | 0.1.0-test.2 |
@@ -29,7 +29,7 @@ DSH 的可复用 QQ 通信组件。普通 Agent 不需要 Character、Memory、P
 
 `portable prepare` 只写新空目录；`install` 固定版本、应用补丁并冻结生成锁文件；`verify` 校验 tarball 和补丁逐文件哈希。凭据由本地环境变量提供。连接真实 QQ 前必须审查唯一 Owner 白名单和数据恢复结果。
 
-Windows rc.3 是原生验证基线；Mac/Linux 没有同等原生验收。构建脚本允许显式 runtimeExecutable/resourcesDirectory，不能据此宣称已经支持跨系统无损恢复。
+Windows DSH 0.2.2-rc.1 是当前隔离原生验证目标（此前 rc.3）；Mac/Linux 没有同等原生验收。构建脚本允许显式 runtimeExecutable/resourcesDirectory，不能据此宣称已经支持跨系统无损恢复。
 
 ## 接口与维护
 

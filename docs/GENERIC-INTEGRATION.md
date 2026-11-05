@@ -123,13 +123,17 @@ sessionLifecycle:
 
 运行中的 Agent、待处理 Inbox、待审批/问答、持久未完成轮次均会延后轮换，下一次安全交互重试，不自动 cancel。记录在 `getStatus().lifecycle` 中包含 lastUserAt、pendingReason、blockedBy、generation。并发 get、手动重置/模型切换/压缩采用每 Conversation 串行边界；路由和生命周期使用同一个偏好文件原子提交，失败不发布新路由。异常或外部更改的偏好文件拒绝覆盖；仍要求单活 Host，不提供跨机器锁。
 
-已有原生 Schedule 仍绑定旧 Session，**不迁移提醒**。通用 QQ 没有可信旧根桥接时，轮换因 `existing_schedule` 延后，避免丢提醒。Character Identity 提供 Host-only `manager.preserveScheduledSession(oldId)`，只接受已持久绑定的 Owner/项目/角色旧根，经原 Outbox 通知稳定 Conversation，不能改写当前主路由。历史部署 test.13 冷恢复曾重授完整身份；test.14 改为仅提醒绑定，拒绝历史根的模型、工具、Memory 与长期任务创建。其他项目若需要相同行为，须提供自己经过审查的桥接；不要简单返回 true。
+已有原生 Schedule 仍绑定旧 Session，**不迁移提醒**。通用 QQ 没有可信旧根桥接时，轮换因 `existing_schedule` 延后，避免丢提醒。DSH 0.2.2 起该判断读取 `schedule.catalog()`：任何未结束（active 或 paused）、`target` 为固定 Session 且等于旧根的任务都会延后轮换。Character Identity 提供 Host-only `manager.preserveScheduledSession(oldId)`，只接受已持久绑定的 Owner/项目/角色旧根，经原 Outbox 通知稳定 Conversation，不能改写当前主路由。历史部署 test.13 冷恢复曾重授完整身份；test.14 改为仅提醒绑定，拒绝历史根的模型、工具、Memory 与长期任务创建。其他项目若需要相同行为，须提供自己经过审查的桥接；不要简单返回 true。
 
 当前补丁的 `manager.isCurrentSession(record)` 检查真实 record 对象、manager 路由与 Agent 注册表；集成层必须在异步 admission 后重查，不能凭 Session ID/QQ 身份参数授权。QQTK 不决定具体 Identity 策略，普通 Agent 无须安装 Character。当前 rc.2 切模型使用原生 `snapshotEvents/buildForkSeed` 构建精确前缀，避免旧 `.events` API 和额外的临时活跃 fork；新根持久化成功后通过 `PrefsStore.commitSession` 一次提交模型偏好及路由。磁盘写入/外部修改/关闭失败时撤销候选，不发布新路由。自动空白轮换仍不 Fork。
 
 生命周期状态在 Manager 的显式 `stateFile`。旧版 `$DSH_HOME/qqbot/model-prefs.json` 不再隐式读取；离线审查后可选用原文件，或完整复制到新路径。备份同时保留原生 Session/Schedule 和 Identity/通知状态。停用开关保留最新路由；未完成副作用仍会阻塞轮换，不能删除记录强迫重置。
 
 验证：`node --test maintenance/session-lifecycle.test.mjs`；配套 Character `scripts/run-lifecycle.ps1` 在两个真实 rc.2 Host 进程中验证空白根、Memory 连续性、停机逾期、原提醒冷恢复和独立任务。模型/Sender 为合成替身，不启动 QQBot、不证明实机收件；已随 Character test.14 在 Windows 实例部署，保留 test.13 生命周期配置；真实 QQ 收件与手机审批仍待验收。
+
+## DSH 0.2.2-rc.1
+
+0.2.2 的 Schedule `list()` 改为 Host 范围分页结果，不再按 Session 过滤；Conversation Manager 改读 catalog 的 `target`，否则存在提醒时的轮换延后会静默失效。宿主写入 Schedule 后存储升级为 v2，0.2.1 无法再加载，宿主与本仓库插件需一起切换。隔离验证使用官方签名安装包解包后的运行时、合成模型与 Sender；QQ Bot/SDK 版本和两份补丁未变，补丁重建通过，但打补丁的 QQ Gateway 未在 0.2.2 上联网装配，也没有手机收件证明。
 
 ## DSH 0.2.1-rc.3
 

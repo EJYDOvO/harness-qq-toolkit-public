@@ -1,10 +1,10 @@
 # 干净安装、数据迁移与回滚
 
-源码和用户数据分开迁移。以下命令只用于新目录；不要对运行中的原目录运行 prepare/restore。默认单 Owner 私聊，不开启群聊。Windows / DSH 0.2.1-rc.3 / Node 24 是原生验证目标；Mac/Linux 的 GUI、原生权限、旧 Session 路径迁移尚未验收。
+源码和用户数据分开迁移。以下命令只用于新目录；不要对运行中的原目录运行 prepare/restore。默认单 Owner 私聊，不开启群聊。Windows / DSH 0.2.2-rc.1 / Node 24 是原生验证目标；Mac/Linux 的 GUI、原生权限、旧 Session 路径迁移尚未验收。
 
 ## 1. 安装公开依赖
 
-自行安装官方 DSH rc.3 与 Node 24。两个源码目录独立：
+自行安装官方 DSH 0.2.2-rc.1 与 Node 24。两个源码目录独立：
 
 ```sh
 git clone https://github.com/EJYDOvO/harness-qq-toolkit-public.git
@@ -20,7 +20,7 @@ npm test
 npm run test:audit
 ```
 
-根 package-lock.json 固定构建依赖及 QQ/SDK 下载完整性。pnpm 11.7.0 来自本地锁定依赖，不依赖开发机全局 pnpm 或旧 Profile。schemastery 3.18.5 仅用于测试依赖；DSH SDK 由 rc.3 发行包提供，不另装第二套 Core。
+根 package-lock.json 固定构建依赖及 QQ/SDK 下载完整性。pnpm 11.7.0 来自本地锁定依赖，不依赖开发机全局 pnpm 或旧 Profile。schemastery 3.18.5 仅用于测试依赖；DSH SDK 由 0.2.2-rc.1 发行包提供，不另装第二套 Core。
 
 ## 2. 创建私有配置
 
@@ -73,6 +73,6 @@ Character 在上述命令追加 --qqtk。备份独立保存 sessions、storages�
 
 已有旧 Windows 布局实例升级维护后端时，保留该实例自己的 `maintenance/features.json`、`plugin-policy.json` 与 `maintenance/browser/` 运行包，只更新代码文件。仓库中的 features.json 是新安装模板（Task Memory/Browser 默认关闭）；用它覆盖已启用 Browser 或 Memory 的实例会在下次 apply 时关闭这些功能。切换前对比新旧开关，确认一致后再重新 Stage。
 
-回滚保留**最新** Memory、Session、Schedule、路由和去重账本，只切回兼容的旧代码/包/补丁/私有配置。不用旧数据快照覆盖新增记录。官方 DSH 自身的安装/降级由官方渠道管理，本仓库不修改 ASAR 或内置 Bundle。
+回滚保留**最新** Memory、Session、Schedule、路由和去重账本，只切回兼容的旧代码/包/补丁/私有配置。DSH 0.2.2 写入 Schedule 后存储为 v2，0.2.1 宿主无法加载；此后不能把宿主单独降回 0.2.1，只能在维护者明确决定时整体恢复切换前快照（会丢失窗口内新增数据）。不用旧数据快照覆盖新增记录。官方 DSH 自身的安装/降级由官方渠道管理，本仓库不修改 ASAR 或内置 Bundle。
 
 SDK/Interaction 跨仓库审计需要 Character 源码：在非默认相邻目录时设置 DSH_CHARACTER_PROJECT 为其绝对路径。仅为测试依赖，不是 QQTK 运行依赖；CI 固定检出兼容 Character 提交，更新接口时同步审查该固定点。

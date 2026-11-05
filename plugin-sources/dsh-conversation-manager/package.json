@@ -1,6 +1,6 @@
 {
   "name": "dsh-conversation-manager",
-  "version": "0.1.0-test.4",
+  "version": "0.1.0-test.5",
   "type": "module",
   "main": "index.mjs",
   "exports": {
@@ -16,6 +16,6 @@
   "license": "MIT",
   "engines": {
     "node": ">=24",
-    "dsh": ">=0.2.1-rc.3"
+    "dsh": ">=0.2.2-rc.1"
   }
 }

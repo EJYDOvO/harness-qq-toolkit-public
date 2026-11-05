@@ -122,7 +122,7 @@ function cmHost(t,{home=temp(t),durable=new Map()}={}){
  const ctx={on:()=>()=>{},get(name){
   if(name==='agentPresets')return {async resolve(id){return {id};},async mount(){},composedPreset:c=>presetOf.get(c)};
   if(name==='sessionPersistence')return {async open(id){if(!durable.has(id))throw new SessionPersistenceNotFoundError(id);return {header:durable.get(id).meta,read:async()=>({events:[]}),close:async()=>{}};}};
-  if(name==='schedule')return {async list(){return [];}};
+  if(name==='schedule')return {async catalog(){return [];}};
   if(name==='sessions')return {async flush(s){durable.set(s.header.id,{meta:{agentPreset:s.header.agentPreset}});return true;}};
  }};
  const config={preset:'qq-character',cwd:home,sessionIdleTimeout:600000,sessionLifecycle:{enabled:false},adapter:{key:(scope,peer)=>'qqbot:app-a:'+scope+':'+peer,lifecycleScope:()=>false,isUserInput:t=>!!t?.msgId,inputId:t=>t?.msgId}};

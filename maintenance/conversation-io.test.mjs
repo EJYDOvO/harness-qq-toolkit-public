@@ -36,7 +36,7 @@ function host(t,{home,durable=new Map(),clock={now:Date.now()},namespace='chat-a
  const ctx={on:()=>()=>{},get(name){
   if(name==='agentPresets')return {async resolve(id){return {id:id??'fixture'};},async mount(){}};
   if(name==='sessionPersistence')return {async open(id){if(!durable.has(id))throw new SessionPersistenceNotFoundError(id);return {header:durable.get(id).meta,read:async()=>({events:durable.get(id).events}),close:async()=>{}};}};
-  if(name==='schedule')return {async list(){return [];}};
+  if(name==='schedule')return {async catalog(){return [];}};
   if(name==='sessions')return {async flush(s){durable.set(s.header.id,{meta:{agentPreset:s.header.agentPreset},events:structuredClone(s.events)});return true;}};
  }};
  // A generic chat adapter of the Manager: its opaque target names the platform input.
