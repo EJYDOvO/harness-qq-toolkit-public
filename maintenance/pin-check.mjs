@@ -1,3 +1,4 @@
+import {checkProfileBudgets} from './model-budget-check.mjs';
 // Read-only pre-switch candidate / post-switch instance pin check. Changes nothing (no install, update, policy or
 // updater write). Fails unless the Host build, the exact QQ package versions,
 // their pnpm patch pins and the patched installed files all match this checkout.
@@ -57,6 +58,7 @@ check(Object.values(policy.targets??{}).every(v=>typeof v==='string'&&/^\d+\.\d+
 facts.testedRuntime=policy.testedRuntime;check(policy.testedRuntime===host.dsh,'plugin-policy testedRuntime must match target Host');
 for(const name of ['dsh-qqbot','qqbot-nodejs'])check(policy.targets?.['@tencent-connect/'+name]===versions[name],'plugin-policy target must pin '+name+' exactly');
 check(typeof policy.qqPatch==='string'&&!!patched['@tencent-connect/dsh-qqbot@'+versions['dsh-qqbot']]&&path.resolve(profile,policy.qqPatch)===path.resolve(profile,patched['@tencent-connect/dsh-qqbot@'+versions['dsh-qqbot']]),'plugin-policy qqPatch must match installed patch pin');
+const budget=checkProfileBudgets({profile,runtime:host.dsh});facts.modelBudgets=budget.models;problems.push(...budget.problems.map(p=>'Model budget: '+p));
 // Desktop updates need an explicit user confirmation; report anything staged.
 if(updater&&fs.existsSync(updater+'/pending/update-info.json')){const info=load(updater+'/pending/update-info.json');facts.stagedInstaller=info.fileName;const staged=/(\d+\.\d+\.\d+(?:-[\w.]+)?)-win/.exec(info.fileName)?.[1];if(staged&&staged!==host.desktop)warnings.push(`Desktop installer ${info.fileName} is staged; never confirm a Desktop update during the switch window`);}
  }catch(error){problems.push('Inspection failed: '+error.message);}

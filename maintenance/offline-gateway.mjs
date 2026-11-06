@@ -21,7 +21,10 @@ const server=http.createServer(async(req,res)=>{
  const to=/^\/v2\/users\/([^/]+)\/messages$/.exec(req.url);
  if(req.method==='POST'&&to){seen.sent.push({to:to[1],auth:req.headers.authorization,body:JSON.parse(body)});return json({id:'offline-receipt-'+seen.sent.length,timestamp:new Date().toISOString()});}
  if(req.method==='POST'&&req.url.endsWith('/chat/completions')){
-  const request=JSON.parse(body);seen.model.push({stream:request.stream,messages:request.messages?.length});
+  const request=JSON.parse(body),budget=request.max_tokens??request.max_completion_tokens;
+  const inputCharge=Math.ceil(Buffer.byteLength(JSON.stringify(request.messages??[]))/8);
+  seen.model.push({stream:request.stream,messages:request.messages?.length,budget});
+  if(!Number.isSafeInteger(budget)||budget<=0||inputCharge+budget>128000)return json({error:{message:'Mock context window exceeded',code:'context_length_exceeded'}},400);
   const chunk=v=>res.write('data: '+JSON.stringify({id:'offline',object:'chat.completion.chunk',created:0,model:request.model,...v})+'\n\n');
   res.writeHead(200,{'content-type':'text/event-stream'});chunk({choices:[{index:0,delta:{role:'assistant',content:REPLY},finish_reason:null}]});
   chunk({choices:[{index:0,delta:{},finish_reason:'stop'}],usage:{prompt_tokens:1,completion_tokens:1,total_tokens:2}});res.end('data: [DONE]\n\n');return;
@@ -42,7 +45,7 @@ function hostVersion(){
 const report={ok:false,runtime:hostVersion(),qqNetwork:false,checks:[]};let host;
 try{
  const configFile=path.join(path.dirname(home),path.basename(home)+'.config.json');
- fs.writeFileSync(configFile,JSON.stringify({runtimeRoot:runtime,profileName:'offline',qq:{appId:APP,ownerId:OWNER,appSecretEnv:'OFFLINE_QQ_SECRET'},model:{provider:'offline-model',id:'fixture',baseURL:base+'/v1',apiKeyEnv:'OFFLINE_MODEL_KEY'}}),{flag:'wx'});
+ fs.writeFileSync(configFile,JSON.stringify({runtimeRoot:runtime,profileName:'offline',qq:{appId:APP,ownerId:OWNER,appSecretEnv:'OFFLINE_QQ_SECRET'},model:{provider:'offline-model',id:'fixture',baseURL:base+'/v1',apiKeyEnv:'OFFLINE_MODEL_KEY',contextWindow:128000,maxTokens:128000,observedAt:new Date().toISOString(),capabilitySource:'reviewed-manual'}}),{flag:'wx'});
  portable.prepare(configFile,home);const installed=portable.install(home);assert(installed.patchesVerified);
  report.checks.push(`Portable Profile installed pinned QQ packages; patched files hash-verified (${installed.packages} local packages)`);
  const m=JSON.parse(fs.readFileSync(home+'/portable-profile.json','utf8'));
@@ -65,6 +68,7 @@ try{
  report.checks.push('Owner C2C message -> native Session -> model stream -> session/event outbound -> passive reply POST (msg_id kept)');
  const stderr=fs.readFileSync(home+'/host.stderr.log','utf8');assert(!/entries did not activate/.test(stderr),'Inactive plugin entries: '+stderr.slice(0,400));
  report.checks.push('No inactive plugin entries in Host stderr');
+ report.modelBudgets=seen.model.map(m=>m.budget);report.checks.push('Model server enforces input + output capacity; native SDK leaves input space');
  report.requests={token:seen.token,gateway:seen.gateway,model:seen.model.length,sent:seen.sent.map(s=>({to:s.to===OWNER?'owner':s.to===STRANGER?'stranger':'other',msgType:s.body.msg_type})),unexpected:seen.other};
  report.ok=true;
 }catch(error){report.error=error.stack;}
