@@ -1,6 +1,6 @@
 # Identity & Access — Host 授权服务（Gate 2）
 
-独立、平台无关的 Host 插件 `0.1.0-test.2`，provide 服务 `identityAccess`。不依赖 QQ SDK、Character Memory、Persona 或任何平台命令实现；不注册模型工具、RPC 或路由。默认不装配，QQ 只有显式 `identityAccess.enabled: true` 时才使用它。
+独立、平台无关的 Host 插件 `0.1.0-test.3`，provide 服务 `identityAccess`。不依赖 QQ SDK、Character Memory、Persona 或任何平台命令实现；不注册模型工具、RPC 或路由。默认不装配，QQ 只有显式 `identityAccess.enabled: true` 时才使用它。
 
 ```
 Platform Adapter → Platform Admission（白名单）→ Unified Agent I/O → Identity & Access → Conversation Manager → 授权的原生 Preset
@@ -38,7 +38,13 @@ Platform Adapter → Platform Admission（白名单）→ Unified Agent I/O → 
 - Session 授权：`issue(verified,{sessionId,preset})` 颁发可撤销租约，`authorize(lease,{sessionId,operation})` 每次检查当前角色、有效期、封禁、Preset 与 Session。非 Owner 仅允许 `chat/reply/hitl`。角色变更只撤销该 Principal 的租约；过期在检查时生效。
 - `conversation({platform,adapter,accountId})`：Agent I/O 的访问契约（`admit/bind/adopt/authorize/command/outbound/onRevoke/commands`）。v1 只接受私聊且发送者即会话对象；群聊会使多个 Principal 共用一个 Session，直接拒绝。`adopt` 只按本机 Owner 配置把无新输入恢复的 Owner Session 重新绑定，其他角色必须有新的已准入输入。
 - `/role`（`roleCommandSpec`）：经 Agent I/O 命令路由注册，路由的访问闸门提供 `call.access`；返回值即回复文本。`list`、`show <principal>`、`grant contact <principal> [30m|12h|7d]`（最长 366 天）、`revoke|block|unblock <principal>`。目标必须是已验证并记录过的 Principal。
-- 全局工具守卫：角色管理的 Session 只有当前 Owner 授权才能执行工具；contact/guest Preset 无论租约状态一律拒绝。`tool-scope.mjs` 是 contact/guest Preset 内的原生工具范围（`tools.restrict` + `tools.guard`），覆盖继承和后注册的全局工具。
+- 全局工具守卫：角色管理的 Session 只有当前 Owner 授权才能执行工具；contact/guest Preset 无论租约状态一律拒绝。原生准备阶段的 `tools.guard` 与派发阶段的 `tools/execute` 都校验，已准备的调用不会因队列中的撤销而沿用旧结果。`tool-scope.mjs` 是 contact/guest Preset 内的原生工具范围（`tools.restrict` + `tools.guard`），覆盖继承和后注册的全局工具。
+
+## test.3 授权回归
+
+撤销租约不再清除同一服务实例内 Session 的主体归属。`managedSession(id)` 是仅供 Host 使用的本地历史标记，不颁发授权，关闭服务后也只返回这一布尔值。旧 Owner 的 Provider 被关闭、租约已撤销或持久化故障时，该 Session 不会落入“非角色管理的本地窗口”放行分支；另一主体也不能借撤销接管其 Session。此标记不持久化、不扩充身份 Schema；HMR/冷恢复仍依赖 Conversation Manager 的可信路由、Owner adopt 和 Preset 范围，不能用正文或 Preset 名称恢复身份。
+
+合成对抗测试覆盖 QQ 的伪造 System、Owner、审批、工具结果和 Worker JSON；原文引用保持为 user 内容，嵌入命令不执行。配套 Character 的普通工具派发边界修复与固定 DSH 0.2.2-rc.1 原生角色探针，验证准备后撤销、旧 Owner Session、后注册工具、HMR 及进程重启。默认角色权限未扩大，原生审批未旁路。
 
 ## 边界
 
