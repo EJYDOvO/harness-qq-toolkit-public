@@ -26,7 +26,7 @@ export function createIdentityAccess({stateFile,owner,ownerFile,presets:names,le
  if(fs.existsSync(key))state=load(key);
  if(state.schemaVersion!==1||state.owner!==fingerprint||!Number.isSafeInteger(state.epoch)||state.epoch<0||!state.accounts||Array.isArray(state.accounts)||!Array.isArray(state.audit))throw Error('Identity state incompatible or damaged');
  for(const [id,row]of Object.entries(state.accounts))if(id===ownerId||!/^principal-[a-f0-9]{64}$/.test(id)||!row||!['contact',undefined].includes(row.role)||typeof row.blocked!=='boolean'||row.expires!==null&&!Number.isFinite(row.expires)||row.provider!==undefined&&(!field(row.provider)||!field(row.subject)||principal(row.provider,row.subject)!==id))throw Error('Invalid persisted role state');
- const providers=new Map(),identities=new WeakMap(),known=new Map(),leases=new Map(),sessions=new Map(),revisions=new Map(),conversations=new Map();
+ const providers=new Map(),identities=new WeakMap(),known=new Map(),leases=new Map(),sessions=new Map(),sessionOwners=new Map(),revisions=new Map(),conversations=new Map();
  const save=persist??(next=>{fs.mkdirSync(path.dirname(key),{recursive:true});const tmp=key+'.'+randomUUID()+'.tmp';let fd;try{fd=fs.openSync(tmp,'wx',0o600);fs.writeFileSync(fd,JSON.stringify(next));fs.fsyncSync(fd);fs.closeSync(fd);fd=undefined;fs.renameSync(tmp,key);}finally{if(fd!==undefined)fs.closeSync(fd);if(fs.existsSync(tmp))fs.unlinkSync(tmp);}});
  writers.add(key);
  function active(){if(closed||faulted)throw Error('Identity service unavailable');}
@@ -48,9 +48,9 @@ export function createIdentityAccess({stateFile,owner,ownerFile,presets:names,le
   const who=identity(verified),p=policy(who.principalId);
   if(p.blocked||!field(sessionId)||!accepted[p.role].includes(preset))throw Error('Preset authorization denied');
   // A Session belongs to one Principal; another account cannot take over its authorization.
-  const bound=sessions.get(sessionId);if(bound&&bound.principalId!==p.principalId)throw Error('Session belongs to another Principal');
+  const bound=sessionOwners.get(sessionId);if(bound&&bound!==p.principalId)throw Error('Session belongs to another Principal');
   const handle=Object.freeze({}),controller=new AbortController(),lease={handle,controller,identity:verified,principalId:p.principalId,role:p.role,revision:revisions.get(p.principalId)??0,sessionId,preset};
-  leases.set(handle,lease);sessions.set(sessionId,lease);return Object.freeze({handle,signal:controller.signal});
+  leases.set(handle,lease);sessions.set(sessionId,lease);sessionOwners.set(sessionId,p.principalId);return Object.freeze({handle,signal:controller.signal});
  }
  function admin(actor){const who=identity(actor);if(who.principalId!==ownerId)throw Error('Owner operation required');return who;}
  function view(id){const row=state.accounts[id];return Object.freeze({...policy(id),provider:row?.provider,account:mask(row?.subject)});}
@@ -82,6 +82,9 @@ export function createIdentityAccess({stateFile,owner,ownerFile,presets:names,le
   issue,authorize,change,
   // The current lease of a native Session, if it is role-managed (Host-only).
   sessionLease(sessionId){active();return sessions.get(sessionId)?.handle;},
+  // Revocation ends a lease, not the Session's provenance. Keep this local
+  // tombstone for the service lifetime, including fail-closed cleanup calls.
+  managedSession:sessionId=>sessionOwners.has(sessionId),
   show(actor,{target}={}){admin(actor);return view(identity(target).principalId);},
   list(actor){admin(actor);return Object.keys(state.accounts).map(view);},
   audit(actor){admin(actor);return structuredClone(state.audit);},
