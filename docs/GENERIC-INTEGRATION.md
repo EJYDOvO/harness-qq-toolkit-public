@@ -133,7 +133,11 @@ sessionLifecycle:
 
 ## DSH 0.2.2-rc.1
 
-0.2.2 的 Schedule `list()` 改为 Host 范围分页结果，不再按 Session 过滤；Conversation Manager 改读 catalog 的 `target`，否则存在提醒时的轮换延后会静默失效。宿主写入 Schedule 后存储升级为 v2，0.2.1 无法再加载，宿主与本仓库插件需一起切换。隔离验证使用官方签名安装包解包后的运行时、合成模型与 Sender；QQ Bot/SDK 版本和两份补丁未变，补丁重建通过，但打补丁的 QQ Gateway 未在 0.2.2 上联网装配，也没有手机收件证明。
+0.2.2 的 Schedule `list()` 改为 Host 范围分页结果，不再按 Session 过滤；Conversation Manager 改读 catalog 的 `target`，否则存在提醒时的轮换延后会静默失效。宿主写入 Schedule 后存储升级为 v2，0.2.1 无法再加载，宿主与本仓库插件需一起切换。隔离验证使用官方签名安装包解包后的运行时、合成模型与 Sender；QQ Bot/SDK 版本和两份补丁未变，补丁重建通过。
+
+**离线装配**（`node maintenance/offline-gateway.mjs --runtime <宿主> --home <新空目录>`）：portable 流程在新 Home 安装固定版本并按 `patchedDependencies` 打补丁、逐文件核验，然后以 `QQBOT_BASE_URL`/`QQBOT_TOKEN_BASE_URL` 指向本机回环 mock 启动宿主（Gateway 只使用这两个可覆盖的地址），模型指向回环 OpenAI 兼容流。0.2.2-rc.1 上已验证：取 token、`/gateway`、WebSocket IDENTIFY/READY；非白名单私聊不产生 Session 轮次和模型调用；Owner 私聊 → 原生 Session → 模型流 → `session/event` 出站 → 带原 `msg_id` 的被动回复；宿主无未激活条目。这证明补丁 Gateway 的装配与事件链路，**不是**真实 QQ 服务器联网或手机收件验证；账号、凭据均为合成值。
+
+**版本锁定**（`node maintenance/pin-check.mjs --runtime <宿主> --profile <Profile> [--updater <更新缓存>]`，只读）：宿主 DSH 版本须等于 `versions.json`；`dsh-qqbot`/`qqbot-nodejs` 须精确固定（版本范围会让更新绕过按版本绑定的补丁）；`patchedDependencies` 键与补丁文件、已安装补丁后文件须与本仓库一致；存在 `plugin-policy.json` 时 `testedRuntime` 须等于宿主版本。0.2.1-rc.3 与 0.2.2-rc.1 的 Desktop 更新都只在用户确认后下载和安装（`autoDownload`、`autoInstallOnAppQuit` 均关闭），插件管理页也只在用户操作时更新；但服务端可下发强制更新策略，使 Desktop 界面在更新前不可用（进行中的任务继续运行）。本仓库不修改官方文件来关闭它，切换窗口内不确认任何 Desktop 或插件更新。
 
 ## DSH 0.2.1-rc.3
 

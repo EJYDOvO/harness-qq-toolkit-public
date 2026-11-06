@@ -73,6 +73,6 @@ Character 在上述命令追加 --qqtk。备份独立保存 sessions、storages�
 
 已有旧 Windows 布局实例升级维护后端时，保留该实例自己的 `maintenance/features.json`、`plugin-policy.json` 与 `maintenance/browser/` 运行包，只更新代码文件。仓库中的 features.json 是新安装模板（Task Memory/Browser 默认关闭）；用它覆盖已启用 Browser 或 Memory 的实例会在下次 apply 时关闭这些功能。切换前对比新旧开关，确认一致后再重新 Stage。
 
-回滚保留**最新** Memory、Session、Schedule、路由和去重账本，只切回兼容的旧代码/包/补丁/私有配置。DSH 0.2.2 写入 Schedule 后存储为 v2，0.2.1 宿主无法加载；此后不能把宿主单独降回 0.2.1，只能在维护者明确决定时整体恢复切换前快照（会丢失窗口内新增数据）。不用旧数据快照覆盖新增记录。官方 DSH 自身的安装/降级由官方渠道管理，本仓库不修改 ASAR 或内置 Bundle。
+回滚保留**最新** Memory、Session、Schedule、路由和去重账本，只切回兼容的旧代码/包/补丁/私有配置。DSH 0.2.2 写入 Schedule 后存储为 v2，0.2.1 宿主无法加载；此后不能把宿主单独降回 0.2.1，只能在维护者明确决定时整体恢复切换前快照（会丢失窗口内新增数据）。能否只换回宿主不凭 Schedule 文件哈希判断：Character 的 `scripts/rollback-gate.mjs` 在快照时记录、回滚前只读比对存储单元版本、Session 格式、SQLite Schema 与逻辑内容（含 WAL）、Outbox 和任务账本，给出允许 / 需旧宿主隔离加载验证 / 拒绝三种结论。切换前用 `maintenance/pin-check.mjs` 确认宿主与 QQ 补丁版本锁定。不用旧数据快照覆盖新增记录。官方 DSH 自身的安装/降级由官方渠道管理，本仓库不修改 ASAR 或内置 Bundle。
 
 SDK/Interaction 跨仓库审计需要 Character 源码：在非默认相邻目录时设置 DSH_CHARACTER_PROJECT 为其绝对路径。仅为测试依赖，不是 QQTK 运行依赖；CI 固定检出兼容 Character 提交，更新接口时同步审查该固定点。
