@@ -8,4 +8,4 @@ manage.ps1 / ops.cjs / stage.cjs / remote.cjs 等仍按旧 Windows root/data/pro
 
 Stage 检查固定版本、配置与补丁，切换需要 idle/锁/备份/单活/健康门禁。不得把旧布局脚本指向现有生产目录做迁移验证。源码清理本轮没有部署或触碰运行实例。
 
-独立源码回归使用 npm test（自动临时代码夹具）、npm run test:audit 与 npm run test:patch。checkpoint.ps1 只提交用户已审阅暂存的本仓库内容，不创建嵌套 Git 仓库或自动 stage 数据。
+独立源码回归使用 npm test（自动临时代码夹具）、npm run test:audit 与 npm run test:patch。offline-gateway.mjs 在新的空 Home 中按 portable 流程安装补丁后的 QQ 包，以本机回环 mock 代替 QQ 接口与模型，验证宿主上的 Gateway 装配和 Session 事件链路（不连接 QQ 服务器，不等于手机送达）。pin-check.mjs 只读核对宿主版本、QQ 包精确版本、补丁键/文件与已安装补丁文件，切换前对目标 Profile 运行。checkpoint.ps1 只提交用户已审阅暂存的本仓库内容，不创建嵌套 Git 仓库或自动 stage 数据。

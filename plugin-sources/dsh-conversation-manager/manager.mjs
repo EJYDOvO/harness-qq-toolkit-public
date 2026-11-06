@@ -392,8 +392,10 @@ export class ConversationManager {
         if(!old&&await this.unfinishedPersisted(previous)){state.blocker='unfinished_persisted_work';this.modelResolver.prefs.commitLifecycle(key,state);return null;}
         // Adapters keep existing reminders on their original roots. Character
         // provides a stable-conversation bridge; other integrations defer safely.
+        // DSH 0.2.2 Schedule list() is Host-wide and paged; read the catalog and
+        // count every not-ended task whose fixed destination is the old root.
         const schedules=this.ctx.get('schedule');
-        const reminders=schedules?await schedules.list({sessionId:previous}):[];
+        const reminders=schedules?(await schedules.catalog()).filter(task=>task.status!=='ended'&&task.target?.kind==='session'&&task.target.sessionId===previous):[];
         if(reminders.length&&this.preserveScheduledSession?.(previous)!==true){state.blocker='existing_schedule';this.modelResolver.prefs.commitLifecycle(key,state);return null;}
         if(protectedOld())return null;
         const composed=await this.composePreset(presets?(presets.includes(old?.agentPreset)?old.agentPreset:presets[0]):old?.agentPreset??this.getEffectivePresetByKey(key)),route=this.modelResolver.getEffectiveRoute(key),id=SessionId(randomUUID());

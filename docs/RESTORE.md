@@ -1,10 +1,10 @@
 # 干净安装、数据迁移与回滚
 
-源码和用户数据分开迁移。以下命令只用于新目录；不要对运行中的原目录运行 prepare/restore。默认单 Owner 私聊，不开启群聊。Windows / DSH 0.2.1-rc.3 / Node 24 是原生验证目标；Mac/Linux 的 GUI、原生权限、旧 Session 路径迁移尚未验收。
+源码和用户数据分开迁移。以下命令只用于新目录；不要对运行中的原目录运行 prepare/restore。默认单 Owner 私聊，不开启群聊。Windows / DSH 0.2.2-rc.1 / Node 24 是原生验证目标；Mac/Linux 的 GUI、原生权限、旧 Session 路径迁移尚未验收。
 
 ## 1. 安装公开依赖
 
-自行安装官方 DSH rc.3 与 Node 24。两个源码目录独立：
+自行安装官方 DSH 0.2.2-rc.1 与 Node 24。两个源码目录独立：
 
 ```sh
 git clone https://github.com/EJYDOvO/harness-qq-toolkit-public.git
@@ -20,7 +20,7 @@ npm test
 npm run test:audit
 ```
 
-根 package-lock.json 固定构建依赖及 QQ/SDK 下载完整性。pnpm 11.7.0 来自本地锁定依赖，不依赖开发机全局 pnpm 或旧 Profile。schemastery 3.18.5 仅用于测试依赖；DSH SDK 由 rc.3 发行包提供，不另装第二套 Core。
+根 package-lock.json 固定构建依赖及 QQ/SDK 下载完整性。pnpm 11.7.0 来自本地锁定依赖，不依赖开发机全局 pnpm 或旧 Profile。schemastery 3.18.5 仅用于测试依赖；DSH SDK 由 0.2.2-rc.1 发行包提供，不另装第二套 Core。
 
 ## 2. 创建私有配置
 
@@ -73,6 +73,29 @@ Character 在上述命令追加 --qqtk。备份独立保存 sessions、storages�
 
 已有旧 Windows 布局实例升级维护后端时，保留该实例自己的 `maintenance/features.json`、`plugin-policy.json` 与 `maintenance/browser/` 运行包，只更新代码文件。仓库中的 features.json 是新安装模板（Task Memory/Browser 默认关闭）；用它覆盖已启用 Browser 或 Memory 的实例会在下次 apply 时关闭这些功能。切换前对比新旧开关，确认一致后再重新 Stage。
 
-回滚保留**最新** Memory、Session、Schedule、路由和去重账本，只切回兼容的旧代码/包/补丁/私有配置。不用旧数据快照覆盖新增记录。官方 DSH 自身的安装/降级由官方渠道管理，本仓库不修改 ASAR 或内置 Bundle。
+回滚保留**最新** Memory、Session、Schedule、路由和去重账本，只切回兼容的旧代码/包/补丁/私有配置。DSH 0.2.2 写入 Schedule 后存储为 v2，0.2.1 宿主无法加载；此后不能把宿主单独降回 0.2.1，只能在维护者明确决定时整体恢复切换前快照（会丢失窗口内新增数据）。能否只换回宿主不凭 Schedule 文件哈希判断：Character 的 `scripts/rollback-gate.mjs` 在快照时记录、回滚前只读比对存储单元版本、Session 格式、SQLite Schema 与逻辑内容（含 WAL）、Outbox 和任务账本，给出允许 / 需旧宿主隔离加载验证 / 拒绝三种结论。切换前检查隔离新版候选 Profile，切换后检查实际 Profile，具体命令见下文；旧实例不应通过新版 testedRuntime 检查。不用旧数据快照覆盖新增记录。官方 DSH 自身的安装/降级由官方渠道管理，本仓库不修改 ASAR 或内置 Bundle。
 
 SDK/Interaction 跨仓库审计需要 Character 源码：在非默认相邻目录时设置 DSH_CHARACTER_PROJECT 为其绝对路径。仅为测试依赖，不是 QQTK 运行依赖；CI 固定检出兼容 Character 提交，更新接口时同步审查该固定点。
+
+
+### 部署门禁补充：候选与实例分离
+
+切换前只检查隔离候选：
+
+```sh
+node <QQTK>/maintenance/pin-check.mjs --phase pre-switch --runtime <TARGET_HOST> --profile <CANDIDATE_PROFILE> --instance-profile <INSTANCE_PROFILE>
+```
+
+旧实例保留旧 testedRuntime；候选的 plugin-policy.json 须经维护者审阅，明确 schemaVersion、profile、testedRuntime、精确 targets、qqPatch 和 localPackages。不要为通过校验而修改旧实例，也不要用模板覆盖实例策略。
+
+另行批准切换后，检查实际实例：
+
+```sh
+node <QQTK>/maintenance/pin-check.mjs --phase post-switch --runtime <TARGET_HOST> --profile <INSTANCE_PROFILE>
+```
+
+两阶段均严格检查目标版本、补丁 pin/文件哈希和已安装文件；工具没有安装、修改策略或切换能力。
+
+回滚门禁使用格式版本 2 清单。停机维护锁下 record，check 使用完全相同的绝对 Home、全部 --sqlite 与 --file 参数；不得省略或替换监控路径。新增、修改、删除 Session/记录域/记录/状态文件均计入，Schedule 版本及 SQLite Schema 前进、损坏、缺失或无法确定状态均拒绝。指定 --file 是 JSON 状态文件。旧清单须重新从一致快照生成，不能编辑为通过。SQLite 主文件和 WAL 按一致快照保管；WAL 内容变化也需回放验证。
+
+allowed（退出 0）只表示监控状态完全未变；needs_replay（2）须复制当前数据到隔离旧 Host 验证；refused（3）不得只换宿主。任何可能丢失新增数据的整体快照恢复均须维护者单独明确决定，默认向前修复。

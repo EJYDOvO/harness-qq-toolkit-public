@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "profile": "desktop",
-  "testedRuntime": "0.2.1-rc.3",
+  "testedRuntime": "0.2.2-rc.1",
   "targets": {
     "@tencent-connect/dsh-qqbot": "0.5.2",
     "@tencent-connect/qqbot-nodejs": "1.0.5"

@@ -2,7 +2,7 @@
 
 独立、平台无关的 Host 插件。维护 Conversation → 原生 Session 的唯一当前路由、模型/Preset 偏好、并发、恢复和可选空白轮换。QQ、Identity、Memory、Remote Ops 均不是本插件依赖。
 
-当前源码 `0.1.0-test.4`（I1：可选授权 Preset，未部署）；test.3 为 2026-11-02 授权部署的 Iteration 08 版本，保留恢复异常分类和关闭规则，补充 Context 活性门禁及可选脱敏观察。test.2 为历史部署。验证基线为 DSH `0.2.1-rc.3`；复用原生 Agent/Session/Persistence/Preset/Schedule，不实现第二套运行时、调度器或数据库。
+当前源码 `0.1.0-test.5`（DSH 0.2.2-rc.1：Schedule 阻断改读 catalog `target`，未部署）；test.4 为 I1 可选授权 Preset；test.3 为 2026-11-02 授权部署的 Iteration 08 版本，保留恢复异常分类和关闭规则，补充 Context 活性门禁及可选脱敏观察。test.2 为历史部署。验证基线为 DSH `0.2.2-rc.1`（隔离）；复用原生 Agent/Session/Persistence/Preset/Schedule，不实现第二套运行时、调度器或数据库。
 
 ## 安装与装配
 
