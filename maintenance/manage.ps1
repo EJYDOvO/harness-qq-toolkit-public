@@ -137,7 +137,8 @@ try {
         $env:QQBOT_TEST_PROFILE = $taskStage
         Invoke-TaskNode @('--test',(Join-Path $PSScriptRoot 'hitl.test.mjs'),(Join-Path $PSScriptRoot 'qq-boundaries.test.mjs'),(Join-Path $PSScriptRoot 'maintenance.test.cjs'),(Join-Path $PSScriptRoot 'remote-ops.test.mjs'))
         $taskCompositionErrors = Join-Path $taskRoot 'tmp\inspect\validated-composition.err.log'
-        & (Join-Path $taskRoot 'resources\runtime\cli\bin\dsh.cmd') --profile qqbot-validation --dump-config 1> (Join-Path $taskRoot 'tmp\inspect\validated-composition.yml') 2> $taskCompositionErrors
+        # Compose with the selected Host runtime (host-runtime.json), not the install root's original one.
+        & (Join-Path $taskRuntime 'resources\runtime\cli\bin\dsh.cmd') --profile qqbot-validation --dump-config 1> (Join-Path $taskRoot 'tmp\inspect\validated-composition.yml') 2> $taskCompositionErrors
         if ($LASTEXITCODE -ne 0) { throw 'Candidate composition failed.' }
         if ((Get-Content -LiteralPath $taskCompositionErrors -Raw) -match 'skipping profile bundle|incompatible with dsh|patch: entry .+ not found') { throw 'Candidate silently skipped a plugin or override; inspect composition diagnostics.' }
         Invoke-TaskNode @((Join-Path $PSScriptRoot 'stage.cjs'),'seal')

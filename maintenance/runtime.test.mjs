@@ -7,3 +7,11 @@ test('runtime selection keeps data separate, honors explicit override and refuse
  fs.writeFileSync(state,'invalid');assert.throws(()=>resolveRuntime(root,{}));assert.equal(resolveRuntime(root,{DSH_RUNTIME_ROOT:other}).runtimeRoot,other);
  assert.throws(()=>resolveRuntime(root,{DSH_RUNTIME_ROOT:'relative'}),/absolute/);
 });
+test('maintenance composes and starts the candidate with the selected runtime, never the install root Host',()=>{
+ // After a runtime move (host-runtime.json) the install root may still hold an
+ // older Host, e.g. 0.2.1, which cannot compose a 0.2.2-only Character.
+ const manage=fs.readFileSync(new URL('./manage.ps1',import.meta.url),'utf8'),cli=String.raw`'resources\runtime\cli\bin\dsh.cmd'`;
+ assert(!manage.includes('(Join-Path $taskRoot '+cli),'composition must not use the install root CLI');
+ assert(manage.includes('(Join-Path $taskRuntime '+cli+') --profile qqbot-validation --dump-config'));
+ assert(manage.includes("$taskExe = Join-Path $taskRuntime 'DeepSeek Harness.exe'"));
+});
