@@ -26,3 +26,11 @@ test('DeployValidated is unattended and waits for Gateway readiness of the new H
  const start=manage.indexOf('function Start-TaskHost'),stamp=manage.indexOf('$taskStartedAt =',start),launch=manage.indexOf('Start-Process -FilePath $taskExe',start);
  assert(start>0&&stamp>start&&stamp<launch,'the start time is taken before launching');
 });
+test('maintenance scripts decode Node JSON output as UTF-8 before parsing it',()=>{
+ // A Chinese Preset name in `ops.cjs health` made Windows PowerShell 5.1 (GBK console)
+ // fail ConvertFrom-Json; the readiness loop swallowed it and rolled back a ready Host.
+ for(const name of ['manage.ps1','watchdog.ps1']){
+  const s=fs.readFileSync(new URL('./'+name,import.meta.url),'utf8'),set=s.indexOf('[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false'),parse=s.indexOf('ConvertFrom-Json');
+  assert(set>0&&parse>set,name+' sets UTF-8 before its first JSON parse');
+ }
+});

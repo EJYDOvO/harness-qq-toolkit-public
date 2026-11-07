@@ -1,5 +1,8 @@
 param([switch]$Once)
 $ErrorActionPreference='Stop'
+# Node prints UTF-8; Windows PowerShell 5.1 would decode it with the console code page (GBK on
+# Chinese Windows) and corrupt JSON containing non-ASCII text, e.g. a Chinese Preset name.
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
 $taskRoot=Split-Path -Parent $PSScriptRoot
 $taskState=Join-Path $taskRoot 'data\maintenance'
 $taskNode=Join-Path $taskRoot 'resources/runtime/primary-runtime/dependencies/node/bin/node.exe'
