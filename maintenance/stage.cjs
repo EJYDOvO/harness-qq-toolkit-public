@@ -9,8 +9,11 @@ const state = path.join(root,'data/maintenance/candidate.json');
 const selectedRuntime=()=>require('./runtime.cjs').resolveRuntime(root);
 const files = ['package.json','pnpm-lock.yaml','pnpm-workspace.yaml','cordis.patch.yml'];
 const hash = file => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
-const hashes = dir => Object.fromEntries(files.map(f=>[f,hash(path.join(dir,f))]));
-const helperHashes=()=>Object.fromEntries(['ops.cjs','remote.cjs','local-client.cjs','manage.ps1','backup-integrity.cjs','stage.cjs','runtime.cjs','read-asar.cjs'].map(f=>[f,hash(path.join(__dirname,f))]));
+// A Character Profile also records its artifact pins; ops.cjs verify checks them.
+const pinsFile = 'character-artifacts.json';
+const profileFiles = () => [...files,...(fs.existsSync(path.join(profile,pinsFile))?[pinsFile]:[])];
+const hashes = dir => Object.fromEntries(profileFiles().map(f=>[f,hash(path.join(dir,f))]));
+const helperHashes=()=>Object.fromEntries(['ops.cjs','remote.cjs','local-client.cjs','manage.ps1','backup-integrity.cjs','stage.cjs','candidate.cjs','runtime.cjs','read-asar.cjs'].map(f=>[f,hash(path.join(__dirname,f))]));
 const cmd = process.argv[2];
 if (cmd === 'seal') {
   const record=JSON.parse(fs.readFileSync(state,'utf8'));
@@ -61,8 +64,9 @@ if (cmd === 'seal') {
   fs.copyFileSync(path.join(__dirname,'patches/qqbot-nodejs@1.0.5.patch'),path.join(stage,'patches/qqbot-nodejs@1.0.5.patch'));
   const manifest=JSON.parse(fs.readFileSync(path.join(stage,'package.json'),'utf8'));
   manifest.dependencies={...manifest.dependencies,...policy.targets,...Object.fromEntries(Object.entries(policy.localPackages||{}).map(([n,e])=>[n,e.source]))};
-  manifest.dsh.profile.bundles=[...new Set([...manifest.dsh.profile.bundles,...Object.keys(policy.localPackages||{})])];
+  manifest.dsh.profile.bundles=require('./candidate.cjs').candidateBundles(manifest.dsh.profile.bundles,policy.localPackages);
   atomic(path.join(stage,'package.json'),JSON.stringify(manifest,null,2)+'\n');
+  if(fs.existsSync(path.join(profile,pinsFile)))atomic(path.join(stage,pinsFile),JSON.stringify(require('./candidate.cjs').candidateArtifacts(JSON.parse(fs.readFileSync(path.join(profile,pinsFile),'utf8')),policy.localPackages),null,2)+'\n');
   const settings=yaml.load(fs.readFileSync(path.join(stage,'pnpm-workspace.yaml'),'utf8'));
   settings.autoInstallPeers=false;
   settings.patchedDependencies={...settings.patchedDependencies, '@tencent-connect/dsh-qqbot@0.5.2':policy.qqPatch};

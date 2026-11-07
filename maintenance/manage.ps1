@@ -163,6 +163,8 @@ try {
             foreach ($taskFile in @('package.json','pnpm-lock.yaml','pnpm-workspace.yaml','cordis.patch.yml')) {
                 Copy-Item -LiteralPath (Join-Path $taskStage $taskFile) -Destination (Join-Path $taskProfile $taskFile) -Force
             }
+            # A Character Profile's artifact pins were sealed with the candidate and must move with it.
+            if (Test-Path -LiteralPath (Join-Path $taskStage 'character-artifacts.json')) { Copy-Item -LiteralPath (Join-Path $taskStage 'character-artifacts.json') -Destination (Join-Path $taskProfile 'character-artifacts.json') -Force }
             Copy-Item -LiteralPath (Join-Path $taskStage 'patches') -Destination $taskProfile -Recurse -Force
             & $taskNode $taskPnpm --dir $taskProfile --store-dir $taskStore install --frozen-lockfile --ignore-scripts --offline
             if ($LASTEXITCODE -ne 0) { throw 'Frozen candidate install failed.' }
