@@ -88,6 +88,8 @@ function Start-TaskHost {
     Remove-Item Env:\ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue
     $taskLogStamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
     $script:taskStartLog = Join-Path $taskRoot "tmp\desktop-$taskLogStamp.stdout.log"
+    # Taken before launching: a fast Gateway may report ready within the first poll. The old Host is stopped.
+    $taskStartedAt = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
     Start-Process -FilePath $taskExe -WorkingDirectory $taskRoot -WindowStyle Hidden -RedirectStandardOutput $script:taskStartLog -RedirectStandardError (Join-Path $taskRoot "tmp\desktop-$taskLogStamp.stderr.log") | Out-Null
     $taskDeadline = (Get-Date).AddSeconds(100)
     do {
@@ -95,7 +97,15 @@ function Start-TaskHost {
         try {
             $taskStatus = Get-TaskStatus
             $taskLog = Get-Content -LiteralPath $script:taskStartLog -Raw -ErrorAction SilentlyContinue
-            if ($taskStatus.reachable -and $taskLog -match '\[im-qqbot\] Bot ready!') { return (Get-TaskStatus -Health) }
+            # Gateway readiness recorded by Remote Ops after this start, by a process of this Host.
+            $taskReady = $false
+            $taskHealthFile = Join-Path $taskState 'qq-health.json'
+            if (Test-Path -LiteralPath $taskHealthFile) {
+                $taskHealth = Get-Content -LiteralPath $taskHealthFile -Raw | ConvertFrom-Json
+                $taskPids = @(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $taskExe } | ForEach-Object { $_.ProcessId })
+                $taskReady = $taskHealth.connected -eq $true -and $taskHealth.detail -eq 'ready' -and [int64]$taskHealth.at -ge $taskStartedAt -and ($taskPids -contains [int]$taskHealth.pid)
+            }
+            if ($taskStatus.reachable -and ($taskReady -or $taskLog -match '\[im-qqbot\] Bot ready!')) { return (Get-TaskStatus -Health) }
         } catch { }
     } while ((Get-Date) -lt $taskDeadline)
     throw 'Harness/QQ did not become ready within 100 seconds.'
@@ -166,7 +176,9 @@ try {
             # A Character Profile's artifact pins were sealed with the candidate and must move with it.
             if (Test-Path -LiteralPath (Join-Path $taskStage 'character-artifacts.json')) { Copy-Item -LiteralPath (Join-Path $taskStage 'character-artifacts.json') -Destination (Join-Path $taskProfile 'character-artifacts.json') -Force }
             Copy-Item -LiteralPath (Join-Path $taskStage 'patches') -Destination $taskProfile -Recurse -Force
-            & $taskNode $taskPnpm --dir $taskProfile --store-dir $taskStore install --frozen-lockfile --ignore-scripts --offline
+            # The live modules directory may come from a Profile installed elsewhere and renamed; pnpm then
+            # rebuilds it, which needs confirmation on a TTY. Stage filled the offline store.
+            & $taskNode $taskPnpm --dir $taskProfile --store-dir $taskStore install --frozen-lockfile --ignore-scripts --offline --config.confirm-modules-purge=false
             if ($LASTEXITCODE -ne 0) { throw 'Frozen candidate install failed.' }
             Invoke-TaskNode @($taskOps,'verify')
         } elseif ($Action -eq 'Restore') {

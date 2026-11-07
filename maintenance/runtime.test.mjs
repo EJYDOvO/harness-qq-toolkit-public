@@ -15,3 +15,14 @@ test('maintenance composes and starts the candidate with the selected runtime, n
  assert(manage.includes('(Join-Path $taskRuntime '+cli+') --profile qqbot-validation --dump-config'));
  assert(manage.includes("$taskExe = Join-Path $taskRuntime 'DeepSeek Harness.exe'"));
 });
+test('DeployValidated is unattended and waits for Gateway readiness of the new Host process',()=>{
+ const manage=fs.readFileSync(new URL('./manage.ps1',import.meta.url),'utf8');
+ // A renamed Profile's modules directory must be rebuilt without a TTY prompt.
+ assert(manage.includes('install --frozen-lockfile --ignore-scripts --offline --config.confirm-modules-purge=false'));
+ // DSH 0.2.2 prints no QQ ready line; Remote Ops records readiness with the Host pid.
+ assert(manage.includes("$taskHealthFile = Join-Path $taskState 'qq-health.json'"));
+ assert(manage.includes("$taskHealth.detail -eq 'ready'")&&manage.includes('[int64]$taskHealth.at -ge $taskStartedAt'),'a health record from before this start is stale');
+ assert(manage.includes('($taskPids -contains [int]$taskHealth.pid)'),'the record must come from a process of the selected Host');
+ const start=manage.indexOf('function Start-TaskHost'),stamp=manage.indexOf('$taskStartedAt =',start),launch=manage.indexOf('Start-Process -FilePath $taskExe',start);
+ assert(start>0&&stamp>start&&stamp<launch,'the start time is taken before launching');
+});
