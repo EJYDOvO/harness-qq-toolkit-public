@@ -19,7 +19,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: EJYDOvO/character-agent-v1
-          ref: 82d7bbfe19ade822416837c6aa3c28da98da1937
+          ref: 1942b4bace1dbe659d62fe790e97735f15342a3c # Character main after #19/#20; audit SDK compatibility against current code
           path: reference/character
       - run: npm run test:audit
         env:
