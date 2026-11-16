@@ -9,15 +9,18 @@ function install(){
  const link=path.join(data,'character-current');fs.symlinkSync(dirs.alpha,link,'junction');
  const request=path.join(data,'maintenance/character-switch.json'),result=path.join(data,'maintenance/character-switch-result.json');fs.mkdirSync(path.dirname(request),{recursive:true});
  const ask=(over={})=>write(request,{target:'beta',previous:'alpha',requestedAt:Date.now(),nonce:'n1',...over});
+ const inprogress=path.join(data,'maintenance/character-switch.inprogress.json');
+ const begin=(over)=>{ask(over);const r=spawnSync(process.execPath,[script,'pending',root],{encoding:'utf8'});assert.equal(r.status,0,r.stderr);};
  const readResult=()=>JSON.parse(fs.readFileSync(result,'utf8'));
- return {root,data,dirs,link,request,result,ask,readResult,cleanup:()=>fs.rmSync(root,{recursive:true,force:true})};
+ return {root,data,dirs,link,request,result,inprogress,ask,begin,readResult,cleanup:()=>fs.rmSync(root,{recursive:true,force:true})};
 }
 const run=(args)=>{const r=spawnSync(process.execPath,[script,...args],{encoding:'utf8'});return {code:r.status,json:r.stdout.trim()?JSON.parse(r.stdout.trim().split('\n').pop()):null,stderr:r.stderr};};
 const marker=(dir)=>fs.readFileSync(path.join(dir,'marker.txt'),'utf8');
 
 test('apply and revert repoint the junction without touching either character directory',()=>{
  const i=install();try{
-  i.ask();
+  i.begin();
+  assert.equal(run(['check',i.root]).code,0);
   assert.equal(run(['apply',i.root]).code,0);assert.equal(marker(i.link),'beta');
   assert.equal(run(['revert',i.root]).code,0);assert.equal(marker(i.link),'alpha');
   for(const id of ['alpha','beta']){assert.equal(marker(i.dirs[id]),id);assert(fs.existsSync(path.join(i.dirs[id],'binding.json')));}
@@ -25,8 +28,8 @@ test('apply and revert repoint the junction without touching either character di
 });
 test('apply refuses when the link does not point at the previous character',()=>{
  const i=install();try{
-  i.ask({previous:'alpha',target:'beta'});fs.unlinkSync(i.link);fs.symlinkSync(i.dirs.gamma,i.link,'junction');
-  const r=run(['apply',i.root]);assert.notEqual(r.code,0);assert.equal(marker(i.link),'gamma');
+  i.begin({previous:'alpha',target:'beta'});fs.unlinkSync(i.link);fs.symlinkSync(i.dirs.gamma,i.link,'junction');
+  for(const step of ['check','apply','revert']){const r=run([step,i.root]);assert.notEqual(r.code,0,step);assert.equal(marker(i.link),'gamma');}
  }finally{i.cleanup();}
 });
 test('untrusted character directories are refused',()=>{
@@ -60,7 +63,8 @@ test('a stale request expires without switching (review focus 4)',()=>{
 test('pending reports a valid request, an absent one and an invalid one',()=>{
  const i=install();try{
   assert.equal(run(['pending',i.root]).code,3);
-  i.ask();const ok=run(['pending',i.root]);assert.equal(ok.code,0);assert.equal(ok.json.target,'beta');assert(fs.existsSync(i.request));
+  i.ask();const ok=run(['pending',i.root]);assert.equal(ok.code,0);assert.equal(ok.json.target,'beta');assert(!fs.existsSync(i.request)&&fs.existsSync(i.inprogress),'the request becomes the in-progress snapshot');
+  assert.equal(run(['pending',i.root]).code,3);
   write(i.request,{target:'current',previous:'alpha',requestedAt:Date.now(),nonce:'n'});
   assert.equal(run(['pending',i.root]).code,4);assert.equal(i.readResult().reason,'invalid');assert(!fs.existsSync(i.request));
   write(i.request,'{not json');assert.equal(run(['pending',i.root]).code,4);assert.equal(i.readResult().reason,'invalid');
@@ -77,7 +81,7 @@ test('health check accepts only a fresh compiled persona of the target from a st
 });
 test('verify reads runtime-health.json through the junction',()=>{
  const i=install();try{
-  i.ask();run(['apply',i.root]);const now=Date.now();
+  i.begin();run(['apply',i.root]);const now=Date.now();
   assert.notEqual(run(['verify',i.root,String(now),'5']).code,0);
   write(path.join(i.link,'runtime-health.json'),{pid:5,characterId:'beta',personaSource:'neutral',compiledRevision:'r',at:now+1});
   assert.notEqual(run(['verify',i.root,String(now),'4,5']).code,0);
@@ -87,11 +91,46 @@ test('verify reads runtime-health.json through the junction',()=>{
 });
 test('finish writes the result atomically and removes the request',()=>{
  const i=install();try{
-  i.ask();assert.equal(run(['finish',i.root,'ok']).code,0);
-  assert.deepEqual([i.readResult().ok,i.readResult().target,i.readResult().nonce],[true,'beta','n1']);assert(!fs.existsSync(i.request));
-  i.ask();run(['finish',i.root,'fail','host did not start','true']);
+  i.begin();assert.equal(run(['finish',i.root,'ok']).code,0);
+  assert.deepEqual([i.readResult().ok,i.readResult().target,i.readResult().nonce],[true,'beta','n1']);assert(!fs.existsSync(i.inprogress));
+  i.begin();run(['finish',i.root,'fail','host did not start','true']);
   assert.deepEqual([i.readResult().ok,i.readResult().reason,i.readResult().restored],[false,'host did not start',true]);
   assert(!fs.readdirSync(path.dirname(i.request)).some(n=>n.endsWith('.tmp')));
+ }finally{i.cleanup();}
+});
+test('a switch that pending accepted never expires, and a newer request cannot hijack it',()=>{
+ const i=install();try{
+  i.begin();
+  // Time passes (idle waits, Host start) and the restarted Host files a new request for another character.
+  const snapshot=JSON.parse(fs.readFileSync(i.inprogress,'utf8'));write(i.inprogress,{...snapshot,requestedAt:Date.now()-60*60*1000});
+  i.ask({target:'gamma',previous:'beta',nonce:'n2'});
+  assert.equal(run(['check',i.root]).code,0);assert.equal(run(['apply',i.root]).code,0);assert.equal(marker(i.link),'beta');
+  const now=Date.now();write(path.join(i.link,'runtime-health.json'),{pid:5,characterId:'beta',personaSource:'compiled',compiledRevision:'r',at:now+1});
+  assert.equal(run(['verify',i.root,String(now),'5']).code,0);
+  assert.equal(run(['revert',i.root]).code,0);assert.equal(marker(i.link),'alpha');
+  assert.equal(run(['finish',i.root,'fail','x','true']).code,0);
+  assert.deepEqual([i.readResult().target,i.readResult().nonce],['beta','n1']);
+  assert.equal(JSON.parse(fs.readFileSync(i.request,'utf8')).nonce,'n2','the newer request is left for the next cycle');assert(!fs.existsSync(i.inprogress));
+ }finally{i.cleanup();}
+});
+test('check refuses bad switches and recognises one that is already applied',()=>{
+ const i=install();try{
+  i.begin();assert.equal(run(['check',i.root]).code,0);
+  run(['apply',i.root]);assert.equal(run(['check',i.root]).code,5);
+  write(path.join(i.dirs.beta,'binding.json'),{characterId:'other'});assert.notEqual(run(['check',i.root]).code,0);
+ }finally{i.cleanup();}
+});
+test('finish removes the snapshot and fails loudly when the result cannot be written',()=>{
+ const i=install();try{
+  i.begin();fs.mkdirSync(i.result);
+  const r=run(['finish',i.root,'ok']);assert.notEqual(r.code,0);assert(!fs.existsSync(i.inprogress),'a finished switch is never replayed');
+  assert.equal(run(['pending',i.root]).code,3);
+ }finally{i.cleanup();}
+});
+test('relative registry directories are refused',()=>{
+ const i=install();try{
+  const file=path.join(i.data,'characters/registry.json'),reg=JSON.parse(fs.readFileSync(file,'utf8'));reg.characters.find(c=>c.id==='beta').dir='characters/beta';write(file,reg);
+  assert.throws(()=>sw.trustedDir(i.root,'beta'),/absolute/);
  }finally{i.cleanup();}
 });
 test('repoint never deletes recursively',()=>{

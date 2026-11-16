@@ -42,14 +42,15 @@ test('SwitchCharacter stops, repoints, restarts and verifies, and falls back to 
  assert(manage.includes("elseif ($Action -eq 'SwitchCharacter')"));
  const slice=(name)=>{const from=manage.indexOf('function '+name);assert(from>=0,name+' is a named function');const next=manage.indexOf('\nfunction ',from+10);return manage.slice(from,next<0?manage.length:next);};
  const flow=slice('Invoke-CharacterSwitch'),at=(text,from=0)=>{const i=flow.indexOf(text,from);assert(i>=0,text+' is in the switch flow');return i;};
- const pending=at("'pending'"),idle=at('Wait-TaskIdle',pending),stop=at('Stop-TaskHost',idle),apply=at("'apply'",stop),stamp=at('$taskStartedAt =',apply),launch=at('Start-TaskHost',stamp),verify=at('Wait-TaskCharacterServed',launch),ok=at("'ok'",verify);
- assert(pending<idle&&idle<stop&&stop<apply&&apply<stamp&&stamp<launch&&launch<verify&&verify<ok);
+ const pending=at("'pending'"),check=at("'check'",pending),idle=at('Wait-TaskIdle',check),stop=at('Stop-TaskHost',idle),apply=at("'apply'",stop),stamp=at('$taskStartedAt =',apply),launch=at('Start-TaskHost',stamp),verify=at('Wait-TaskCharacterServed',launch),fail=at('catch',verify),ok=at("'ok'",fail);
+ assert(pending<check&&check<idle&&idle<stop&&stop<apply&&apply<stamp&&stamp<launch&&launch<verify&&verify<fail&&fail<ok,'check runs before the Host is stopped; a failed finish ok never rolls back');
  assert(slice('Wait-TaskCharacterServed').includes("'verify'"));
  // Failure: restore, then record what happened and whether the previous character is back.
- const fail=at('catch',ok),restore=at('Restore-TaskCharacter',fail),finish=at("'fail'",restore);assert(restore<finish);
+ const restore=at('Restore-TaskCharacter $taskLinked',fail),finish=at("'fail'",restore);assert(restore<finish&&finish<ok);
  // Restore stops only this attempt's Host, then reverts the link, then starts the previous character.
  const undo=slice('Restore-TaskCharacter'),stopNew=undo.indexOf('Stop-Process'),revert=undo.indexOf("'revert'"),restart=undo.indexOf('Start-TaskHost');
  assert(stopNew>=0&&stopNew<revert&&revert<restart,'revert comes before the restart');
+ assert(undo.includes('$Linked -and'),'revert only when this attempt moved the link');
  assert(flow.includes('Format-SwitchReason')&&slice('Format-SwitchReason').includes('\"'),'the failure reason is stripped of double quotes before it becomes a native argument');
  assert(!/Backup-TaskProfile/.test(flow),'a switch makes no Profile backup');
 });

@@ -135,11 +135,11 @@ function Wait-TaskCharacterServed([int64]$StartedAt) {
     } while ((Get-Date) -lt $taskDeadline)
     throw "New character was not served by the restarted Host: $($script:taskSwitchOutput)"
 }
-function Restore-TaskCharacter {
-    # Stop only this attempt's Host, point the link back and start the previous character's Host.
+function Restore-TaskCharacter([bool]$Linked) {
+    # Stop only this attempt's Host; point the link back only if this attempt moved it; start the previous character.
     Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $taskExe } | ForEach-Object { Stop-Process -Id $_.ProcessId -ErrorAction SilentlyContinue }
     Start-Sleep -Seconds 2
-    if ((Invoke-SwitchNode @('revert',$taskRoot)) -ne 0) { throw 'Cannot point the character link back.' }
+    if ($Linked -and (Invoke-SwitchNode @('revert',$taskRoot)) -ne 0) { throw 'Cannot point the character link back.' }
     Start-TaskHost | Out-Null
 }
 function Invoke-CharacterSwitch {
@@ -148,6 +148,19 @@ function Invoke-CharacterSwitch {
         # 3: no request; 4: expired or invalid, and the helper already recorded that result.
         $taskResult.skipped = $true
         return
+    }
+    # Everything that can refuse is decided now, while the Host is still running and untouched.
+    $taskCheck = Invoke-SwitchNode @('check',$taskRoot)
+    if ($taskCheck -eq 5) {
+        # A previous attempt already moved the link; only the result is missing.
+        if ((Invoke-SwitchNode @('finish',$taskRoot,'ok')) -ne 0) { throw 'Character switch result could not be recorded.' }
+        $taskResult.skipped = $true
+        return
+    }
+    if ($taskCheck -ne 0) {
+        $taskReason = Format-SwitchReason "Switch refused before anything changed: $($script:taskSwitchOutput)"
+        Invoke-SwitchNode @('finish',$taskRoot,'fail',$taskReason,'true') | Out-Null
+        throw $taskReason
     }
     $taskLinked = $false
     try {
@@ -158,18 +171,19 @@ function Invoke-CharacterSwitch {
         $taskStartedAt = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
         $taskResult.status = Start-TaskHost
         Wait-TaskCharacterServed $taskStartedAt
-        Invoke-SwitchNode @('finish',$taskRoot,'ok') | Out-Null
-        $script:taskStopped = $false
     } catch {
         $taskReason = Format-SwitchReason $_.Exception.Message
-        # Nothing was stopped or repointed yet: the previous character is still being served.
+        # Nothing was stopped yet: the previous character is still being served.
         $taskRestored = !$script:taskStopped
-        if ($taskLinked -or $script:taskStopped) {
-            try { Restore-TaskCharacter; $taskRestored = $true } catch { $taskRestored = $false; $taskReason = Format-SwitchReason "$taskReason; rollback failed: $($_.Exception.Message)" }
+        if ($script:taskStopped) {
+            try { Restore-TaskCharacter $taskLinked; $taskRestored = $true } catch { $taskRestored = $false; $taskReason = Format-SwitchReason "$taskReason; rollback failed: $($_.Exception.Message)" }
         }
-        Invoke-SwitchNode @('finish',$taskRoot,'fail',$taskReason,"$taskRestored".ToLower()) | Out-Null
+        if ((Invoke-SwitchNode @('finish',$taskRoot,'fail',$taskReason,"$taskRestored".ToLower())) -ne 0) { $taskReason = "$taskReason; result could not be recorded" }
         throw $taskReason
     }
+    # The switch worked. A failed result write must never trigger a rollback.
+    $script:taskStopped = $false
+    if ((Invoke-SwitchNode @('finish',$taskRoot,'ok')) -ne 0) { throw 'Character switched, but its result could not be recorded.' }
 }
 function Restore-TaskFiles([string]$From) {
     Invoke-TaskNode @((Join-Path $PSScriptRoot 'backup-integrity.cjs'),'verify',$From) | Out-Host
