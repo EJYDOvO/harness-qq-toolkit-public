@@ -127,6 +127,21 @@ test('finish removes the snapshot and fails loudly when the result cannot be wri
   assert.equal(run(['pending',i.root]).code,3);
  }finally{i.cleanup();}
 });
+test('a leftover snapshot is reported as interrupted, with or without a new request',()=>{
+ const i=install();try{
+  i.begin();// link still at previous
+  let r=run(['pending',i.root]);assert.equal(r.code,3);
+  assert.deepEqual([i.readResult().ok,i.readResult().reason,i.readResult().restored,i.readResult().target,i.readResult().nonce],[false,'interrupted',true,'beta','n1']);assert(!fs.existsSync(i.inprogress));
+  i.begin();run(['apply',i.root]);// link at target
+  r=run(['pending',i.root]);assert.equal(r.code,3);assert.equal(i.readResult().restored,false);assert.equal(i.readResult().reason,'interrupted');assert(!fs.existsSync(i.inprogress));
+  // Leftover plus a new request: the old nonce is reported, the new request is snapshotted.
+  i.begin();i.ask({target:'gamma',previous:'beta',nonce:'n2'});
+  r=run(['pending',i.root]);assert.equal(r.code,0);assert.equal(r.json.nonce,'n2');
+  assert.deepEqual([i.readResult().reason,i.readResult().nonce],['interrupted','n1']);
+  assert.equal(JSON.parse(fs.readFileSync(i.inprogress,'utf8')).nonce,'n2');assert(!fs.existsSync(i.request));
+  write(i.inprogress,'{garbage');assert.equal(run(['pending',i.root]).code,3);assert.equal(i.readResult().reason,'interrupted');assert(!fs.existsSync(i.inprogress));
+ }finally{i.cleanup();}
+});
 test('relative registry directories are refused',()=>{
  const i=install();try{
   const file=path.join(i.data,'characters/registry.json'),reg=JSON.parse(fs.readFileSync(file,'utf8'));reg.characters.find(c=>c.id==='beta').dir='characters/beta';write(file,reg);

@@ -1,6 +1,7 @@
 // Character switch helper for the maintenance watchdog. manage.ps1 stays thin and asks this file
 // what to do; it only knows the file formats the Character manager writes, never its code.
 //   pending <root>                          0 request accepted and moved to character-switch.inprogress.json (printed) | 3 none | 4 invalid or expired (result written, request removed)
+//                                           A leftover snapshot (its run died; manage.ps1 holds the lock for a whole switch) is first reported as {ok:false, reason:'interrupted', restored} and removed; with no new request the exit is 3.
 //   check <root>                            0 link at previous, ready | 5 link already at target | 1 refused (nothing was changed)
 //   Every step after pending reads only the in-progress snapshot: neither the clock nor a newer request can change a started switch.
 //   apply <root> | revert <root>            repoint data/character-current
@@ -60,8 +61,17 @@ function parseRequest(raw,now=Date.now()){
 const loadSwitch=(root)=>{const parsed=validateRequest(fs.readFileSync(paths(root).inprogress,'utf8'));if(!parsed.request)throw Error(`In-progress switch is ${parsed.error}`);return parsed.request;};
 function writeResult(root,fields){writeJsonAtomic(paths(root).result,{...fields,at:Date.now()});}
 
+// A snapshot found while no switch is running belongs to a dead run: report it so its nonce gets a result.
+function reportInterrupted(root){
+ const {inprogress,link}=paths(root);let raw;try{raw=fs.readFileSync(inprogress,'utf8');}catch(error){if(error.code==='ENOENT')return;throw error;}
+ const {request}=validateRequest(raw);let restored=false;
+ try{restored=!!request&&sameFile(fs.realpathSync(link),trustedDir(root,request.previous));}catch{}
+ writeResult(root,{ok:false,target:request&&request.target,nonce:request&&request.nonce,reason:'interrupted',restored});
+ fs.rmSync(inprogress,{force:true});
+}
 const commands={
  pending(root){
+  reportInterrupted(root);
   const {request,inprogress}=paths(root);let raw;try{raw=fs.readFileSync(request,'utf8');}catch(error){if(error.code==='ENOENT')return {code:EXIT.none};throw error;}
   const parsed=parseRequest(raw);
   if(parsed.request){fs.renameSync(request,inprogress);return {code:0,out:parsed.request};}

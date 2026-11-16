@@ -58,6 +58,7 @@ test('the watchdog runs a requested switch outside the maintenance lock and does
  const watchdog=fs.readFileSync(new URL('./watchdog.ps1',import.meta.url),'utf8'),lines=watchdog.split('\n');
  const index=lines.findIndex(line=>line.includes('-Action SwitchCharacter'));assert(index>0,'the watchdog triggers SwitchCharacter');
  assert(lines[index].includes('character-switch.json'),'only when a request file exists');
+ assert(lines[index].includes('character-switch.inprogress.json'),'a snapshot left by a dead run is reported too');
  assert(!lines[index].includes('-Queue')&&!lines[index].includes('$taskStarts'),'synchronous and not a counted start');
  const lock=watchdog.indexOf('$taskGuard=[IO.File]::Open'),release=watchdog.indexOf('finally { if($taskGuard){$taskGuard.Dispose()} }'),offset=lines.slice(0,index).join('\n').length;
  assert(lock>0&&release>lock&&offset>release,'the call comes after the maintenance lock try/finally');

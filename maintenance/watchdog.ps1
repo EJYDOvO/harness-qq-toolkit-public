@@ -59,8 +59,8 @@ try {
    } catch [IO.IOException] { $taskStatus='maintenance-in-progress';$taskAbsentSince=$null }
    finally { if($taskGuard){$taskGuard.Dispose()} }
    if($taskRestart){& (Join-Path $PSScriptRoot 'manage.ps1') -Action Restart -Queue | Out-Null;$taskStarts+=Get-Date}
-   # A requested character switch runs synchronously and is not a watchdog start; it has its own hourly limit.
-   if(Test-Path -LiteralPath (Join-Path $taskState 'character-switch.json')){& (Join-Path $PSScriptRoot 'manage.ps1') -Action SwitchCharacter | Out-Null}
+   # A requested character switch (or a snapshot left by a dead run, which manage.ps1 reports) runs synchronously and is not a watchdog start; it has its own hourly limit.
+   if((Test-Path -LiteralPath (Join-Path $taskState 'character-switch.json')) -or (Test-Path -LiteralPath (Join-Path $taskState 'character-switch.inprogress.json'))){& (Join-Path $PSScriptRoot 'manage.ps1') -Action SwitchCharacter | Out-Null}
    $taskStarts=@($taskStarts | Where-Object {$_ -gt (Get-Date).AddHours(-1)})
    $taskNow=[ordered]@{status=$taskStatus;enabled=$taskEnabled;checkedAt=(Get-Date).ToString('o');startsLastHour=$taskStarts.Count;startTimes=@($taskStarts | ForEach-Object {$_.ToString('o')});pid=$PID}
    $taskNow | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $taskState "watchdog-state.$PID.tmp") -Encoding UTF8
