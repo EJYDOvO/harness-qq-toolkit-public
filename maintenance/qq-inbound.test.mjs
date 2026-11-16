@@ -13,6 +13,7 @@ import {randomUUID,createHash} from 'node:crypto';
 import {fileURLToPath,pathToFileURL} from 'node:url';
 import {createAgentIO} from '../plugin-sources/dsh-agent-io/io.mjs';
 import {qqAdapter,qqConversation} from './qq-conversation-fixture.mjs';
+import {deriveSessionId,validSessionNamespace} from '../plugin-sources/dsh-conversation-manager/session-id.mjs';
 
 const dist=new URL('./qqbot-src/dist/',import.meta.url);
 const read=file=>fs.readFileSync(new URL(file,dist),'utf8').replaceAll('\r\n','\n');
@@ -222,12 +223,12 @@ class SessionPersistenceNotFoundError extends Error{constructor(id){super('absen
 function conversationManager(t,order){
  const home=fs.mkdtempSync(path.join(os.tmpdir(),'qq-inbound-'));t.after(()=>fs.rmSync(home,{recursive:true,force:true}));
  const durable=new Set(),live=new Map();
- const PrefsStore=vm.runInNewContext(cmSource('preferences.mjs')+';PrefsStore;',{...fs,resolve:path.resolve,isAbsolute:path.isAbsolute,dirname:path.dirname,homedir:()=>home,process:{pid:process.pid,env:{DSH_HOME:home}},structuredClone});
+ const PrefsStore=vm.runInNewContext(cmSource('preferences.mjs')+';PrefsStore;',{...fs,validSessionNamespace,resolve:path.resolve,isAbsolute:path.isAbsolute,dirname:path.dirname,homedir:()=>home,process:{pid:process.pid,env:{DSH_HOME:home}},structuredClone});
  const handle=id=>{const a={id,status:'idle',session:{header:{id,agentPreset:'fixture'},events:[]},inbox:{hasPending:false},cancel(){order.push('cancel');},followup(){order.push('followup');},whenIdle:()=>Promise.resolve()};live.set(id,a);return {agent:a,async dispose(){order.push('dispose');live.delete(id);}};};
  const agents={get:id=>live.get(id),async create({sessionId}){return handle(sessionId);},async resume({resumeSessionId}){if(!durable.has(resumeSessionId))throw new SessionPersistenceNotFoundError(resumeSessionId);return handle(resumeSessionId);}};
  class ModelResolver{constructor(){this.prefs=new PrefsStore(undefined,path.join(home,'prefs.json'));}getEffectiveRoute(){return undefined;}getResumeRoute(){return undefined;}getPreset(k){return this.prefs.getPreset(k);}getSessionId(k){return this.prefs.getSessionId(k);}setSessionId(k,v){this.prefs.setSessionId(k,v);}}
  const IdleEvictor=vm.runInNewContext(cmSource('idle-evictor.mjs')+';IdleEvictor;',{Date,setInterval:()=>0,clearInterval(){}});
- const Manager=vm.runInNewContext(cmSource('manager.mjs')+';ConversationManager;',{ModelResolver,IdleEvictor,SessionPersistenceNotFoundError,SessionId:x=>x,buildForkSeed:r=>r,createHash,randomUUID,Date,structuredClone,process:{cwd:()=>home}});
+ const Manager=vm.runInNewContext(cmSource('manager.mjs')+';ConversationManager;',{ModelResolver,IdleEvictor,SessionPersistenceNotFoundError,SessionId:x=>x,buildForkSeed:r=>r,createHash,randomUUID,deriveSessionId,Date,structuredClone,process:{cwd:()=>home}});
  const ctx={on:()=>()=>{},get(name){if(name==='agentPresets')return {async resolve(id){return {id:id??'fixture'};},async mount(){}};if(name==='sessionPersistence')return {async open(id){throw new SessionPersistenceNotFoundError(id);}};if(name==='sessions')return {async flush(s){durable.add(s.header.id);return true;}};}};
  const config={appId:'app-a',cwd:home,sessionIdleTimeout:1,sessionLifecycle:{enabled:false},access:owner,adapter:{key:(scope,peer)=>'qqbot:app-a:'+scope+':'+peer,lifecycleScope:()=>false,acceptActivity:()=>true,isUserInput:t=>!!t?.msgId,inputId:t=>t?.msgId}};
  return {manager:new Manager(ctx,agents,config,{info(){},warn(){},debug(){},error(){}}),config};

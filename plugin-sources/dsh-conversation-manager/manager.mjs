@@ -1,8 +1,9 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { SessionId, buildForkSeed } from '@deepseek-ai/dsh-session';
 import { SessionPersistenceNotFoundError } from '@deepseek-ai/dsh-session-persistence';
 import { ModelResolver } from "./model-resolver.mjs";
 import { IdleEvictor } from "./idle-evictor.mjs";
+import { deriveSessionId } from "./session-id.mjs";
 // Stable through plugin reloads, different after an actual Host process restart.
 const hostBootId=globalThis[Symbol.for('dsh.conversation.sessionBoot.v1')]??=randomUUID();
 /** ManualCompactionError 各 code 的友好提示 */
@@ -418,8 +419,7 @@ export class ConversationManager {
         return this.adapter.key(scope,peerId);
     }
     deriveSessionId(sessionKey) {
-        const hash = createHash('sha256').update(sessionKey).digest('hex');
-        return `${hash.slice(0, 8)}-${hash.slice(8, 12)}-${hash.slice(12, 16)}-${hash.slice(16, 20)}-${hash.slice(20, 32)}`;
+        return deriveSessionId(sessionKey, this.modelResolver.prefs.sessionNamespace);
     }
     currentSessionId(sessionKey) {
         return this.modelResolver.getSessionId(sessionKey) ?? this.deriveSessionId(sessionKey);

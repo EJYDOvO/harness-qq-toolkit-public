@@ -12,6 +12,7 @@ import vm from 'node:vm';
 import {randomUUID,createHash} from 'node:crypto';
 import {createAgentIO} from '../plugin-sources/dsh-agent-io/io.mjs';
 import {createConversations} from '../plugin-sources/dsh-agent-io/conversation.mjs';
+import {deriveSessionId,validSessionNamespace} from '../plugin-sources/dsh-conversation-manager/session-id.mjs';
 
 const tick=async(n=5)=>{for(let i=0;i<n;i++)await new Promise(r=>setImmediate(r));};
 const deferred=()=>{let resolve;const promise=new Promise(r=>{resolve=r;});return {promise,resolve};};
@@ -21,7 +22,7 @@ class SessionPersistenceNotFoundError extends Error{constructor(id){super('absen
 // One real ConversationManager per vm context; a new context is a new Host process (boot id).
 function host(t,{home,durable=new Map(),clock={now:Date.now()},namespace='chat-a:acct',lifecycle={enabled:false}}={}){
  if(!home){home=fs.mkdtempSync(path.join(os.tmpdir(),'conversation-io-'));t.after(()=>fs.rmSync(home,{recursive:true,force:true}));}
- const Prefs=vm.runInNewContext(cm('preferences.mjs')+';PrefsStore;',{...fs,resolve:path.resolve,isAbsolute:path.isAbsolute,dirname:path.dirname,homedir:()=>home,process:{pid:process.pid,env:{DSH_HOME:home}},structuredClone});
+ const Prefs=vm.runInNewContext(cm('preferences.mjs')+';PrefsStore;',{...fs,validSessionNamespace,resolve:path.resolve,isAbsolute:path.isAbsolute,dirname:path.dirname,homedir:()=>home,process:{pid:process.pid,env:{DSH_HOME:home}},structuredClone});
  const live=new Map(),order=[];
  function handle(id){
   const agent={id,status:'idle',received:[],session:{header:{id,agentPreset:'fixture'},events:durable.get(id)?.events??[],snapshotEvents(){return this.events;}},inbox:{hasPending:false},
@@ -32,7 +33,7 @@ function host(t,{home,durable=new Map(),clock={now:Date.now()},namespace='chat-a
  class ModelResolver{constructor(){this.prefs=new Prefs(undefined,path.join(home,'conversations.json'));}getEffectiveRoute(){return undefined;}getResumeRoute(){return undefined;}getPreset(k){return this.prefs.getPreset(k);}getSessionId(k){return this.prefs.getSessionId(k);}setSessionId(k,v){this.prefs.setSessionId(k,v);}}
  class Clock extends Date{static now(){return clock.now;}}
  const IdleEvictor=vm.runInNewContext(cm('idle-evictor.mjs')+';IdleEvictor;',{Date:Clock,setInterval:()=>0,clearInterval(){}});
- const Manager=vm.runInNewContext(cm('manager.mjs')+';ConversationManager;',{ModelResolver,IdleEvictor,SessionPersistenceNotFoundError,SessionId:x=>x,buildForkSeed:r=>r,createHash,randomUUID,Date:Clock,structuredClone,process:{cwd:()=>home}});
+ const Manager=vm.runInNewContext(cm('manager.mjs')+';ConversationManager;',{ModelResolver,IdleEvictor,SessionPersistenceNotFoundError,SessionId:x=>x,buildForkSeed:r=>r,createHash,randomUUID,deriveSessionId,Date:Clock,structuredClone,process:{cwd:()=>home}});
  const ctx={on:()=>()=>{},get(name){
   if(name==='agentPresets')return {async resolve(id){return {id:id??'fixture'};},async mount(){}};
   if(name==='sessionPersistence')return {async open(id){if(!durable.has(id))throw new SessionPersistenceNotFoundError(id);return {header:durable.get(id).meta,read:async()=>({events:durable.get(id).events}),close:async()=>{}};}};

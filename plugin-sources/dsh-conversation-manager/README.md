@@ -2,7 +2,7 @@
 
 独立、平台无关的 Host 插件。维护 Conversation → 原生 Session 的唯一当前路由、模型/Preset 偏好、并发、恢复和可选空白轮换。QQ、Identity、Memory、Remote Ops 均不是本插件依赖。
 
-当前源码 `0.1.0-test.5`（DSH 0.2.2-rc.1：Schedule 阻断改读 catalog `target`，未部署）；test.4 为 I1 可选授权 Preset；test.3 为 2026-11-02 授权部署的 Iteration 08 版本，保留恢复异常分类和关闭规则，补充 Context 活性门禁及可选脱敏观察。test.2 为历史部署。验证基线为 DSH `0.2.2-rc.1`（隔离）；复用原生 Agent/Session/Persistence/Preset/Schedule，不实现第二套运行时、调度器或数据库。
+当前源码 `0.1.0-test.6`（可选会话命名空间，见下）；test.5 为 DSH 0.2.2-rc.1 兼容（Schedule 阻断改读 catalog `target`）；test.4 为 I1 可选授权 Preset；test.3 为 2026-11-02 授权部署的 Iteration 08 版本，保留恢复异常分类和关闭规则，补充 Context 活性门禁及可选脱敏观察。test.2 为历史部署。验证基线为 DSH `0.2.2-rc.1`（隔离）；复用原生 Agent/Session/Persistence/Preset/Schedule，不实现第二套运行时、调度器或数据库。
 
 ## 安装与装配
 
@@ -18,6 +18,8 @@
 ```
 
 每个 Profile/项目使用独立的绝对 `stateFile`。只允许单活 Host 写入。一个服务内的各 Adapter 共用同一个偏好存储，避免分别加载旧状态造成覆盖；外部改写检测失败会拒绝提交，不静默刷新或重置。
+
+**会话命名空间（可选）。** 状态里没有记录的会话键，Session ID 由会话键推导；会话键不含状态文件的归属，所以两个状态文件共用同一个 Host Session 存储时会推导出同一个 ID，恢复对方的历史。状态文件的所有者可以在 Host 打开它之前写入顶层字段 `sessionNamespace`（1–128 个字符，首尾无空白）：推导改为对“命名空间 + 换行 + 会话键”取摘要，不同命名空间互不相撞。没有该字段时推导结果与以前完全相同。本插件只读取并在每次保存时原样保留它，不提供修改接口；值不合法时状态视为不可读（与其他损坏同样拒绝提交）。已有记录（`sessionIds`）的会话键不受影响。
 
 ## 可信 Host Adapter 契约
 

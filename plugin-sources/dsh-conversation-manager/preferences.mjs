@@ -6,7 +6,14 @@
  */
 import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, openSync, fsyncSync, closeSync, unlinkSync } from 'node:fs';
 import { dirname, isAbsolute } from 'node:path';
+import { validSessionNamespace } from './session-id.mjs';
 export class PrefsStore {
+    /**
+     * Scope of derived Session ids (see session-id.mjs). Written into the state
+     * file by its owner before the Host opens it; never set through this store,
+     * and kept unchanged by every save.
+     */
+    sessionNamespace;
     /** per-peer 模型偏好（内存态） */
     overrides = new Map();
     /** per-peer 最新 sessionId（fork 后更新，内存态） */
@@ -95,7 +102,7 @@ export class PrefsStore {
         mkdirSync(dirname(this.prefsPath),{recursive:true});
         const current=existsSync(this.prefsPath)?readFileSync(this.prefsPath,'utf8'):undefined;
         if(current!==this.fileContent)throw Error('Conversation preferences changed externally; reload before committing');
-        const content=JSON.stringify(data,null,2);
+        const content=JSON.stringify(this.sessionNamespace===undefined?data:{sessionNamespace:this.sessionNamespace,...data},null,2);
         const temp=this.prefsPath+'.'+process.pid+'.tmp';let fd;
         try{fd=openSync(temp,'w',0o600);writeFileSync(fd,content,'utf8');fsyncSync(fd);closeSync(fd);fd=undefined;renameSync(temp,this.prefsPath);this.fileContent=content;}
         finally{if(fd!==undefined)closeSync(fd);if(existsSync(temp))unlinkSync(temp);}
@@ -108,6 +115,10 @@ export class PrefsStore {
             const content = readFileSync(this.prefsPath, 'utf8');
             this.fileContent=content;
             const data = JSON.parse(content);
+            if(data.sessionNamespace!==undefined){
+                if(!validSessionNamespace(data.sessionNamespace))throw Error('Invalid persisted Conversation session namespace');
+                this.sessionNamespace=data.sessionNamespace;
+            }
             for(const [key,value]of Object.entries(data.lifecycle??{})){
                 if(!value||typeof value!=='object'||!Number.isFinite(value.lastUserAt)||typeof value.bootId!=='string')throw Error('Invalid persisted Conversation lifecycle');
                 this.lifecycle.set(key,value);
