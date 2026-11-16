@@ -10,6 +10,7 @@ import {apply as applyIdentity} from '../plugin-sources/dsh-identity-access/inde
 import {createAgentIO} from '../plugin-sources/dsh-agent-io/io.mjs';
 import {createHITLHost} from '../plugin-sources/dsh-agent-io/hitl.mjs';
 import {qqAdapter,qqConversation,openQQHITL} from './qq-conversation-fixture.mjs';
+import {deriveSessionId,validSessionNamespace} from '../plugin-sources/dsh-conversation-manager/session-id.mjs';
 
 const tick=async(n=10)=>{for(let i=0;i<n;i++)await new Promise(r=>setImmediate(r));};
 const temp=t=>{const dir=fs.mkdtempSync(path.join(os.tmpdir(),'identity-access-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));return dir;};
@@ -131,7 +132,7 @@ test('the global tool guard needs a current Owner lease and always denies contac
 class SessionPersistenceNotFoundError extends Error{constructor(id){super('absent');this.name='SessionPersistenceNotFoundError';this.sessionId=id;}}
 const cm=file=>fs.readFileSync(new URL('../plugin-sources/dsh-conversation-manager/'+file,import.meta.url),'utf8').replace(/^import .*;\r?\n/gm,'').replace(/export class /g,'class ')+'\n';
 function cmHost(t,{home=temp(t),durable=new Map()}={}){
- const Prefs=vm.runInNewContext(cm('preferences.mjs')+';PrefsStore;',{...fs,resolve:path.resolve,isAbsolute:path.isAbsolute,dirname:path.dirname,homedir:()=>home,process:{pid:process.pid,env:{DSH_HOME:home}},structuredClone});
+ const Prefs=vm.runInNewContext(cm('preferences.mjs')+';PrefsStore;',{...fs,validSessionNamespace,resolve:path.resolve,isAbsolute:path.isAbsolute,dirname:path.dirname,homedir:()=>home,process:{pid:process.pid,env:{DSH_HOME:home}},structuredClone});
  const live=new Map(),presetOf=new WeakMap();
  function handle(id,preset){
   const ctx={};presetOf.set(ctx,preset);
@@ -142,7 +143,7 @@ function cmHost(t,{home=temp(t),durable=new Map()}={}){
  const agents={get:id=>live.get(id),async create({sessionId,meta}){return handle(sessionId,meta.agentPreset);},async resume({resumeSessionId}){if(!durable.has(resumeSessionId))throw new SessionPersistenceNotFoundError(resumeSessionId);return handle(resumeSessionId,durable.get(resumeSessionId).meta.agentPreset);}};
  class ModelResolver{constructor(){this.prefs=new Prefs(undefined,path.join(home,'conversations.json'));}getEffectiveRoute(){return undefined;}getResumeRoute(){return undefined;}getPreset(k){return this.prefs.getPreset(k);}getSessionId(k){return this.prefs.getSessionId(k);}setSessionId(k,v){this.prefs.setSessionId(k,v);}}
  const IdleEvictor=vm.runInNewContext(cm('idle-evictor.mjs')+';IdleEvictor;',{Date,setInterval:()=>0,clearInterval(){}});
- const Manager=vm.runInNewContext(cm('manager.mjs')+';ConversationManager;',{ModelResolver,IdleEvictor,SessionPersistenceNotFoundError,SessionId:x=>x,buildForkSeed:r=>r,createHash,randomUUID,Date,structuredClone,process:{cwd:()=>home}});
+ const Manager=vm.runInNewContext(cm('manager.mjs')+';ConversationManager;',{ModelResolver,IdleEvictor,SessionPersistenceNotFoundError,SessionId:x=>x,buildForkSeed:r=>r,createHash,randomUUID,deriveSessionId,Date,structuredClone,process:{cwd:()=>home}});
  const ctx={on:()=>()=>{},get(name){
   if(name==='agentPresets')return {async resolve(id){return {id};},async mount(){},composedPreset:c=>presetOf.get(c)};
   if(name==='sessionPersistence')return {async open(id){if(!durable.has(id))throw new SessionPersistenceNotFoundError(id);return {header:durable.get(id).meta,read:async()=>({events:[]}),close:async()=>{}};}};
