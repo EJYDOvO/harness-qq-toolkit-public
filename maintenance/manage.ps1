@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('Status','Doctor','Result','CheckUpdates','Backup','Stage','DeployValidated','Restart','Restore','ApplyFeatures')]
+    [ValidateSet('Status','Doctor','Result','CheckUpdates','Backup','Stage','DeployValidated','Restart','Restore','ApplyFeatures','SwitchCharacter')]
     [string]$Action = 'Status',
     [switch]$Queue,
     [string]$BackupId,
@@ -113,6 +113,64 @@ function Start-TaskHost {
     } while ((Get-Date) -lt $taskDeadline)
     throw 'Harness/QQ did not become ready within 100 seconds.'
 }
+function Invoke-SwitchNode([string[]]$SwitchArgs) {
+    # Decisions live in character-switch.cjs; this only runs it and keeps its output and exit code.
+    $script:taskSwitchOutput = & $taskNode (Join-Path $PSScriptRoot 'character-switch.cjs') @SwitchArgs
+    return $LASTEXITCODE
+}
+function Format-SwitchReason([string]$Text) {
+    # Windows PowerShell 5.1 splits a native argument at embedded double quotes, so one reason would
+    # arrive as several arguments. Keep it one plain line.
+    return (($Text -replace '["\\\r\n]+',' ').Trim())
+}
+function Get-TaskHostPids {
+    return @(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $taskExe } | ForEach-Object { $_.ProcessId })
+}
+function Wait-TaskCharacterServed([int64]$StartedAt) {
+    $taskDeadline = (Get-Date).AddSeconds(20)
+    do {
+        $taskPidList = (Get-TaskHostPids) -join ','
+        if ($taskPidList -and (Invoke-SwitchNode @('verify',$taskRoot,"$StartedAt",$taskPidList)) -eq 0) { return }
+        Start-Sleep -Seconds 2
+    } while ((Get-Date) -lt $taskDeadline)
+    throw "New character was not served by the restarted Host: $($script:taskSwitchOutput)"
+}
+function Restore-TaskCharacter {
+    # Stop only this attempt's Host, point the link back and start the previous character's Host.
+    Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $taskExe } | ForEach-Object { Stop-Process -Id $_.ProcessId -ErrorAction SilentlyContinue }
+    Start-Sleep -Seconds 2
+    if ((Invoke-SwitchNode @('revert',$taskRoot)) -ne 0) { throw 'Cannot point the character link back.' }
+    Start-TaskHost | Out-Null
+}
+function Invoke-CharacterSwitch {
+    $taskPending = Invoke-SwitchNode @('pending',$taskRoot)
+    if ($taskPending -ne 0) {
+        # 3: no request; 4: expired or invalid, and the helper already recorded that result.
+        $taskResult.skipped = $true
+        return
+    }
+    $taskLinked = $false
+    try {
+        Wait-TaskIdle
+        Stop-TaskHost
+        if ((Invoke-SwitchNode @('apply',$taskRoot)) -ne 0) { throw 'Cannot point the character link at the new character.' }
+        $taskLinked = $true
+        $taskStartedAt = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
+        $taskResult.status = Start-TaskHost
+        Wait-TaskCharacterServed $taskStartedAt
+        Invoke-SwitchNode @('finish',$taskRoot,'ok') | Out-Null
+        $script:taskStopped = $false
+    } catch {
+        $taskReason = Format-SwitchReason $_.Exception.Message
+        # Nothing was stopped or repointed yet: the previous character is still being served.
+        $taskRestored = !$script:taskStopped
+        if ($taskLinked -or $script:taskStopped) {
+            try { Restore-TaskCharacter; $taskRestored = $true } catch { $taskRestored = $false; $taskReason = Format-SwitchReason "$taskReason; rollback failed: $($_.Exception.Message)" }
+        }
+        Invoke-SwitchNode @('finish',$taskRoot,'fail',$taskReason,"$taskRestored".ToLower()) | Out-Null
+        throw $taskReason
+    }
+}
 function Restore-TaskFiles([string]$From) {
     Invoke-TaskNode @((Join-Path $PSScriptRoot 'backup-integrity.cjs'),'verify',$From) | Out-Host
     $taskResolved = [IO.Path]::GetFullPath($taskProfile)
@@ -156,6 +214,8 @@ try {
         if ((Get-Content -LiteralPath $taskCompositionErrors -Raw) -match 'skipping profile bundle|incompatible with dsh|patch: entry .+ not found') { throw 'Candidate silently skipped a plugin or override; inspect composition diagnostics.' }
         Invoke-TaskNode @((Join-Path $PSScriptRoot 'stage.cjs'),'seal')
         $taskResult.candidate = $taskStage
+    } elseif ($Action -eq 'SwitchCharacter') {
+        Invoke-CharacterSwitch
     } else {
         if ($Action -eq 'DeployValidated') { Invoke-TaskNode @((Join-Path $PSScriptRoot 'stage.cjs'),'check') }
         if ($Action -eq 'Restore') {
