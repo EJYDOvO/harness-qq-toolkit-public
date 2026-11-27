@@ -42,15 +42,16 @@ test('SwitchCharacter stops, repoints, restarts and verifies, and falls back to 
  assert(manage.includes("elseif ($Action -eq 'SwitchCharacter')"));
  const slice=(name)=>{const from=manage.indexOf('function '+name);assert(from>=0,name+' is a named function');const next=manage.indexOf('\nfunction ',from+10);return manage.slice(from,next<0?manage.length:next);};
  const flow=slice('Invoke-CharacterSwitch'),at=(text,from=0)=>{const i=flow.indexOf(text,from);assert(i>=0,text+' is in the switch flow');return i;};
- const pending=at("'pending'"),check=at("'check'",pending),idle=at('Wait-TaskIdle',check),stop=at('Stop-TaskHost',idle),apply=at("'apply'",stop),stamp=at('$taskStartedAt =',apply),launch=at('Start-TaskHost',stamp),verify=at('Wait-TaskCharacterServed',launch),fail=at('catch',verify),ok=at("'ok'",fail);
- assert(pending<check&&check<idle&&idle<stop&&stop<apply&&apply<stamp&&stamp<launch&&launch<verify&&verify<fail&&fail<ok,'check runs before the Host is stopped; a failed finish ok never rolls back');
+ const recovery=at('Restore-TaskCharacter'),pending=at("'pending'",recovery),check=at("'check'",pending),stop=at('Stop-TaskHost',check),apply=at("'apply'",stop),stamp=at('$taskStartedAt =',apply),launch=at('Start-TaskHost',stamp),verify=at("Wait-TaskCharacterServed $taskStartedAt 'target'",launch),fail=at('catch',verify),ok=at("'ok'",fail);
+ assert(recovery<pending&&pending<check&&check<stop&&stop<apply&&apply<stamp&&stamp<launch&&launch<verify&&verify<fail&&fail<ok,'recovery precedes new requests, and success is recorded outside rollback handling');
+ const normalStop=slice('Stop-TaskHost {');assert(normalStop.indexOf('Wait-TaskIdle')<normalStop.indexOf('Stop-TaskHostProcesses'));
  assert(slice('Wait-TaskCharacterServed').includes("'verify'"));
  // Failure: restore, then record what happened and whether the previous character is back.
- const restore=at('Restore-TaskCharacter $taskLinked',fail),finish=at("'fail'",restore);assert(restore<finish&&finish<ok);
+ const restore=at('Restore-TaskCharacter',fail),finish=at("'finish'",restore);assert(restore<finish&&finish<ok);
  // Restore stops only this attempt's Host, then reverts the link, then starts the previous character.
- const undo=slice('Restore-TaskCharacter'),stopNew=undo.indexOf('Stop-Process'),revert=undo.indexOf("'revert'"),restart=undo.indexOf('Start-TaskHost');
- assert(stopNew>=0&&stopNew<revert&&revert<restart,'revert comes before the restart');
- assert(undo.includes('$Linked -and'),'revert only when this attempt moved the link');
+ const undo=slice('Restore-TaskCharacter'),stopNew=undo.indexOf('Stop-TaskHostProcesses'),revert=undo.indexOf("'revert'"),restart=undo.indexOf('Start-TaskHost'),ready=undo.indexOf("Wait-TaskCharacterServed $taskStartedAt 'previous'");
+ assert(stopNew>=0&&stopNew<revert&&revert<restart&&restart<ready,'shutdown precedes revert, and rollback verifies the previous Host after restart');
+ assert(slice('Stop-TaskHostProcesses').includes("throw 'Harness did not stop.'"));
  assert(flow.includes('Format-SwitchReason')&&slice('Format-SwitchReason').includes('\"'),'the failure reason is stripped of double quotes before it becomes a native argument');
  assert(!/Backup-TaskProfile/.test(flow),'a switch makes no Profile backup');
 });
@@ -58,9 +59,10 @@ test('the watchdog runs a requested switch outside the maintenance lock and does
  const watchdog=fs.readFileSync(new URL('./watchdog.ps1',import.meta.url),'utf8'),lines=watchdog.split('\n');
  const index=lines.findIndex(line=>line.includes('-Action SwitchCharacter'));assert(index>0,'the watchdog triggers SwitchCharacter');
  assert(lines[index].includes('character-switch.json'),'only when a request file exists');
- assert(lines[index].includes('character-switch.inprogress.json'),'a snapshot left by a dead run is reported too');
+ assert(lines[index].includes('$taskSwitchJournal')&&watchdog.includes("Join-Path $taskState 'character-switch.inprogress.json'"),'an interrupted journal triggers recovery');
  assert(!lines[index].includes('-Queue')&&!lines[index].includes('$taskStarts'),'synchronous and not a counted start');
  const lock=watchdog.indexOf('$taskGuard=[IO.File]::Open'),release=watchdog.indexOf('finally { if($taskGuard){$taskGuard.Dispose()} }'),offset=lines.slice(0,index).join('\n').length;
  assert(lock>0&&release>lock&&offset>release,'the call comes after the maintenance lock try/finally');
- assert(lines.findIndex(line=>line.includes('-Action Restart'))<index,'it sits with the restart call');
+ assert(watchdog.indexOf('if (Test-Path -LiteralPath $taskSwitchJournal)')<watchdog.indexOf('Start-Process -FilePath $taskExe'),'the journal gates a restart while the lock is held');
+ assert(lines.findIndex(line=>line.includes('-Action Restart'))>index,'the switch and queued restart are mutually exclusive');
 });

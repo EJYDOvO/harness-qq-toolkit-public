@@ -64,7 +64,8 @@ test('pending reports a valid request, an absent one and an invalid one',()=>{
  const i=install();try{
   assert.equal(run(['pending',i.root]).code,3);
   i.ask();const ok=run(['pending',i.root]);assert.equal(ok.code,0);assert.equal(ok.json.target,'beta');assert(!fs.existsSync(i.request)&&fs.existsSync(i.inprogress),'the request becomes the in-progress snapshot');
-  assert.equal(run(['pending',i.root]).code,3);
+  assert.equal(run(['pending',i.root]).code,1);
+  assert.equal(run(['finish',i.root,'fail','interrupted','true']).code,0);
   write(i.request,{target:'current',previous:'alpha',requestedAt:Date.now(),nonce:'n'});
   assert.equal(run(['pending',i.root]).code,4);assert.equal(i.readResult().reason,'invalid');assert(!fs.existsSync(i.request));
   write(i.request,'{not json');assert.equal(run(['pending',i.root]).code,4);assert.equal(i.readResult().reason,'invalid');
@@ -87,6 +88,21 @@ test('verify reads runtime-health.json through the junction',()=>{
   assert.notEqual(run(['verify',i.root,String(now),'4,5']).code,0);
   write(path.join(i.link,'runtime-health.json'),{pid:5,characterId:'beta',personaSource:'compiled',compiledRevision:'r',at:now+1});
   assert.equal(run(['verify',i.root,String(now),'4,5']).code,0);
+ }finally{i.cleanup();}
+});
+test('rollback verification requires fresh health for the previous character',()=>{
+ const i=install();try{
+  i.begin();const now=Date.now();
+  const verify=()=>run(['verify',i.root,String(now),'5','previous']).code;
+  const health=path.join(i.link,'runtime-health.json');
+  write(health,{pid:5,characterId:'alpha',personaSource:'compiled',at:now-1});
+  assert.equal(verify(),1);
+  write(health,{pid:5,characterId:'beta',personaSource:'compiled',at:now+1});
+  assert.equal(verify(),1);
+  write(health,{pid:5,characterId:'alpha',personaSource:'compiled',at:now+1});
+  assert.equal(verify(),0);
+  write(health,{pid:5,characterId:'alpha',personaSource:'neutral',at:now+1});
+  assert.equal(verify(),0,'the previous character may use its neutral fallback');
  }finally{i.cleanup();}
 });
 test('finish writes the result atomically and removes the request',()=>{
@@ -120,26 +136,83 @@ test('check refuses bad switches and recognises one that is already applied',()=
   write(path.join(i.dirs.beta,'binding.json'),{characterId:'other'});assert.notEqual(run(['check',i.root]).code,0);
  }finally{i.cleanup();}
 });
-test('finish removes the snapshot and fails loudly when the result cannot be written',()=>{
+test('a verified outcome survives a failed result write and is published without a second switch',()=>{
  const i=install();try{
-  i.begin();fs.mkdirSync(i.result);
-  const r=run(['finish',i.root,'ok']);assert.notEqual(r.code,0);assert(!fs.existsSync(i.inprogress),'a finished switch is never replayed');
-  assert.equal(run(['pending',i.root]).code,3);
+  i.begin();assert.equal(run(['apply',i.root]).code,0);
+  const now=Date.now();write(path.join(i.link,'runtime-health.json'),{pid:5,characterId:'beta',personaSource:'compiled',at:now+1});
+  assert.equal(run(['verify',i.root,String(now),'5']).code,0);
+  fs.mkdirSync(i.result);
+  const r=run(['finish',i.root,'ok']);assert.equal(r.code,1);assert(fs.existsSync(i.inprogress));
+  assert.equal(run(['recover',i.root]).code,1);
+  assert.equal(marker(i.link),'beta');
+  const completed=fs.readFileSync(i.inprogress,'utf8');
+  fs.rmdirSync(i.result);
+  assert.equal(run(['recover',i.root]).code,3);
+  const result=i.readResult();assert.deepEqual([result.ok,result.target,result.nonce],[true,'beta','n1']);
+  // The public result may already have been published when the original process died.
+  write(i.inprogress,completed);
+  assert.equal(run(['recover',i.root]).code,3);assert.deepEqual(i.readResult(),result);
+  assert.equal(marker(i.link),'beta');assert(!fs.existsSync(i.inprogress));
  }finally{i.cleanup();}
 });
-test('a leftover snapshot is reported as interrupted, with or without a new request',()=>{
+test('a leftover snapshot blocks newer requests until rollback is verified and reported',()=>{
  const i=install();try{
-  i.begin();// link still at previous
-  let r=run(['pending',i.root]);assert.equal(r.code,3);
-  assert.deepEqual([i.readResult().ok,i.readResult().reason,i.readResult().restored,i.readResult().target,i.readResult().nonce],[false,'interrupted',true,'beta','n1']);assert(!fs.existsSync(i.inprogress));
-  i.begin();run(['apply',i.root]);// link at target
-  r=run(['pending',i.root]);assert.equal(r.code,3);assert.equal(i.readResult().restored,false);assert.equal(i.readResult().reason,'interrupted');assert(!fs.existsSync(i.inprogress));
-  // Leftover plus a new request: the old nonce is reported, the new request is snapshotted.
-  i.begin();i.ask({target:'gamma',previous:'beta',nonce:'n2'});
-  r=run(['pending',i.root]);assert.equal(r.code,0);assert.equal(r.json.nonce,'n2');
-  assert.deepEqual([i.readResult().reason,i.readResult().nonce],['interrupted','n1']);
+  i.begin();i.ask({target:'gamma',previous:'alpha',nonce:'n2'});
+  assert.equal(run(['pending',i.root]).code,1);
+  assert.equal(run(['recover',i.root]).json.link,'previous');
+  assert.equal(JSON.parse(fs.readFileSync(i.inprogress,'utf8')).nonce,'n1');assert(fs.existsSync(i.request));
+  assert.equal(run(['finish',i.root,'fail','interrupted','true']).code,0);
+  assert.deepEqual([i.readResult().ok,i.readResult().reason,i.readResult().restored,i.readResult().target,i.readResult().nonce],[false,'interrupted',true,'beta','n1']);
+  const r=run(['pending',i.root]);assert.equal(r.code,0);assert.equal(r.json.nonce,'n2');
   assert.equal(JSON.parse(fs.readFileSync(i.inprogress,'utf8')).nonce,'n2');assert(!fs.existsSync(i.request));
-  write(i.inprogress,'{garbage');assert.equal(run(['pending',i.root]).code,3);assert.equal(i.readResult().reason,'interrupted');assert(!fs.existsSync(i.inprogress));
+ }finally{i.cleanup();}
+});
+for(const state of ['target','missing']){
+ test(`rollback restores the previous junction from an interrupted ${state} state`,()=>{
+  const i=install();try{
+   i.begin();assert.equal(run(['apply',i.root]).code,0);
+   if(state==='missing')fs.unlinkSync(i.link);
+   assert.equal(run(['recover',i.root]).json.link,state);
+   assert.equal(run(['revert',i.root]).code,0);assert.equal(marker(i.link),'alpha');
+   assert.equal(run(['revert',i.root]).code,0,'a retry preserves the restored link');
+   assert(fs.existsSync(i.inprogress));assert(!fs.existsSync(i.result));
+  }finally{i.cleanup();}
+ });
+}
+test('rollback restores a junction left dangling at the expected target',()=>{
+ const i=install();try{
+  i.begin();assert.equal(run(['apply',i.root]).code,0);
+  fs.renameSync(i.dirs.beta,path.join(i.data,'characters','moved-beta'));
+  assert.equal(run(['recover',i.root]).json.link,'target');
+  assert.equal(run(['revert',i.root]).code,0);
+  assert.equal(marker(i.link),'alpha');
+  assert.equal(marker(path.join(i.data,'characters','moved-beta')),'beta');
+ }finally{i.cleanup();}
+});
+for(const kind of ['file','directory','foreign junction','dangling junction']){
+ test(`rollback preserves an unexpected ${kind} and leaves the journal retryable`,()=>{
+  const i=install();try{
+   i.begin();fs.unlinkSync(i.link);
+   if(kind==='file')write(i.link,'keep');
+   else if(kind==='directory')write(path.join(i.link,'marker.txt'),'keep');
+   else fs.symlinkSync(kind==='foreign junction'?i.dirs.gamma:path.join(i.data,'gone'),i.link,'junction');
+   const originalLink=kind.endsWith('junction')?fs.readlinkSync(i.link):null;
+   assert.equal(run(['recover',i.root]).code,1);
+   assert.equal(run(['revert',i.root]).code,1);
+   assert.equal(run(['finish',i.root,'retry','rollback blocked']).code,0);
+   const remaining=originalLink?fs.readlinkSync(i.link):fs.readFileSync(kind==='file'?i.link:path.join(i.link,'marker.txt'),'utf8');
+   assert.equal(remaining,originalLink||'keep');
+   assert.deepEqual([i.readResult().ok,i.readResult().restored,i.readResult().nonce],[false,false,'n1']);
+   assert(fs.existsSync(i.inprogress));assert.equal(run(['pending',i.root]).code,1);
+  }finally{i.cleanup();}
+ });
+}
+test('a malformed in-progress snapshot blocks new switches without being discarded',()=>{
+ const i=install();try{
+  write(i.inprogress,'{garbage');i.ask();
+  assert.equal(run(['recover',i.root]).code,1);
+  assert.equal(run(['pending',i.root]).code,1);
+  assert.equal(fs.readFileSync(i.inprogress,'utf8'),'{garbage');assert(fs.existsSync(i.request));
  }finally{i.cleanup();}
 });
 test('relative registry directories are refused',()=>{
