@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('Status','Doctor','Result','CheckUpdates','Backup','Stage','DeployValidated','Restart','Restore','ApplyFeatures')]
+    [ValidateSet('Status','Doctor','Result','CheckUpdates','Backup','Stage','DeployValidated','Restart','Restore','ApplyFeatures','SwitchCharacter')]
     [string]$Action = 'Status',
     [switch]$Queue,
     [string]$BackupId,
@@ -77,15 +77,27 @@ function Backup-TaskProfile {
     Invoke-TaskNode @((Join-Path $PSScriptRoot 'backup-integrity.cjs'),'seal',$taskDestination) | Out-Host
     return $taskDestination
 }
+function Get-TaskHostProcesses {
+    Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $taskExe }
+}
+function Stop-TaskHostProcesses([object[]]$Processes) {
+    foreach ($taskProcess in $Processes) { Stop-Process -Id $taskProcess.ProcessId -ErrorAction SilentlyContinue }
+    if ($Processes.Count) { Start-Sleep -Seconds 2 }
+    if (@(Get-TaskHostProcesses).Count) { throw 'Harness did not stop.' }
+}
 function Stop-TaskHost {
     # Stop only this installation, after checking that both agent and plugin operations are idle.
     Wait-TaskIdle
-    $taskProcesses = @(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $taskExe })
+    $taskProcesses = @(Get-TaskHostProcesses)
     if (!$taskProcesses.Count) { throw 'Harness process could not be identified.' }
     $script:taskStopped = $true
-    foreach ($taskProcess in $taskProcesses) { Stop-Process -Id $taskProcess.ProcessId -ErrorAction SilentlyContinue }
-    Start-Sleep -Seconds 2
-    if (@(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $taskExe }).Count) { throw 'Harness did not stop.' }
+    Stop-TaskHostProcesses $taskProcesses
+}
+function Test-TaskQQReady([int64]$taskStartedAt, [int[]]$taskPids) {
+    $taskHealthFile = Join-Path $taskState 'qq-health.json'
+    if (!(Test-Path -LiteralPath $taskHealthFile)) { return $false }
+    $taskHealth = Get-Content -LiteralPath $taskHealthFile -Raw | ConvertFrom-Json
+    return $taskHealth.connected -eq $true -and $taskHealth.detail -eq 'ready' -and [int64]$taskHealth.at -ge $taskStartedAt -and ($taskPids -contains [int]$taskHealth.pid)
 }
 function Start-TaskHost {
     Remove-Item Env:\ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue
@@ -101,17 +113,117 @@ function Start-TaskHost {
             $taskStatus = Get-TaskStatus
             $taskLog = Get-Content -LiteralPath $script:taskStartLog -Raw -ErrorAction SilentlyContinue
             # Gateway readiness recorded by Remote Ops after this start, by a process of this Host.
-            $taskReady = $false
-            $taskHealthFile = Join-Path $taskState 'qq-health.json'
-            if (Test-Path -LiteralPath $taskHealthFile) {
-                $taskHealth = Get-Content -LiteralPath $taskHealthFile -Raw | ConvertFrom-Json
-                $taskPids = @(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $taskExe } | ForEach-Object { $_.ProcessId })
-                $taskReady = $taskHealth.connected -eq $true -and $taskHealth.detail -eq 'ready' -and [int64]$taskHealth.at -ge $taskStartedAt -and ($taskPids -contains [int]$taskHealth.pid)
-            }
+            $taskReady = Test-TaskQQReady $taskStartedAt @(Get-TaskHostPids)
             if ($taskStatus.reachable -and ($taskReady -or $taskLog -match '\[im-qqbot\] Bot ready!')) { return (Get-TaskStatus -Health) }
         } catch { }
     } while ((Get-Date) -lt $taskDeadline)
     throw 'Harness/QQ did not become ready within 100 seconds.'
+}
+function Invoke-SwitchNode([string[]]$SwitchArgs) {
+    # Decisions live in character-switch.cjs; this only runs it and keeps its output and exit code.
+    $script:taskSwitchOutput = & $taskNode (Join-Path $PSScriptRoot 'character-switch.cjs') @SwitchArgs
+    return $LASTEXITCODE
+}
+function Format-SwitchReason([string]$Text) {
+    # Windows PowerShell 5.1 splits a native argument at embedded double quotes, so one reason would
+    # arrive as several arguments. Keep it one plain line.
+    return (($Text -replace '["\\\r\n]+',' ').Trim())
+}
+function Get-TaskHostPids {
+    Get-TaskHostProcesses | ForEach-Object { $_.ProcessId }
+}
+function Wait-TaskCharacterServed([int64]$StartedAt, [string]$Role) {
+    $taskDeadline = (Get-Date).AddSeconds(20)
+    do {
+        $taskPidList = (Get-TaskHostPids) -join ','
+        if ($taskPidList -and (Invoke-SwitchNode @('verify',$taskRoot,"$StartedAt",$taskPidList,$Role)) -eq 0) { return }
+        Start-Sleep -Seconds 2
+    } while ((Get-Date) -lt $taskDeadline)
+    throw "The restarted Host did not serve the $Role character. $($script:taskSwitchOutput)"
+}
+function Test-TaskExistingCharacterServed([string]$Role) {
+    $taskProcesses = @(Get-TaskHostProcesses)
+    foreach ($taskProcess in $taskProcesses) {
+        if (!$taskProcess.CreationDate) { continue }
+        $taskStartedAt = ([DateTimeOffset]$taskProcess.CreationDate).ToUnixTimeMilliseconds()
+        if ((Invoke-SwitchNode @('verify',$taskRoot,"$taskStartedAt",("$($taskProcess.ProcessId)"),$Role)) -ne 0) { continue }
+        try {
+            if (!(Test-TaskQQReady $taskStartedAt @($taskProcesses.ProcessId))) { return $false }
+            return (Get-TaskStatus -Health).reachable
+        } catch { return $false }
+    }
+    return $false
+}
+function Restore-TaskCharacter {
+    $taskRecovery = Invoke-SwitchNode @('recover',$taskRoot)
+    if ($taskRecovery -eq 3) { return $false }
+    if ($taskRecovery -ne 0) { throw "Cannot recover the character switch. $($script:taskSwitchOutput)" }
+    $taskLink = ($script:taskSwitchOutput | ConvertFrom-Json).link
+    if ($taskLink -eq 'previous' -and (Test-TaskExistingCharacterServed 'previous')) { return $true }
+
+    # A target Host can survive an interrupted switch. Confirm shutdown before changing the junction.
+    Stop-TaskHostProcesses @(Get-TaskHostProcesses)
+    if ((Invoke-SwitchNode @('revert',$taskRoot)) -ne 0) { throw "Cannot restore the character link. $($script:taskSwitchOutput)" }
+    $taskStartedAt = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
+    Start-TaskHost | Out-Null
+    Wait-TaskCharacterServed $taskStartedAt 'previous'
+    return $true
+}
+function Invoke-CharacterSwitch {
+    try {
+        $taskRecovered = Restore-TaskCharacter
+    } catch {
+        $taskReason = Format-SwitchReason "interrupted. Rollback failed. $($_.Exception.Message)"
+        Invoke-SwitchNode @('finish',$taskRoot,'retry',$taskReason) | Out-Null
+        throw $taskReason
+    }
+    if ($taskRecovered -and (Invoke-SwitchNode @('finish',$taskRoot,'fail','interrupted','true')) -ne 0) {
+        throw 'The previous character was restored, but the interrupted switch result could not be recorded.'
+    }
+    $taskPending = Invoke-SwitchNode @('pending',$taskRoot)
+    if ($taskPending -in @(3,4)) {
+        $taskResult.skipped = $true
+        return
+    }
+    if ($taskPending -ne 0) { throw "Cannot accept the character switch. $($script:taskSwitchOutput)" }
+    # Everything that can refuse is decided now, while the Host is still running and untouched.
+    $taskCheck = Invoke-SwitchNode @('check',$taskRoot)
+    if ($taskCheck -notin @(0,5)) {
+        $taskReason = Format-SwitchReason "Switch refused before anything changed: $($script:taskSwitchOutput)"
+        Invoke-SwitchNode @('finish',$taskRoot,'fail',$taskReason,'false') | Out-Null
+        throw $taskReason
+    }
+    try {
+        if ($taskCheck -eq 5) {
+            if (!(Test-TaskExistingCharacterServed 'target')) { throw 'The link already points at the target, but its Host could not be verified.' }
+        } else {
+            Stop-TaskHost
+            if ((Invoke-SwitchNode @('apply',$taskRoot)) -ne 0) { throw "Cannot point the character link at the new character. $($script:taskSwitchOutput)" }
+            $taskStartedAt = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
+            $taskResult.status = Start-TaskHost
+            Wait-TaskCharacterServed $taskStartedAt 'target'
+        }
+    } catch {
+        $taskReason = Format-SwitchReason $_.Exception.Message
+        $taskRestored = $false
+        $taskOutcome = 'fail'
+        if ($script:taskStopped -or $taskCheck -eq 5) {
+            try {
+                if (!(Restore-TaskCharacter)) { throw 'Missing switch journal.' }
+                $taskRestored = $true
+            } catch {
+                $taskOutcome = 'retry'
+                $taskReason = Format-SwitchReason "$taskReason. Rollback failed. $($_.Exception.Message)"
+            }
+        } else {
+            try { $taskRestored = Test-TaskExistingCharacterServed 'previous' } catch { }
+        }
+        if ((Invoke-SwitchNode @('finish',$taskRoot,$taskOutcome,$taskReason,"$taskRestored".ToLower())) -ne 0) { $taskReason = "$taskReason. The result could not be recorded." }
+        throw $taskReason
+    }
+    # The switch worked. A failed result write must never trigger a rollback.
+    $script:taskStopped = $false
+    if ((Invoke-SwitchNode @('finish',$taskRoot,'ok')) -ne 0) { throw 'Character switched, but its result could not be recorded.' }
 }
 function Restore-TaskFiles([string]$From) {
     Invoke-TaskNode @((Join-Path $PSScriptRoot 'backup-integrity.cjs'),'verify',$From) | Out-Host
@@ -137,7 +249,9 @@ $taskStopped = $false
 $taskFilesChanged = $false
 try {
     $taskLock = [IO.File]::Open((Join-Path $taskState 'maintenance.lock'),[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
-    if ($Action -eq 'Backup') {
+    if ($Action -in @('Restart','DeployValidated','Restore','ApplyFeatures') -and (Test-Path -LiteralPath (Join-Path $taskState 'character-switch.inprogress.json'))) {
+        throw 'Character switch recovery must finish before restarting the Host.'
+    } elseif ($Action -eq 'Backup') {
         Wait-TaskIdle
         $taskResult.backup = Backup-TaskProfile
     } elseif ($Action -eq 'Stage') {
@@ -156,6 +270,8 @@ try {
         if ((Get-Content -LiteralPath $taskCompositionErrors -Raw) -match 'skipping profile bundle|incompatible with dsh|patch: entry .+ not found') { throw 'Candidate silently skipped a plugin or override; inspect composition diagnostics.' }
         Invoke-TaskNode @((Join-Path $PSScriptRoot 'stage.cjs'),'seal')
         $taskResult.candidate = $taskStage
+    } elseif ($Action -eq 'SwitchCharacter') {
+        Invoke-CharacterSwitch
     } else {
         if ($Action -eq 'DeployValidated') { Invoke-TaskNode @((Join-Path $PSScriptRoot 'stage.cjs'),'check') }
         if ($Action -eq 'Restore') {

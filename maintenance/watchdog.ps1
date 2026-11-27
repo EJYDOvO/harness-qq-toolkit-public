@@ -5,6 +5,7 @@ $ErrorActionPreference='Stop'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
 $taskRoot=Split-Path -Parent $PSScriptRoot
 $taskState=Join-Path $taskRoot 'data\maintenance'
+$taskSwitchJournal=Join-Path $taskState 'character-switch.inprogress.json'
 $taskNode=Join-Path $taskRoot 'resources/runtime/primary-runtime/dependencies/node/bin/node.exe'
 $taskRuntime=& $taskNode (Join-Path $PSScriptRoot 'runtime.cjs')
 if($LASTEXITCODE -ne 0){throw 'Invalid Host runtime selection'}
@@ -27,9 +28,9 @@ try {
    $taskGuard=$null
    try {
     $taskGuard=[IO.File]::Open((Join-Path $taskState 'maintenance.lock'),[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
-    $taskRunning=@(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $taskExe -and $_.CommandLine -notmatch '--type=|qqbot-validation|runtime[\\/]cli' })
-    if (!$taskEnabled) { $taskStatus='disabled';$taskAbsentSince=$null }
-    elseif ($taskRunning.Count) {
+    if (Test-Path -LiteralPath $taskSwitchJournal) { $taskStatus='character-switch-recovery';$taskAbsentSince=$null }
+    elseif (!$taskEnabled) { $taskStatus='disabled';$taskAbsentSince=$null }
+    elseif (($taskRunning=@(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $taskExe -and $_.CommandLine -notmatch '--type=|qqbot-validation|runtime[\\/]cli' })).Count) {
      $taskStatus='running';$taskAbsentSince=$null
      $taskHealthPath=Join-Path $taskState 'qq-health.json'
      if(Test-Path -LiteralPath $taskHealthPath) {
@@ -58,7 +59,9 @@ try {
     }
    } catch [IO.IOException] { $taskStatus='maintenance-in-progress';$taskAbsentSince=$null }
    finally { if($taskGuard){$taskGuard.Dispose()} }
-   if($taskRestart){& (Join-Path $PSScriptRoot 'manage.ps1') -Action Restart -Queue | Out-Null;$taskStarts+=Get-Date}
+   # manage.ps1 takes the maintenance lock for recovery and any new switch. These starts stay outside the watchdog budget.
+   if((Test-Path -LiteralPath $taskSwitchJournal) -or (Test-Path -LiteralPath (Join-Path $taskState 'character-switch.json'))){& (Join-Path $PSScriptRoot 'manage.ps1') -Action SwitchCharacter | Out-Null}
+   elseif($taskRestart){& (Join-Path $PSScriptRoot 'manage.ps1') -Action Restart -Queue | Out-Null;$taskStarts+=Get-Date}
    $taskStarts=@($taskStarts | Where-Object {$_ -gt (Get-Date).AddHours(-1)})
    $taskNow=[ordered]@{status=$taskStatus;enabled=$taskEnabled;checkedAt=(Get-Date).ToString('o');startsLastHour=$taskStarts.Count;startTimes=@($taskStarts | ForEach-Object {$_.ToString('o')});pid=$PID}
    $taskNow | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $taskState "watchdog-state.$PID.tmp") -Encoding UTF8
