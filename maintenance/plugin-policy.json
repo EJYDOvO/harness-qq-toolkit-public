@@ -1,12 +1,12 @@
 {
   "schemaVersion": 1,
   "profile": "desktop",
-  "testedRuntime": "0.2.2-rc.1",
+  "testedRuntime": "0.2.3-alpha.2",
   "targets": {
     "@tencent-connect/dsh-qqbot": "0.5.2",
     "@tencent-connect/qqbot-nodejs": "1.0.5"
   },
   "qqPatch": "patches/dsh-qqbot@0.5.2.patch",
-  "notes": "Legacy Windows maintenance template. Supply private localPackages pins and hashes after portable pack; never downgrade an installed plugin.",
+  "notes": "Windows maintenance template for Alpha.2. Verify the candidate against the signed Host before use. Supply private localPackages pins and hashes after portable pack; never downgrade an installed plugin.",
   "localPackages": {}
 }

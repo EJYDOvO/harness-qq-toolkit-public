@@ -220,15 +220,25 @@ export class ConversationManager {
         const key = record.sessionKey;
         const sessionsService = this.getSessionsService();
         if (!sessionsService) throw Error('Native Session service unavailable; model switch refused');
+        const parent = record.agent.session;
         let seed, inheritedEventCount;
         try {
-            // rc.2 fork() returns a live Session, not an .events bag. Use the
-            // exported native prefix builder, avoiding an orphan live fork.
-            const events = record.agent.session.snapshotEvents();
+            // Capture the source prefix before flushing it. Repair events added by
+            // buildForkSeed belong only to the child and are outside this prefix.
+            const events = parent.snapshotEvents();
             inheritedEventCount = events.length;
             seed = events.length ? buildForkSeed(events, events.at(-1).seq) : [];
         }
         catch (err) { throw new Error('Cannot snapshot Session; model switch refused',{cause:err}); }
+        const parentIsCurrent = () => !this.closed && this.sessions.get(key) === record
+            && record.agent.session === parent && parent.seq === inheritedEventCount
+            && !this.protectedSession(record);
+        if (!await sessionsService.flush(parent)) {
+            throw Error('Cannot persist parent Session history; model switch refused');
+        }
+        if (!parentIsCurrent()) {
+            throw Error('Conversation changed during parent Session flush; model switch refused');
+        }
         const childId = SessionId(randomUUID());
         const effectiveRoute = options.route ?? this.modelResolver.getEffectiveRoute(key);
         const composed = await this.composePreset(record.agentPreset??this.getEffectivePresetByKey(key));
@@ -236,6 +246,7 @@ export class ConversationManager {
             sessionId: childId,
             seed,
             inheritedEventCount,
+            parentSource: { sessionId: record.sessionId, endSeq: inheritedEventCount },
             meta: {
                 cwd: this.config.cwd || process.cwd(),
                 parentSession: record.sessionId,
@@ -247,7 +258,7 @@ export class ConversationManager {
         });
         try {
             if(!await sessionsService.flush(created.agent.session))throw new Error('Model fork persistence did not acknowledge the Session');
-            if(this.closed||this.sessions.get(key)!==record)throw new Error('Conversation route changed during model fork');
+            if(!parentIsCurrent())throw new Error('Conversation route changed during model fork');
             this.modelResolver.prefs.commitSession(key,childId,effectiveRoute);
         } catch(error) { await this.disposeHandle(created).catch(()=>{}); throw error; }
         const oldHandle = record.handle;

@@ -1,10 +1,12 @@
 # 干净安装、数据迁移与回滚
 
-源码和用户数据分开迁移。以下命令只用于新目录；不要对运行中的原目录运行 prepare/restore。默认单 Owner 私聊，不开启群聊。Windows / DSH 0.2.2-rc.1 / Node 24 是原生验证目标；Mac/Linux 的 GUI、原生权限、旧 Session 路径迁移尚未验收。
+源码和用户数据分开迁移。以下命令只用于新目录；不要对运行中的原目录运行 prepare/restore。默认单 Owner 私聊，不开启群聊。Windows / DSH 0.2.3-alpha.2 / Node 24.22.3 是原生验证目标；Mac/Linux 的 GUI、原生权限、旧 Session 路径迁移尚未验收。
 
 ## 1. 安装公开依赖
 
-自行安装官方 DSH 0.2.2-rc.1 与 Node 24。两个源码目录独立：
+Alpha.2 沿用默认 JSONL。旧 RC 无法打开含有 Alpha.2 新增的 `workspace-root/change` 事件的会话。切回旧 Host 前用独立数据副本验证可读性，并保留升级前快照。
+
+自行安装官方 DSH 0.2.3-alpha.2 与 Node 24.22.3。两个源码目录独立：
 
 ```sh
 git clone https://github.com/EJYDOvO/harness-qq-toolkit-public.git
@@ -20,7 +22,7 @@ npm test
 npm run test:audit
 ```
 
-根 package-lock.json 固定构建依赖及 QQ/SDK 下载完整性。pnpm 11.7.0 来自本地锁定依赖，不依赖开发机全局 pnpm 或旧 Profile。schemastery 3.18.5 仅用于测试依赖；DSH SDK 由 0.2.2-rc.1 发行包提供，不另装第二套 Core。
+根 package-lock.json 固定构建依赖及 QQ/SDK 下载完整性。pnpm 11.7.0 来自本地锁定依赖，不依赖开发机全局 pnpm 或旧 Profile。schemastery 3.18.5 仅用于测试依赖；DSH SDK 由 0.2.3-alpha.2 发行包提供，不另装第二套 Core。
 
 ## 2. 创建私有配置
 
@@ -108,7 +110,7 @@ allowed（退出 0）只表示监控状态完全未变；needs_replay（2）须�
 QQTK 的只读能力探测（只输出 policy/diff，不写 Profile；当前支持环境凭据的 OpenAI-compatible /models）：
 
 ```sh
-node <QQTK>/maintenance/model-budget-probe.mjs --profile <PROFILE> --home <HOME> --provider <PROVIDER> --runtime-version 0.2.2-rc.1
+node <QQTK>/maintenance/model-budget-probe.mjs --profile <PROFILE> --home <HOME> --provider <PROVIDER> --runtime-version 0.2.3-alpha.2
 ```
 
 它拒绝缺少容量、非法容量、重复路由、超大响应和重定向。可先使用 DSH Models 页原生发现；其他协议或凭据方式使用原生发现并人工审核。探测结果须经管理员审核再应用，仅将差异字段添加到现有模型对象，不覆盖提供商、凭据或输入模态。无法发现容量时填写经复核的手动声明，source=reviewed-manual，不能随意补默认值。
@@ -116,7 +118,7 @@ node <QQTK>/maintenance/model-budget-probe.mjs --profile <PROFILE> --home <HOME>
 将配套 model-policy.json 放在目标 Profile，包含 schemaVersion=1、profile、testedRuntime、maxAgeDays（默认30，最多90）以及模型记录（provider/id/contextWindow/maxTokens/endpointSha256/source/observedAt）。策略不含密钥或明文服务地址。端点、模型集合、数值、目标运行时或 Profile 名称改变，均须重新复核；证据过期须重新探测或人工核实，不应只修改日期。
 
 ```sh
-node <QQTK>/maintenance/model-budget-check.mjs --profile <PROFILE> --runtime-version 0.2.2-rc.1
+node <QQTK>/maintenance/model-budget-check.mjs --profile <PROFILE> --runtime-version 0.2.3-alpha.2
 ```
 
 pin-check 的 pre-switch/post-switch 已调用此门禁；模型定义存在但缺少策略或预算时失败。候选与实际 Profile 的策略 profile 字段应各自匹配目录名。检查全程只读，不发网络请求、不安装插件、不修改配置。没有声明自定义模型的官方内置目录无需此实例策略。

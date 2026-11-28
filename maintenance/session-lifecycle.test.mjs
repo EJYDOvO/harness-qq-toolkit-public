@@ -14,7 +14,7 @@ function factory(home,clock,durable=new Map()){
  const sandbox={...fs,validSessionNamespace,resolve:path.resolve,isAbsolute:path.isAbsolute,dirname:path.dirname,homedir:()=>home,process:{pid:process.pid,env:{DSH_HOME:home}},structuredClone};
  const Prefs=vm.runInNewContext(source('model/prefs-store.js')+';PrefsStore;',sandbox);
  const live=new Map(),options=[],disposed=[];let creates=0;
- function handle(id,meta={agentPreset:'fixture'}){const agent={id,status:'idle',session:{header:{id,...meta},events:durable.get(id)?.events??[],snapshotEvents(){return this.events;}},inbox:{hasPending:false},cancel(){this.cancelled=true;}};live.set(id,agent);return {agent,async dispose(){disposed.push(id);if(live.get(id)===agent)live.delete(id);}};}
+ function handle(id,meta={agentPreset:'fixture'}){const agent={id,status:'idle',session:{header:{id,...meta},events:durable.get(id)?.events??[],get seq(){return this.events.length;},snapshotEvents(){return this.events;}},inbox:{hasPending:false},cancel(){this.cancelled=true;}};live.set(id,agent);return {agent,async dispose(){disposed.push(id);if(live.get(id)===agent)live.delete(id);}};}
  const agents={get:id=>live.get(id),async create(input){creates++;options.push(input);return handle(input.sessionId,input.meta);},async resume({resumeSessionId}){if(!durable.has(resumeSessionId))throw new SessionPersistenceNotFoundError(resumeSessionId);return handle(resumeSessionId);}};
  class ModelResolver{constructor(_ctx,config){this.prefs=new Prefs(undefined,path.join(home,"qqbot","model-prefs.json"));this.config=config;}getEffectiveRoute(k){return this.prefs.getOverride(k)??{provider:'fixture-provider',model:'fixture-model'};}getResumeRoute(k){return this.getEffectiveRoute(k);}getPreset(k){return this.prefs.getPreset(k);}getSessionId(k){return this.prefs.getSessionId(k);}setSessionId(k,v){this.prefs.setSessionId(k,v);}}
  class Clock extends Date{static now(){return clock.now;}}
@@ -96,6 +96,46 @@ test('model switch publishes Session and preference atomically; failure preserve
  assert.equal(f.manager.currentSessionId(key),id);assert.equal(prefs.getOverride(key),undefined);assert(f.manager.isCurrentSession(old));assert(!f.disposed.includes(id));assert.equal(f.disposed.length,1);
  prefs.persist=original;await f.manager.setModelOverride('c2c','owner',{provider:'selected',model:'next'});assert.notEqual(old.sessionId,id);assert(f.manager.isCurrentSession(old));assert(f.disposed.includes(id));
  const disk=JSON.parse(fs.readFileSync(prefs.prefsPath));assert.equal(disk.sessionIds[key],old.sessionId);assert.equal(disk.overrides[key].model,'next');await f.manager.disposeAll();
+});
+test('model switch inherits the persisted Alpha.2 source prefix and keeps the route on parent flush failure',async()=>{
+ const f=fixture(),record=await f.get('first'),id=record.sessionId;
+ const history={seq:0,type:'user/message',data:{text:'keep me'}};
+ record.agent.session.events.push(history);
+ const originalGet=f.manager.ctx.get,originalCreate=f.manager.agents.create,creates=f.creates();
+ let persisted=false;
+ f.manager.ctx.get=name=>name==='sessions'?{async flush(session){
+  if(session.header.id===id&&!persisted)return false;
+  return originalGet(name).flush(session);
+ }}:originalGet(name);
+ try{
+  await assert.rejects(()=>f.manager.setModelOverride('c2c','owner',{provider:'p',model:'next'}),/parent Session history/);
+  assert.equal(f.creates(),creates);
+  assert.equal(f.manager.currentSessionId(record.sessionKey),id);
+  assert(f.manager.isCurrentSession(record));
+  persisted=true;
+  f.manager.agents.create=async input=>{
+   assert.deepEqual(f.durable.get(id)?.events,[history]);
+   assert.deepEqual({...input.parentSource},{sessionId:id,endSeq:1});
+   assert.deepEqual(input.seed,[history]);assert.equal(input.inheritedEventCount,1);
+   return originalCreate(input);
+  };
+  await f.manager.setModelOverride('c2c','owner',{provider:'p',model:'next'});
+  assert.notEqual(record.sessionId,id);
+ }finally{await f.manager.disposeAll();}
+});
+test('event appended during Alpha.2 model fork preserves the original route and destroys the candidate',async()=>{
+ const f=fixture(),record=await f.get('first'),parent=record.agent.session,id=record.sessionId;
+ const originalGet=f.manager.ctx.get;
+ f.manager.ctx.get=name=>name==='sessions'?{async flush(session){
+  if(session!==parent)parent.events.push({seq:0,type:'user/message',data:{text:'arrived during fork'}});
+  return originalGet(name).flush(session);
+ }}:originalGet(name);
+ try{
+  await assert.rejects(()=>f.manager.setModelOverride('c2c','owner',{provider:'p',model:'next'}),/Conversation route changed during model fork/);
+  assert.equal(f.manager.currentSessionId(record.sessionKey),id);assert(f.manager.isCurrentSession(record));
+  assert.equal(parent.events.at(-1).data.text,'arrived during fork');
+  assert.equal(f.disposed.length,1);assert.notEqual(f.disposed[0],id);
+ }finally{await f.manager.disposeAll();}
 });
 test('model switch respects the started Preset and refuses unfinished interaction',async()=>{
  const f=fixture(),record=await f.get('first');record.agent.status='running';
